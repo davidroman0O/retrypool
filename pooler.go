@@ -11,12 +11,12 @@ import (
 	"time"
 )
 
-// Worker interface remains the same
+// Worker interface for task processing
 type Worker[T any] interface {
 	Run(ctx context.Context, data T) error
 }
 
-// DeadTask struct remains the same
+// DeadTask struct to hold failed task information
 type DeadTask[T any] struct {
 	Data          T
 	Retries       int
@@ -24,18 +24,19 @@ type DeadTask[T any] struct {
 	Error         error
 }
 
-// taskWrapper now includes scheduledTime for delays
+// taskWrapper now includes scheduledTime and triedWorkers for worker tracking
 type taskWrapper[T any] struct {
 	data          T
 	retries       int
 	totalDuration time.Duration
 	timeLimit     time.Duration // Zero means no limit
 	scheduledTime time.Time     // For delay between retries
+	triedWorkers  map[int]bool  // Track workers that have tried this task
 }
 
-// taskQueue remains the same
+// taskQueue now stores pointers to taskWrapper
 type taskQueue[T any] struct {
-	tasks []taskWrapper[T]
+	tasks []*taskWrapper[T]
 }
 
 // Option type for configuring the Pool
@@ -100,7 +101,7 @@ func NewPool[T any](ctx context.Context, workers []Worker[T], options ...Option[
 	return pool
 }
 
-// startWorkers remains the same
+// startWorkers updated to handle scheduledTime and triedWorkers
 func (p *Pool[T]) startWorkers() {
 	for i := 0; i < len(p.workers); i++ {
 		p.wg.Add(1)
@@ -108,7 +109,7 @@ func (p *Pool[T]) startWorkers() {
 	}
 }
 
-// workerLoop updated to handle scheduledTime
+// workerLoop updated to handle scheduledTime and triedWorkers
 func (p *Pool[T]) workerLoop(workerID int) {
 	defer p.wg.Done()
 	for {
@@ -130,8 +131,10 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		default:
 		}
 
-		task, ok := p.peekTask()
+		// Get next task for this worker
+		retries, idx, task, ok := p.getNextTask(workerID)
 		if !ok {
+			// No tasks available for this worker
 			p.mu.Unlock()
 			continue
 		}
@@ -141,19 +144,28 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			waitDuration := task.scheduledTime.Sub(now)
 			p.mu.Unlock()
 			select {
-			case <-p.timer.After(waitDuration): // Use p.timer here instead of time.After
+			case <-p.timer.After(waitDuration):
 				// Time to process the task
 			case <-p.ctx.Done():
 				return
 			}
 			continue // Re-acquire the lock and re-check conditions
-		} else {
-			task, ok = p.popTask()
-			if !ok {
-				p.mu.Unlock()
-				continue
-			}
 		}
+
+		// Remove the task from the queue
+		q := p.taskQueues[retries]
+		q.tasks = append(q.tasks[:idx], q.tasks[idx+1:]...)
+		if len(q.tasks) == 0 {
+			delete(p.taskQueues, retries)
+		} else {
+			p.taskQueues[retries] = q
+		}
+
+		// Mark the task as tried by this worker
+		if task.triedWorkers == nil {
+			task.triedWorkers = make(map[int]bool)
+		}
+		task.triedWorkers[workerID] = true
 
 		p.processing++
 		p.mu.Unlock()
@@ -167,7 +179,7 @@ func (p *Pool[T]) workerLoop(workerID int) {
 	}
 }
 
-// isAllQueuesEmpty remains the same
+// isAllQueuesEmpty checks if all task queues are empty
 func (p *Pool[T]) isAllQueuesEmpty() bool {
 	for _, q := range p.taskQueues {
 		if len(q.tasks) > 0 {
@@ -177,46 +189,24 @@ func (p *Pool[T]) isAllQueuesEmpty() bool {
 	return true
 }
 
-// peekTask returns the next task without removing it
-func (p *Pool[T]) peekTask() (*taskWrapper[T], bool) {
-	minRetries := -1
+// getNextTask returns the next task that the worker hasn't tried
+func (p *Pool[T]) getNextTask(workerID int) (int, int, *taskWrapper[T], bool) {
 	for retries, q := range p.taskQueues {
-		if len(q.tasks) > 0 {
-			if minRetries == -1 || retries < minRetries {
-				minRetries = retries
+		for idx, task := range q.tasks {
+			if task.triedWorkers == nil {
+				task.triedWorkers = make(map[int]bool)
+			}
+			if len(task.triedWorkers) >= len(p.workers) {
+				// All workers have tried this task; reset the list
+				task.triedWorkers = make(map[int]bool)
+			}
+			if !task.triedWorkers[workerID] {
+				// Found a task the worker hasn't tried
+				return retries, idx, task, true
 			}
 		}
 	}
-	if minRetries != -1 {
-		task := &p.taskQueues[minRetries].tasks[0]
-		return task, true
-	}
-	return nil, false
-}
-
-// popTask removes and returns the next task
-func (p *Pool[T]) popTask() (*taskWrapper[T], bool) {
-	minRetries := -1
-	for retries, q := range p.taskQueues {
-		if len(q.tasks) > 0 {
-			if minRetries == -1 || retries < minRetries {
-				minRetries = retries
-			}
-		}
-	}
-	if minRetries != -1 {
-		// Since we cannot assign to a struct field in a map value directly, we need to get the taskQueue, modify it, and store it back
-		q := p.taskQueues[minRetries]
-		task := q.tasks[0]
-		q.tasks = q.tasks[1:]
-		if len(q.tasks) == 0 {
-			delete(p.taskQueues, minRetries)
-		} else {
-			p.taskQueues[minRetries] = q
-		}
-		return &task, true
-	}
-	return nil, false
+	return 0, 0, nil, false
 }
 
 // runWorkerWithFailsafe updated to handle OnRetry and RetryIf
@@ -246,7 +236,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *taskWrapper[T]) {
 	}
 }
 
-// requeueTask updated to handle delays and delay types
+// requeueTask updated to handle delays and keep triedWorkers intact
 func (p *Pool[T]) requeueTask(task *taskWrapper[T], err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -273,7 +263,7 @@ func (p *Pool[T]) requeueTask(task *taskWrapper[T], err error) {
 
 	// Requeue task
 	q := p.taskQueues[task.retries]
-	q.tasks = append(q.tasks, *task)
+	q.tasks = append(q.tasks, task)
 	p.taskQueues[task.retries] = q
 	p.cond.Signal()
 }
@@ -306,9 +296,9 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 		return errors.New("pool is closed")
 	}
 
-	task := taskWrapper[T]{data: data, retries: 0}
+	task := &taskWrapper[T]{data: data, retries: 0}
 	for _, opt := range options {
-		opt(&task)
+		opt(task)
 	}
 	task.scheduledTime = time.Now()
 
@@ -319,14 +309,14 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 	return nil
 }
 
-// DeadTasks remains the same
+// DeadTasks returns a copy of the dead tasks list
 func (p *Pool[T]) DeadTasks() []DeadTask[T] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]DeadTask[T](nil), p.deadTasks...)
 }
 
-// QueueSize remains the same
+// QueueSize returns the total number of tasks in the queue
 func (p *Pool[T]) QueueSize() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -337,14 +327,14 @@ func (p *Pool[T]) QueueSize() int {
 	return total
 }
 
-// ProcessingCount remains the same
+// ProcessingCount returns the number of tasks currently being processed
 func (p *Pool[T]) ProcessingCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.processing
 }
 
-// Close remains the same
+// Close stops the pool and waits for all tasks to complete
 func (p *Pool[T]) Close() {
 	if p.closed.Load() {
 		return
@@ -357,7 +347,7 @@ func (p *Pool[T]) Close() {
 	p.wg.Wait()
 }
 
-// ForceClose remains the same
+// ForceClose stops the pool without waiting for tasks to complete
 func (p *Pool[T]) ForceClose() {
 	if p.closed.Load() {
 		return
@@ -374,7 +364,7 @@ func (p *Pool[T]) ForceClose() {
 	p.cond.Broadcast()
 }
 
-// WaitWithCallback remains the same
+// WaitWithCallback waits for the pool to complete while calling a callback function
 func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize, processingCount int) bool, interval time.Duration) error {
 	defer p.Close()
 	for {
@@ -513,7 +503,7 @@ func WithTimeLimit[T any](limit time.Duration) TaskOption[T] {
 	}
 }
 
-// DelayTypeFunc signature (corrected to be generic)
+// DelayTypeFunc signature
 type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duration
 
 // OnRetryFunc signature
