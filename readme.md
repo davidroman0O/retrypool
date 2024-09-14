@@ -22,6 +22,7 @@
 
 - [Installation](#installation)
 - [Getting Started](#getting-started)
+- [Retry mechanism](#retrypool-task-retry-mechanism)
 - [Usage Examples](#usage-examples)
   - [Basic Usage](#basic-usage)
   - [Custom Retry Logic](#custom-retry-logic)
@@ -86,6 +87,75 @@ func main() {
     fmt.Println("All tasks completed")
 }
 ```
+
+# RetryPool Task Retry Mechanism
+
+The following diagram illustrates how tasks are processed and retried in the RetryPool library:
+
+```mermaid
+graph TD
+    A[Task Submitted] --> B{Dispatch to Available Worker}
+    B -->|Worker 1| C1[Worker 1 Processes Task]
+    B -->|Worker 2| C2[Worker 2 Processes Task]
+    B -->|Worker 3| C3[Worker 3 Processes Task]
+    
+    C1 --> D1{Task Successful?}
+    C2 --> D2{Task Successful?}
+    C3 --> D3{Task Successful?}
+    
+    D1 -->|Yes| E[Task Completed]
+    D2 -->|Yes| E
+    D3 -->|Yes| E
+    
+    D1 -->|No| F1{Retry Condition Met?}
+    D2 -->|No| F2{Retry Condition Met?}
+    D3 -->|No| F3{Retry Condition Met?}
+    
+    F1 -->|Yes| G1[Apply Delay]
+    F2 -->|Yes| G2[Apply Delay]
+    F3 -->|Yes| G3[Apply Delay]
+    
+    G1 --> H{Requeue Task}
+    G2 --> H
+    G3 --> H
+    
+    H --> B
+    
+    F1 -->|No| I[Mark as Dead Task]
+    F2 -->|No| I
+    F3 -->|No| I
+    
+    I --> J[Add to Dead Tasks List]
+    
+    subgraph "RetryPool"
+        B
+        H
+        I
+        J
+    end
+```
+
+1. **Task Submission**: A task is submitted to the RetryPool.
+
+2. **Worker Assignment**: The task is dispatched to an available worker (Worker 1, Worker 2, or Worker 3).
+
+3. **Task Processing**: The assigned worker processes the task.
+
+4. **Success Check**: The system checks if the task was completed successfully.
+   - If successful, the task is marked as completed.
+   - If unsuccessful, the system moves to the retry logic.
+
+5. **Retry Condition**: The system checks if the retry condition is met (e.g., maximum attempts not reached, error is retryable).
+   - If the condition is met, a delay is applied before requeueing.
+   - If the condition is not met, the task is marked as a dead task.
+
+6. **Delay Application**: If a retry is needed, the system applies a delay (which can be fixed, exponential backoff, or custom).
+
+7. **Task Requeuing**: After the delay, the task is requeued and becomes available for dispatch again.
+
+8. **Dead Task Handling**: Tasks that have exhausted their retry attempts or met unrecoverable errors are added to the Dead Tasks List.
+
+This mechanism ensures that tasks have multiple opportunities to complete successfully, with built-in safeguards against indefinite retries. The flexible worker assignment allows for efficient resource utilization and fault tolerance.
 
 ## API Documentation
 
