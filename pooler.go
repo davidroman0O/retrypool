@@ -37,6 +37,38 @@ type TaskWrapper[T any] struct {
 	durations     []time.Duration // Track duration for each attempt
 }
 
+func (t *TaskWrapper[T]) Data() T {
+	return t.data
+}
+
+func (t *TaskWrapper[T]) Retries() int {
+	return t.retries
+}
+
+func (t *TaskWrapper[T]) TotalDuration() time.Duration {
+	return t.totalDuration
+}
+
+func (t *TaskWrapper[T]) TimeLimit() time.Duration {
+	return t.timeLimit
+}
+
+func (t *TaskWrapper[T]) ScheduledTime() time.Time {
+	return t.scheduledTime
+}
+
+func (t *TaskWrapper[T]) TriedWorkers() map[int]bool {
+	return t.triedWorkers
+}
+
+func (t *TaskWrapper[T]) Errors() []error {
+	return t.errors
+}
+
+func (t *TaskWrapper[T]) Durations() []time.Duration {
+	return t.durations
+}
+
 // taskQueue now stores pointers to taskWrapper
 type taskQueue[T any] struct {
 	tasks []*TaskWrapper[T]
