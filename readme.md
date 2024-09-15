@@ -17,6 +17,14 @@
 - **Multiple Workers**: Utilize multiple workers for concurrent task processing.
 - **Dead Task Tracking**: Collect tasks that failed after all retry attempts.
 - **Custom Retry Conditions**: Specify conditions under which tasks should be retried.
+- **Dynamic Worker Management**: Add or remove workers from the pool at runtime.
+- **Worker Interruption**: Interrupt and requeue tasks from specific workers.
+- **Task Callbacks**: Define callbacks for successful and failed task completions.
+- **Flexible Task Distribution**: Tasks are distributed to workers that haven't tried them before.
+- **Detailed Task History**: Track errors and durations for each task attempt.
+- **Custom Timer Support**: Implement custom timers for specialized timing needs.
+- **Max Delay and Jitter**: Configure maximum delay and random jitter for retry attempts.
+- **Combine Delay Strategies**: Mix multiple delay strategies for advanced retry behavior.
 
 ## Table of Contents
 
@@ -291,6 +299,27 @@ Use `retrypool.UnlimitedAttempts` to retry indefinitely until success or context
 retrypool.WithAttempts[int](retrypool.UnlimitedAttempts)
 ```
 
+## Task Callbacks
+
+Define callbacks to handle task success or failure:
+
+- **On Success**: Define a callback to execute when a task is successful.
+
+  ```go
+  retrypool.WithOnTaskSuccess(func(controller retrypool.WorkerController, workerID int, worker retrypool.Worker[int], task *retrypool.taskWrapper[int]) {
+      fmt.Printf("Task succeeded on worker %d\n", workerID)
+  })
+  ```
+
+- **On Failure**: Define a callback to execute when a task fails.
+
+  ```go
+  retrypool.WithOnTaskFailure(func(controller retrypool.WorkerController, workerID int, worker retrypool.Worker[int], task *retrypool.taskWrapper[int], err error) {
+      fmt.Printf("Task failed on worker %d: %v\n", workerID, err)
+  })
+  ```
+
+
 ## Delay Types
 
 Customize delay calculations between retries using delay functions.
@@ -307,6 +336,25 @@ retrypool.WithDelayType[int](retrypool.CombineDelay(
     retrypool.BackOffDelay[int],
     retrypool.RandomDelay[int],
 )),
+```
+
+
+## Dynamic Worker Management
+
+The pool supports adding and removing workers at runtime:
+
+### Adding Workers
+
+```go
+pool.AddWorker(&NewWorker{})
+```
+
+### Removing Workers
+
+```go
+if err := pool.RemoveWorker(workerID); err != nil {
+    log.Printf("Error removing worker: %v", err)
+}
 ```
 
 ## Error Handling
