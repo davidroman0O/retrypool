@@ -832,12 +832,12 @@ func TestOnTaskSuccessAndFailureCallbacks(t *testing.T) {
 	var counter int
 
 	pool := NewPool(ctx, []Worker[int]{worker},
-		WithOnTaskSuccess[int](func(controller WorkerController, workerID int, worker Worker[int], task *taskWrapper[int]) {
+		WithOnTaskSuccess[int](func(controller WorkerController, workerID int, worker Worker[int], task *TaskWrapper[int]) {
 			mu.Lock()
 			successCalled = true
 			mu.Unlock()
 		}),
-		WithOnTaskFailure[int](func(controller WorkerController, workerID int, worker Worker[int], task *taskWrapper[int], err error) {
+		WithOnTaskFailure[int](func(controller WorkerController, workerID int, worker Worker[int], task *TaskWrapper[int], err error) {
 			mu.Lock()
 			failureCalled = true
 			if f, ok := worker.(*FlakyWorker); ok {

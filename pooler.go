@@ -25,8 +25,8 @@ type DeadTask[T any] struct {
 	Errors        []error
 }
 
-// taskWrapper now includes scheduledTime, triedWorkers, errors, and durations for worker tracking
-type taskWrapper[T any] struct {
+// TaskWrapper now includes scheduledTime, triedWorkers, errors, and durations for worker tracking
+type TaskWrapper[T any] struct {
 	data          T
 	retries       int
 	totalDuration time.Duration
@@ -39,14 +39,14 @@ type taskWrapper[T any] struct {
 
 // taskQueue now stores pointers to taskWrapper
 type taskQueue[T any] struct {
-	tasks []*taskWrapper[T]
+	tasks []*TaskWrapper[T]
 }
 
 // Option type for configuring the Pool
 type Option[T any] func(*Pool[T])
 
 // TaskOption type for configuring individual tasks
-type TaskOption[T any] func(*taskWrapper[T])
+type TaskOption[T any] func(*TaskWrapper[T])
 
 // Config struct to hold retry configurations
 type Config[T any] struct {
@@ -171,7 +171,7 @@ func (p *Pool[T]) InterruptWorker(workerID int) error {
 
 	// Requeue any tasks assigned to this worker
 	for retries, queue := range p.taskQueues {
-		newTasks := make([]*taskWrapper[T], 0, len(queue.tasks))
+		newTasks := make([]*TaskWrapper[T], 0, len(queue.tasks))
 		for _, task := range queue.tasks {
 			if task.triedWorkers[workerID] {
 				delete(task.triedWorkers, workerID)
@@ -219,7 +219,7 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 
 	// Requeue any tasks assigned to this worker
 	for retries, queue := range p.taskQueues {
-		newTasks := make([]*taskWrapper[T], 0, len(queue.tasks))
+		newTasks := make([]*TaskWrapper[T], 0, len(queue.tasks))
 		for _, task := range queue.tasks {
 			if task.triedWorkers[workerID] {
 				delete(task.triedWorkers, workerID)
@@ -253,7 +253,7 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		p.mu.Unlock()
 	}()
 
-	var currentTask *taskWrapper[T]
+	var currentTask *TaskWrapper[T]
 	for {
 		select {
 		case <-stopChan:
@@ -346,7 +346,7 @@ func (p *Pool[T]) isAllQueuesEmpty() bool {
 }
 
 // getNextTask returns the next task that the worker hasn't tried
-func (p *Pool[T]) getNextTask(workerID int) (int, int, *taskWrapper[T], bool) {
+func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
 	for retries, q := range p.taskQueues {
 		for idx, task := range q.tasks {
 			if task.triedWorkers == nil {
@@ -366,7 +366,7 @@ func (p *Pool[T]) getNextTask(workerID int) (int, int, *taskWrapper[T], bool) {
 }
 
 // runWorkerWithFailsafe updated to handle OnRetry, RetryIf, and callbacks
-func (p *Pool[T]) runWorkerWithFailsafe(workerID int, workerCtx context.Context, task *taskWrapper[T]) {
+func (p *Pool[T]) runWorkerWithFailsafe(workerID int, workerCtx context.Context, task *TaskWrapper[T]) {
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic occurred: %v", r)
@@ -410,7 +410,7 @@ func IsUnrecoverable(err error) bool {
 }
 
 // requeueTask updated to handle delays and keep triedWorkers intact
-func (p *Pool[T]) requeueTask(task *taskWrapper[T], err error) {
+func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -451,7 +451,7 @@ func (p *Pool[T]) calculateDelay(n int, err error) time.Duration {
 }
 
 // addToDeadTasks adds task to dead tasks list
-func (p *Pool[T]) addToDeadTasks(task *taskWrapper[T], finalError error) {
+func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	totalDuration := task.totalDuration
 	for _, duration := range task.durations {
 		totalDuration += duration
@@ -478,7 +478,7 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 		return errors.New("pool is closed")
 	}
 
-	task := &taskWrapper[T]{
+	task := &TaskWrapper[T]{
 		data:         data,
 		retries:      0,
 		triedWorkers: make(map[int]bool),
@@ -720,7 +720,7 @@ func WithOnTaskFailure[T any](onTaskFailure OnTaskFailureFunc[T]) Option[T] {
 
 // WithTimeLimit sets a time limit for a task
 func WithTimeLimit[T any](limit time.Duration) TaskOption[T] {
-	return func(t *taskWrapper[T]) {
+	return func(t *TaskWrapper[T]) {
 		t.timeLimit = limit
 	}
 }
@@ -732,10 +732,10 @@ type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duratio
 type OnRetryFunc[T any] func(attempt int, err error, task T)
 
 // OnTaskSuccessFunc is the type of function called when a task succeeds
-type OnTaskSuccessFunc[T any] func(controller WorkerController, workerID int, worker Worker[T], task *taskWrapper[T])
+type OnTaskSuccessFunc[T any] func(controller WorkerController, workerID int, worker Worker[T], task *TaskWrapper[T])
 
 // OnTaskFailureFunc is the type of function called when a task fails
-type OnTaskFailureFunc[T any] func(controller WorkerController, workerID int, worker Worker[T], task *taskWrapper[T], err error)
+type OnTaskFailureFunc[T any] func(controller WorkerController, workerID int, worker Worker[T], task *TaskWrapper[T], err error)
 
 // RetryIfFunc signature
 type RetryIfFunc func(error) bool
