@@ -132,7 +132,7 @@ func (p *Pool[T]) startWorkers() {
 }
 
 // AddWorker adds a new worker to the pool dynamically
-func (p *Pool[T]) AddWorker(worker Worker[T]) {
+func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -144,6 +144,8 @@ func (p *Pool[T]) AddWorker(worker Worker[T]) {
 
 	p.wg.Add(1)
 	go p.workerLoop(workerID)
+
+	return workerID
 }
 
 // WorkerController interface provides methods to control workers
