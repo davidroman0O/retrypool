@@ -103,44 +103,45 @@ The following diagram illustrates how tasks are processed and retried in the Ret
 ```mermaid
 graph TD
     A[Task Submitted] --> B{Dispatch to Available Worker}
-    B -->|Worker 1| C1[Worker 1 Processes Task]
-    B -->|Worker 2| C2[Worker 2 Processes Task]
-    B -->|Worker 3| C3[Worker 3 Processes Task]
-    
-    C1 --> D1{Task Successful?}
-    C2 --> D2{Task Successful?}
-    C3 --> D3{Task Successful?}
-    
-    D1 -->|Yes| E[Task Completed]
-    D2 -->|Yes| E
-    D3 -->|Yes| E
-    
-    D1 -->|No| F1{Retry Condition Met?}
-    D2 -->|No| F2{Retry Condition Met?}
-    D3 -->|No| F3{Retry Condition Met?}
-    
-    F1 -->|Yes| G1[Apply Delay]
-    F2 -->|Yes| G2[Apply Delay]
-    F3 -->|Yes| G3[Apply Delay]
-    
-    G1 --> H{Requeue Task}
-    G2 --> H
-    G3 --> H
-    
-    H --> B
-    
-    F1 -->|No| I[Mark as Dead Task]
-    F2 -->|No| I
-    F3 -->|No| I
-    
+    B -->|Worker Available| C[Worker Processes Task]
+    B -->|No Worker Available| D[Queue Task]
+    D --> E{Check Queue}
+    E -->|Worker Becomes Available| C
+    E -->|Still No Worker| D
+
+    C --> F{Task Successful?}
+    F -->|Yes| G[Task Completed]
+    F -->|No| H{Retry Conditions}
+
+    H -->|Unrecoverable Error| I[Mark as Dead Task]
+    H -->|Max Attempts Reached| I
+    H -->|Time Limit Exceeded| I
     I --> J[Add to Dead Tasks List]
-    
-    subgraph "RetryPool"
-        B
-        H
-        I
-        J
-    end
+
+    H -->|Retry Possible| K[Calculate Delay]
+    K --> L{Delay Type}
+    L -->|Fixed| M[Apply Fixed Delay]
+    L -->|Backoff| N[Apply Exponential Backoff]
+    L -->|Random| O[Apply Random Delay]
+    L -->|Combined| P[Apply Combined Delay]
+
+    M --> Q[Requeue Task]
+    N --> Q
+    O --> Q
+    P --> Q
+
+    Q --> R{Immediate Retry?}
+    R -->|Yes| S[Put at Front of Queue]
+    R -->|No| T[Put at Back of Queue]
+
+    S --> U{Available Untried Worker?}
+    U -->|Yes| V[Assign to Untried Worker]
+    U -->|No| W[Reset Tried Workers]
+
+    T --> X[Wait for Next Available Worker]
+    V --> B
+    W --> B
+    X --> B
 ```
 
 1. **Task Submission**: A task is submitted to the RetryPool.
