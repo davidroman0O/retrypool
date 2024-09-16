@@ -96,7 +96,7 @@ func main() {
 }
 ```
 
-# RetryPool Task Retry Mechanism
+# Task Lifecycle Mechanism
 
 The following diagram illustrates how tasks are processed and retried in the RetryPool library:
 
