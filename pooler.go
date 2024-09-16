@@ -213,7 +213,7 @@ func (p *Pool[T]) InterruptWorker(workerID int) error {
 		for _, task := range queue.tasks {
 			if task.triedWorkers[workerID] {
 				delete(task.triedWorkers, workerID)
-				task.retries--
+				// task.retries--
 				p.requeueTask(task, errors.New("worker interrupted"))
 			} else {
 				newTasks = append(newTasks, task)
@@ -263,7 +263,7 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 				delete(task.triedWorkers, workerID)
 				if len(task.triedWorkers) == 0 {
 					// If this was the only worker that tried this task, reset it
-					task.retries = 0
+					// task.retries = 0
 					newTasks = append(newTasks, task)
 				}
 			} else {

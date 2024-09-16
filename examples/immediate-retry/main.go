@@ -29,12 +29,12 @@ func (w *DemoWorker) Run(ctx context.Context, task Task) error {
 	w.processed[task.ID]++
 	count := w.processed[task.ID]
 
-	if rand.Float32() < 0.7 { // 70% chance of failure
-		log.Printf("Worker %d: Task %d failed (attempt %d)", w.ID, task.ID, count)
+	if rand.Float32() < 0.95 { // 70% chance of failure
+		log.Printf("Worker %d: Task %d failed (running attempt %d on worker %d)", w.ID, task.ID, count, w.ID)
 		return fmt.Errorf("simulated failure")
 	}
 
-	log.Printf("Worker %d: Task %d succeeded (attempt %d)", w.ID, task.ID, count)
+	log.Printf("Worker %d: Task %d succeeded (running attempt %d on worker %d)", w.ID, task.ID, count, w.ID)
 	return nil
 }
 
@@ -52,19 +52,28 @@ func main() {
 	}
 
 	pool := retrypool.NewPool(ctx, workers,
-		retrypool.WithAttempts[Task](5),
-		retrypool.WithDelay[Task](100*time.Millisecond),
-		retrypool.WithMaxJitter[Task](50*time.Millisecond),
+		retrypool.WithAttempts[Task](retrypool.UnlimitedAttempts),
+		retrypool.WithDelay[Task](50*time.Millisecond),
+		retrypool.WithDelayType[Task](retrypool.CombineDelay[Task](
+			retrypool.FixedDelay[Task],
+		)),
 		retrypool.WithOnRetry[Task](func(attempt int, err error, task *retrypool.TaskWrapper[Task]) {
-			log.Printf("Retrying task %d (attempt %d): %v", task.Data().ID, attempt, err)
+			workers := task.TriedWorkers()
+			tried := []int{}
+			for k, v := range workers {
+				if v {
+					tried = append(tried, k)
+				}
+			}
+			log.Printf("Retrying task %d (attempt %d - %v): %v", task.Data().ID, attempt, tried, err)
 		}),
 	)
 
-	numTasks := 10
+	numTasks := 5
 	for i := 0; i < numTasks; i++ {
 		task := Task{
 			ID:             i,
-			ImmediateRetry: i%2 == 0, // Even-numbered tasks use immediate retry
+			ImmediateRetry: true, // Even-numbered tasks use immediate retry
 		}
 		var err error
 		if task.ImmediateRetry {
