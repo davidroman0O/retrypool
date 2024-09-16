@@ -98,7 +98,7 @@ func main() {
 
 # Task Lifecycle Mechanism
 
-The following diagram illustrates how tasks are processed and retried in the RetryPool library:
+The following diagram illustrates how tasks are processed:
 
 ```mermaid
 graph TD
