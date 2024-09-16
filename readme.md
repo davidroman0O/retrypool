@@ -144,25 +144,36 @@ graph TD
     X --> B
 ```
 
-1. **Task Submission**: A task is submitted to the RetryPool.
+1. Task Submission and Initial Processing:
+   - Tasks are submitted and dispatched to available workers.
+   - If no worker is available, tasks are queued.
 
-2. **Worker Assignment**: The task is dispatched to an available worker (Worker 1, Worker 2, or Worker 3).
+2. Task Execution:
+   - Workers process tasks.
+   - The outcome (success or failure) determines the next steps.
 
-3. **Task Processing**: The assigned worker processes the task.
+3. Retry Mechanism:
+   - Failed tasks go through retry conditions checking.
+   - Unrecoverable errors, max attempts reached, or time limit exceeded lead to dead tasks.
+   - Retryable tasks have a delay calculated based on the configured delay type.
 
-4. **Success Check**: The system checks if the task was completed successfully.
-   - If successful, the task is marked as completed.
-   - If unsuccessful, the system moves to the retry logic.
+4. Delay Types:
+   - Fixed, Backoff, Random, or Combined delays can be applied.
 
-5. **Retry Condition**: The system checks if the retry condition is met (e.g., maximum attempts not reached, error is retryable).
-   - If the condition is met, a delay is applied before requeueing.
-   - If the condition is not met, the task is marked as a dead task.
+5. Requeuing:
+   - Tasks can be requeued for immediate retry or normal processing.
+   - Immediate retry tasks are prioritized and assigned to untried workers if available.
 
-6. **Delay Application**: If a retry is needed, the system applies a delay (which can be fixed, exponential backoff, or custom).
+6. Task and Pool Options:
+   - Various options can be set for individual tasks or the entire pool.
+   - These include time limits, retry conditions, callbacks, and delay configurations.
 
-7. **Task Requeuing**: After the delay, the task is requeued and becomes available for dispatch again.
+7. Worker Management:
+   - Workers can be added, removed, or interrupted dynamically.
 
-8. **Dead Task Handling**: Tasks that have exhausted their retry attempts or met unrecoverable errors are added to the Dead Tasks List.
+8. Pool Operations:
+   - The pool can be closed normally or forcefully.
+   - A wait with callback mechanism is available for monitoring pool status.
 
 This mechanism ensures that tasks have multiple opportunities to complete successfully, with built-in safeguards against indefinite retries. The flexible worker assignment allows for efficient resource utilization and fault tolerance.
 
