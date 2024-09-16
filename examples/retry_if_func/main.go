@@ -45,7 +45,7 @@ func main() {
 		retrypool.WithAttempts[int](5),
 		retrypool.WithDelay[int](100*time.Millisecond),
 		retrypool.WithRetryIf[int](CustomRetryIfFunc),
-		retrypool.WithOnRetry[int](func(attempt int, err error, task int) {
+		retrypool.WithOnRetry[int](func(attempt int, err error, task *retrypool.TaskWrapper[int]) {
 			log.Printf("Retrying task %d, attempt %d: %v", task, attempt, err)
 		}),
 	)

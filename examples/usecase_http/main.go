@@ -119,8 +119,8 @@ func main() {
 		retrypool.WithDelay[TaskData](time.Second),
 		retrypool.WithMaxDelay[TaskData](5*time.Second),
 		retrypool.WithMaxJitter[TaskData](500*time.Millisecond),
-		retrypool.WithOnRetry[TaskData](func(attempt int, err error, task TaskData) {
-			log.Printf("Retrying task (URL: %s) after attempt %d: %v", task.URL, attempt, err)
+		retrypool.WithOnRetry[TaskData](func(attempt int, err error, task *retrypool.TaskWrapper[TaskData]) {
+			log.Printf("Retrying task (URL: %s) after attempt %d: %v", task.Data().URL, attempt, err)
 		}),
 	)
 

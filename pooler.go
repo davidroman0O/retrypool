@@ -281,16 +281,9 @@ func (p *Pool[T]) workerLoop(workerID int) {
 	defer p.wg.Done()
 	stopChan := p.workerChans[workerID]
 
-	var currentTask *TaskWrapper[T]
 	for {
 		select {
 		case <-stopChan:
-			if currentTask != nil {
-				// Requeue the current task
-				p.mu.Lock()
-				p.requeueTask(currentTask, errors.New("worker interrupted"))
-				p.mu.Unlock()
-			}
 			return
 		default:
 		}
@@ -305,18 +298,8 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			return
 		}
 
-		// Check if context is canceled
-		select {
-		case <-p.ctx.Done():
-			p.mu.Unlock()
-			return
-		default:
-		}
-
-		// Get next task for this worker
 		retries, idx, task, ok := p.getNextTask(workerID)
 		if !ok {
-			// No tasks available for this worker
 			p.mu.Unlock()
 			continue
 		}
@@ -352,12 +335,10 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		p.processing++
 		p.mu.Unlock()
 
-		currentTask = task
 		if task.timeLimit > 0 {
 			go p.enforceTimeLimit(task)
 		}
 		p.runWorkerWithFailsafe(workerID, task)
-		currentTask = nil
 
 		p.mu.Lock()
 		p.processing--
@@ -391,24 +372,28 @@ func (p *Pool[T]) isAllQueuesEmpty() bool {
 
 // getNextTask returns the next task that the worker hasn't tried
 func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
+	// First, check for immediate retry tasks this worker hasn't tried
 	for retries, q := range p.taskQueues {
 		for idx, task := range q.tasks {
 			if task.immediateRetry && !task.triedWorkers[workerID] {
 				return retries, idx, task, true
 			}
+		}
+	}
+
+	// Then, check for any task this worker hasn't tried
+	for retries, q := range p.taskQueues {
+		for idx, task := range q.tasks {
 			if task.triedWorkers == nil {
 				task.triedWorkers = make(map[int]bool)
 			}
-			if len(task.triedWorkers) >= len(p.workers) {
-				// All workers have tried this task; reset the list
-				task.triedWorkers = make(map[int]bool)
-			}
 			if !task.triedWorkers[workerID] {
-				// Found a task the worker hasn't tried
 				return retries, idx, task, true
 			}
 		}
 	}
+
+	// If all tasks have been tried by this worker, return no task
 	return 0, 0, nil, false
 }
 
@@ -440,7 +425,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			return
 		}
 		if err != context.Canceled && p.config.retryIf(err) {
-			p.config.onRetry(task.retries, err, task.data)
+			p.config.onRetry(task.retries, err, task)
 			if p.config.onTaskFailure != nil {
 				p.config.onTaskFailure(p, workerID, p.workers[workerID], task, err)
 			}
@@ -461,6 +446,15 @@ func IsUnrecoverable(err error) bool {
 	return errors.As(err, &unrecoverableErr)
 }
 
+/*
+	Rules:
+	- if not immediate retry:
+		- randomly select a worker that hasn't tried this task, put it at the back of the queue
+	- if immediate retry:
+		- if there are workers that haven't tried this task, put it at the front of the queue of one of them
+		- if all workers have tried this task, reset triedWorkers and put it at the back of a random worker's queue
+*/
+
 // requeueTask updated to handle delays and keep triedWorkers intact
 func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 	p.mu.Lock()
@@ -470,14 +464,12 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 
 	// Check if task has exceeded time limit
 	if task.timeLimit > 0 && task.totalDuration >= task.timeLimit {
-		log.Printf("Task exceeded time limit after %d attempts: %v\n", task.retries, err)
 		p.addToDeadTasks(task, err)
 		return
 	}
 
 	// Check if max attempts reached (unless unlimited retries)
 	if p.config.attempts != UnlimitedAttempts && task.retries >= p.config.attempts {
-		log.Printf("Task failed after %d attempts: %v\n", task.retries, err)
 		p.addToDeadTasks(task, err)
 		return
 	}
@@ -486,41 +478,49 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 	delay := p.calculateDelay(task.retries, err)
 	task.scheduledTime = time.Now().Add(delay)
 
-	if task.immediateRetry {
+	if !task.immediateRetry {
+		// Randomly select a worker that hasn't tried this task
+		availableWorkers := make([]int, 0)
+		for workerID := range p.workers {
+			if !task.triedWorkers[workerID] {
+				availableWorkers = append(availableWorkers, workerID)
+			}
+		}
+
+		var selectedWorkerID int
+		if len(availableWorkers) > 0 {
+			selectedWorkerID = availableWorkers[rand.Intn(len(availableWorkers))]
+		} else {
+			// If all workers have tried, reset triedWorkers and select a random worker
+			task.triedWorkers = make(map[int]bool)
+			selectedWorkerID = rand.Intn(len(p.workers))
+		}
+
+		q := p.taskQueues[selectedWorkerID]
+		q.tasks = append(q.tasks, task) // Put at the back of the queue
+		p.taskQueues[selectedWorkerID] = q
+	} else { // Immediate retry
 		if len(task.triedWorkers) < len(p.workers) {
-			// There are still workers that haven't tried this task
+			// Find a worker that hasn't tried this task
 			for workerID := range p.workers {
 				if !task.triedWorkers[workerID] {
-					// Put the task at the front of this worker's queue
-					q := p.taskQueues[0]
-					q.tasks = append([]*TaskWrapper[T]{task}, q.tasks...)
-					p.taskQueues[0] = q
-					p.cond.Signal()
-					return
+					q := p.taskQueues[workerID]
+					q.tasks = append([]*TaskWrapper[T]{task}, q.tasks...) // Put at the front of the queue
+					p.taskQueues[workerID] = q
+					break
 				}
 			}
 		} else {
-			// All workers have tried this task, reset triedWorkers
+			// All workers have tried, reset triedWorkers and put at the back of a random queue
 			task.triedWorkers = make(map[int]bool)
-			// Put the task at the back of a random worker's queue
-			workerIDs := make([]int, 0, len(p.workers))
-			for id := range p.workers {
-				workerIDs = append(workerIDs, id)
-			}
-			randomWorkerID := workerIDs[rand.Intn(len(workerIDs))]
+			randomWorkerID := rand.Intn(len(p.workers))
 			q := p.taskQueues[randomWorkerID]
-			q.tasks = append(q.tasks, task)
+			q.tasks = append(q.tasks, task) // Put at the back of the queue
 			p.taskQueues[randomWorkerID] = q
-			p.cond.Signal()
-			return
 		}
 	}
 
-	// If not immediate retry or no available worker, use existing logic
-	q := p.taskQueues[task.retries]
-	q.tasks = append(q.tasks, task)
-	p.taskQueues[task.retries] = q
-	p.cond.Signal()
+	p.cond.Broadcast() // Signal all workers
 }
 
 // calculateDelay calculates delay based on DelayType
@@ -679,7 +679,7 @@ func newDefaultConfig[T any]() Config[T] {
 		attemptsForError: make(map[error]int),
 		delay:            100 * time.Millisecond,
 		maxJitter:        100 * time.Millisecond,
-		onRetry:          func(n int, err error, task T) {},
+		onRetry:          func(n int, err error, task *TaskWrapper[T]) {},
 		retryIf:          IsRecoverable,
 		delayType:        CombineDelay[T](BackOffDelay[T], RandomDelay[T]),
 		lastErrorOnly:    false,
@@ -828,7 +828,7 @@ func WithImmediateRetry[T any]() TaskOption[T] {
 type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duration
 
 // OnRetryFunc signature
-type OnRetryFunc[T any] func(attempt int, err error, task T)
+type OnRetryFunc[T any] func(attempt int, err error, task *TaskWrapper[T])
 
 // OnTaskSuccessFunc is the type of function called when a task succeeds
 type OnTaskSuccessFunc[T any] func(controller WorkerController, workerID int, worker Worker[T], task *TaskWrapper[T])

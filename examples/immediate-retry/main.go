@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/davidroman0O/retrypool"
@@ -13,56 +13,59 @@ import (
 
 type Task struct {
 	ID             int
-	AttemptCount   int
 	ImmediateRetry bool
 }
 
-type Worker struct {
-	ID             int
-	SuccessCount   int32
-	FailureCount   int32
-	ProcessedTasks map[int]bool
+type DemoWorker struct {
+	ID        int
+	mu        sync.Mutex
+	processed map[int]int
 }
 
-func (w *Worker) Run(ctx context.Context, task Task) error {
-	w.ProcessedTasks[task.ID] = true
-	task.AttemptCount++
+func (w *DemoWorker) Run(ctx context.Context, task Task) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	// Simulate work
-	time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+	w.processed[task.ID]++
+	count := w.processed[task.ID]
 
-	if rand.Float32() < 0.3 { // 30% chance of failure
-		atomic.AddInt32(&w.FailureCount, 1)
-		return fmt.Errorf("task %d failed on worker %d, attempt %d", task.ID, w.ID, task.AttemptCount)
+	if rand.Float32() < 0.7 { // 70% chance of failure
+		log.Printf("Worker %d: Task %d failed (attempt %d)", w.ID, task.ID, count)
+		return fmt.Errorf("simulated failure")
 	}
 
-	atomic.AddInt32(&w.SuccessCount, 1)
+	log.Printf("Worker %d: Task %d succeeded (attempt %d)", w.ID, task.ID, count)
 	return nil
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+	ctx := context.Background()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	workers := make([]retrypool.Worker[Task], 3)
-	for i := range workers {
-		workers[i] = &Worker{ID: i, ProcessedTasks: make(map[int]bool)}
+	numWorkers := 3
+	workers := make([]retrypool.Worker[Task], numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		workers[i] = &DemoWorker{
+			ID:        i,
+			processed: make(map[int]int),
+		}
 	}
 
 	pool := retrypool.NewPool(ctx, workers,
 		retrypool.WithAttempts[Task](5),
 		retrypool.WithDelay[Task](100*time.Millisecond),
 		retrypool.WithMaxJitter[Task](50*time.Millisecond),
-		retrypool.WithOnRetry[Task](func(attempt int, err error, task Task) {
-			log.Printf("Retrying task %d, attempt %d: %v", task.ID, attempt, err)
+		retrypool.WithOnRetry[Task](func(attempt int, err error, task *retrypool.TaskWrapper[Task]) {
+			log.Printf("Retrying task %d (attempt %d): %v", task.Data().ID, attempt, err)
 		}),
 	)
 
-	// Dispatch tasks
-	for i := 0; i < 20; i++ {
-		task := Task{ID: i, ImmediateRetry: i%2 == 0} // Even-numbered tasks use immediate retry
+	numTasks := 10
+	for i := 0; i < numTasks; i++ {
+		task := Task{
+			ID:             i,
+			ImmediateRetry: i%2 == 0, // Even-numbered tasks use immediate retry
+		}
 		var err error
 		if task.ImmediateRetry {
 			err = pool.Dispatch(task, retrypool.WithImmediateRetry[Task]())
@@ -81,16 +84,18 @@ func main() {
 	}, 500*time.Millisecond)
 
 	if err != nil {
-		log.Printf("Pool wait error: %v", err)
+		log.Printf("Error while waiting for tasks to complete: %v", err)
 	}
 
 	pool.Close()
 
 	// Print results
 	for i, w := range workers {
-		worker := w.(*Worker)
-		log.Printf("Worker %d - Successes: %d, Failures: %d, Unique tasks: %d",
-			i, worker.SuccessCount, worker.FailureCount, len(worker.ProcessedTasks))
+		demoWorker := w.(*DemoWorker)
+		log.Printf("Worker %d processed:", i)
+		for taskID, count := range demoWorker.processed {
+			log.Printf("  Task %d: %d times", taskID, count)
+		}
 	}
 
 	deadTasks := pool.DeadTasks()

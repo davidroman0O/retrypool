@@ -189,9 +189,9 @@ func TestOnRetryCallback(t *testing.T) {
 	retryAttempts := 0
 	pool := NewPool(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
-		WithOnRetry[int](func(attempt int, err error, task int) {
+		WithOnRetry[int](func(attempt int, err error, task *TaskWrapper[int]) {
 			retryAttempts++
-			log.Printf("Retry attempt %d for task %d due to error: %v", attempt, task, err)
+			log.Printf("Retry attempt %d for task %d due to error: %v", attempt, task.data, err)
 		}),
 	)
 

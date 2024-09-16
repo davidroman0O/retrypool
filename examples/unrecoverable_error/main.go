@@ -27,8 +27,8 @@ func main() {
 	workers := []retrypool.Worker[int]{&UnrecoverableWorker{}, &UnrecoverableWorker{}}
 	pool := retrypool.NewPool(ctx, workers,
 		retrypool.WithAttempts[int](3),
-		retrypool.WithOnRetry[int](func(attempt int, err error, task int) {
-			log.Printf("Retrying task %d, attempt %d: %v", task, attempt, err)
+		retrypool.WithOnRetry[int](func(attempt int, err error, task *retrypool.TaskWrapper[int]) {
+			log.Printf("Retrying task %v, attempt %d: %v", task, attempt, err)
 		}),
 	)
 
