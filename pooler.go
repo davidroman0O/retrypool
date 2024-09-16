@@ -30,7 +30,8 @@ type TaskWrapper[T any] struct {
 	data           T
 	retries        int
 	totalDuration  time.Duration
-	timeLimit      time.Duration   // Zero means no limit
+	timeLimit      time.Duration   // Zero means no overall limit
+	maxDuration    time.Duration   // Max duration per attempt
 	scheduledTime  time.Time       // For delay between retries
 	triedWorkers   map[int]bool    // Track workers that have tried this task
 	errors         []error         // Track errors for each attempt
@@ -407,8 +408,25 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		}
 	}()
 
+	// Reset attempt-specific duration tracking
 	start := time.Now()
-	err := p.workers[workerID].Run(task.ctx, task.data)
+	attemptCtx, attemptCancel := context.WithCancel(task.ctx)
+	task.cancel = attemptCancel
+
+	// If maxDuration is set, enforce it by cancelling the attempt's context when exceeded
+	if task.maxDuration > 0 {
+		go func() {
+			select {
+			case <-time.After(task.maxDuration):
+				task.cancel() // This cancels the attempt's context when maxDuration is exceeded
+			case <-attemptCtx.Done():
+				// Task completed or cancelled for other reasons
+			}
+		}()
+	}
+
+	// Attempt to run the worker
+	err := p.workers[workerID].Run(attemptCtx, task.data)
 	duration := time.Since(start)
 	task.totalDuration += duration
 	task.durations = append(task.durations, duration)
@@ -419,9 +437,10 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			p.addToDeadTasks(task, err)
 			return
 		}
-		// Check if the error is due to time limit exceeded
-		if err == context.DeadlineExceeded || (err == context.Canceled && task.totalDuration >= task.timeLimit) {
-			p.addToDeadTasks(task, fmt.Errorf("task exceeded time limit of %v", task.timeLimit))
+		// Check if the error is due to time limit or max duration exceeded
+		if err == context.DeadlineExceeded || (err == context.Canceled && duration >= task.maxDuration) {
+			// Exceeded maxDuration for this attempt
+			p.requeueTask(task, fmt.Errorf("task exceeded max duration of %v for attempt", task.maxDuration))
 			return
 		}
 		if err != context.Canceled && p.config.retryIf(err) {
@@ -467,6 +486,9 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 		p.addToDeadTasks(task, err)
 		return
 	}
+
+	// Reset the per-attempt duration for the next attempt
+	task.durations = nil
 
 	// Check if max attempts reached (unless unlimited retries)
 	if p.config.attempts != UnlimitedAttempts && task.retries >= p.config.attempts {
@@ -713,6 +735,7 @@ func (unrecoverableError) Is(err error) bool {
 
 // Timer interface for custom timers
 type Timer interface {
+	// TODO: add more ifnormations, that's not fair
 	After(time.Duration) <-chan time.Time
 }
 
@@ -811,7 +834,15 @@ func WithOnTaskFailure[T any](onTaskFailure OnTaskFailureFunc[T]) Option[T] {
 
 // TaskOption functions for configuring individual tasks
 
-// WithTimeLimit sets a time limit for a task
+// Add WithMaxDuration TaskOption to set per-attempt max duration
+func WithMaxDuration[T any](maxDuration time.Duration) TaskOption[T] {
+	return func(t *TaskWrapper[T]) {
+		t.maxDuration = maxDuration
+	}
+}
+
+// WithTimeLimit sets a time limit for a task, it take in account all retries
+// If reached the task will be put back at the end of the queue
 func WithTimeLimit[T any](limit time.Duration) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.timeLimit = limit
