@@ -27,16 +27,17 @@ type DeadTask[T any] struct {
 
 // TaskWrapper now includes scheduledTime, triedWorkers, errors, and durations for worker tracking
 type TaskWrapper[T any] struct {
-	data          T
-	retries       int
-	totalDuration time.Duration
-	timeLimit     time.Duration   // Zero means no limit
-	scheduledTime time.Time       // For delay between retries
-	triedWorkers  map[int]bool    // Track workers that have tried this task
-	errors        []error         // Track errors for each attempt
-	durations     []time.Duration // Track duration for each attempt
-	ctx           context.Context
-	cancel        context.CancelFunc
+	data           T
+	retries        int
+	totalDuration  time.Duration
+	timeLimit      time.Duration   // Zero means no limit
+	scheduledTime  time.Time       // For delay between retries
+	triedWorkers   map[int]bool    // Track workers that have tried this task
+	errors         []error         // Track errors for each attempt
+	durations      []time.Duration // Track duration for each attempt
+	ctx            context.Context
+	cancel         context.CancelFunc
+	immediateRetry bool
 }
 
 func (t *TaskWrapper[T]) Data() T {
@@ -392,6 +393,9 @@ func (p *Pool[T]) isAllQueuesEmpty() bool {
 func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
 	for retries, q := range p.taskQueues {
 		for idx, task := range q.tasks {
+			if task.immediateRetry && !task.triedWorkers[workerID] {
+				return retries, idx, task, true
+			}
 			if task.triedWorkers == nil {
 				task.triedWorkers = make(map[int]bool)
 			}
@@ -482,7 +486,37 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 	delay := p.calculateDelay(task.retries, err)
 	task.scheduledTime = time.Now().Add(delay)
 
-	// Requeue task
+	if task.immediateRetry {
+		if len(task.triedWorkers) < len(p.workers) {
+			// There are still workers that haven't tried this task
+			for workerID := range p.workers {
+				if !task.triedWorkers[workerID] {
+					// Put the task at the front of this worker's queue
+					q := p.taskQueues[0]
+					q.tasks = append([]*TaskWrapper[T]{task}, q.tasks...)
+					p.taskQueues[0] = q
+					p.cond.Signal()
+					return
+				}
+			}
+		} else {
+			// All workers have tried this task, reset triedWorkers
+			task.triedWorkers = make(map[int]bool)
+			// Put the task at the back of a random worker's queue
+			workerIDs := make([]int, 0, len(p.workers))
+			for id := range p.workers {
+				workerIDs = append(workerIDs, id)
+			}
+			randomWorkerID := workerIDs[rand.Intn(len(workerIDs))]
+			q := p.taskQueues[randomWorkerID]
+			q.tasks = append(q.tasks, task)
+			p.taskQueues[randomWorkerID] = q
+			p.cond.Signal()
+			return
+		}
+	}
+
+	// If not immediate retry or no available worker, use existing logic
 	q := p.taskQueues[task.retries]
 	q.tasks = append(q.tasks, task)
 	p.taskQueues[task.retries] = q
@@ -528,13 +562,14 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 
 	taskCtx, cancel := context.WithCancel(p.ctx)
 	task := &TaskWrapper[T]{
-		data:         data,
-		retries:      0,
-		triedWorkers: make(map[int]bool),
-		errors:       make([]error, 0),
-		durations:    make([]time.Duration, 0),
-		ctx:          taskCtx,
-		cancel:       cancel,
+		data:           data,
+		retries:        0,
+		triedWorkers:   make(map[int]bool),
+		errors:         make([]error, 0),
+		durations:      make([]time.Duration, 0),
+		ctx:            taskCtx,
+		cancel:         cancel,
+		immediateRetry: false,
 	}
 	for _, opt := range options {
 		opt(task)
@@ -780,6 +815,12 @@ func WithOnTaskFailure[T any](onTaskFailure OnTaskFailureFunc[T]) Option[T] {
 func WithTimeLimit[T any](limit time.Duration) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.timeLimit = limit
+	}
+}
+
+func WithImmediateRetry[T any]() TaskOption[T] {
+	return func(t *TaskWrapper[T]) {
+		t.immediateRetry = true
 	}
 }
 
