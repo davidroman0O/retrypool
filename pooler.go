@@ -35,6 +35,8 @@ type TaskWrapper[T any] struct {
 	triedWorkers  map[int]bool    // Track workers that have tried this task
 	errors        []error         // Track errors for each attempt
 	durations     []time.Duration // Track duration for each attempt
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 func (t *TaskWrapper[T]) Data() T {
@@ -98,6 +100,8 @@ type Config[T any] struct {
 	onTaskFailure OnTaskFailureFunc[T] // Callback when a task fails
 
 	maxBackOffN uint
+
+	contextFunc ContextFunc
 }
 
 // Pool struct updated to include Config and support dynamic worker management
@@ -187,6 +191,7 @@ type WorkerController interface {
 }
 
 // InterruptWorker interrupts a worker's execution
+// TODO: add resume worker...
 func (p *Pool[T]) InterruptWorker(workerID int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -274,16 +279,6 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 func (p *Pool[T]) workerLoop(workerID int) {
 	defer p.wg.Done()
 	stopChan := p.workerChans[workerID]
-	workerCtx, cancel := context.WithCancel(p.ctx)
-	p.mu.Lock()
-	p.workerCancels[workerID] = cancel
-	p.mu.Unlock()
-	defer func() {
-		cancel()
-		p.mu.Lock()
-		delete(p.workerCancels, workerID)
-		p.mu.Unlock()
-	}()
 
 	var currentTask *TaskWrapper[T]
 	for {
@@ -357,13 +352,29 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		p.mu.Unlock()
 
 		currentTask = task
-		p.runWorkerWithFailsafe(workerID, workerCtx, task)
+		if task.timeLimit > 0 {
+			go p.enforceTimeLimit(task)
+		}
+		p.runWorkerWithFailsafe(workerID, task)
 		currentTask = nil
 
 		p.mu.Lock()
 		p.processing--
 		p.cond.Signal()
 		p.mu.Unlock()
+	}
+}
+
+func (p *Pool[T]) enforceTimeLimit(task *TaskWrapper[T]) {
+	if task.timeLimit <= 0 {
+		return
+	}
+
+	select {
+	case <-time.After(task.timeLimit - task.totalDuration):
+		task.cancel() // This will cancel the task's context
+	case <-task.ctx.Done():
+		// Task completed or was cancelled for other reasons
 	}
 }
 
@@ -398,7 +409,7 @@ func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
 }
 
 // runWorkerWithFailsafe updated to handle OnRetry, RetryIf, and callbacks
-func (p *Pool[T]) runWorkerWithFailsafe(workerID int, workerCtx context.Context, task *TaskWrapper[T]) {
+func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	defer func() {
 		if r := recover(); r != nil {
 			err := fmt.Errorf("panic occurred: %v", r)
@@ -408,7 +419,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, workerCtx context.Context,
 	}()
 
 	start := time.Now()
-	err := p.workers[workerID].Run(workerCtx, task.data)
+	err := p.workers[workerID].Run(task.ctx, task.data)
 	duration := time.Since(start)
 	task.totalDuration += duration
 	task.durations = append(task.durations, duration)
@@ -417,6 +428,11 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, workerCtx context.Context,
 		task.errors = append(task.errors, err)
 		if IsUnrecoverable(err) {
 			p.addToDeadTasks(task, err)
+			return
+		}
+		// Check if the error is due to time limit exceeded
+		if err == context.DeadlineExceeded || (err == context.Canceled && task.totalDuration >= task.timeLimit) {
+			p.addToDeadTasks(task, fmt.Errorf("task exceeded time limit of %v", task.timeLimit))
 			return
 		}
 		if err != context.Canceled && p.config.retryIf(err) {
@@ -510,12 +526,15 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 		return errors.New("pool is closed")
 	}
 
+	taskCtx, cancel := context.WithCancel(p.ctx)
 	task := &TaskWrapper[T]{
 		data:         data,
 		retries:      0,
 		triedWorkers: make(map[int]bool),
 		errors:       make([]error, 0),
 		durations:    make([]time.Duration, 0),
+		ctx:          taskCtx,
+		cancel:       cancel,
 	}
 	for _, opt := range options {
 		opt(task)
@@ -678,6 +697,13 @@ func WithAttempts[T any](attempts int) Option[T] {
 	}
 }
 
+// WithWorkerContext create a specific context for each worker
+func WithWorkerContext[T any](fn ContextFunc) Option[T] {
+	return func(t *Pool[T]) {
+		t.config.contextFunc = fn
+	}
+}
+
 // WithDelay sets the delay between retries
 func WithDelay[T any](delay time.Duration) Option[T] {
 	return func(p *Pool[T]) {
@@ -771,6 +797,9 @@ type OnTaskFailureFunc[T any] func(controller WorkerController, workerID int, wo
 
 // RetryIfFunc signature
 type RetryIfFunc func(error) bool
+
+// ContextFunc signature
+type ContextFunc func() context.Context
 
 // DelayType functions
 
