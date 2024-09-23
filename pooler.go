@@ -25,7 +25,7 @@ type DeadTask[T any] struct {
 	Errors        []error
 }
 
-// TaskWrapper now includes scheduledTime, triedWorkers, errors, and durations for worker tracking
+// TaskWrapper now includes scheduledTime, triedWorkers, errors, durations, and panicOnTimeout
 type TaskWrapper[T any] struct {
 	data           T
 	retries        int
@@ -39,6 +39,7 @@ type TaskWrapper[T any] struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	immediateRetry bool
+	panicOnTimeout bool // New field to trigger panic on timeout
 }
 
 func (t *TaskWrapper[T]) Data() T {
@@ -73,7 +74,7 @@ func (t *TaskWrapper[T]) Durations() []time.Duration {
 	return t.durations
 }
 
-// taskQueue now stores pointers to taskWrapper
+// taskQueue now stores pointers to TaskWrapper
 type taskQueue[T any] struct {
 	tasks []*TaskWrapper[T]
 }
@@ -214,7 +215,6 @@ func (p *Pool[T]) InterruptWorker(workerID int) error {
 		for _, task := range queue.tasks {
 			if task.triedWorkers[workerID] {
 				delete(task.triedWorkers, workerID)
-				// task.retries--
 				p.requeueTask(task, errors.New("worker interrupted"))
 			} else {
 				newTasks = append(newTasks, task)
@@ -263,8 +263,6 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 			if task.triedWorkers[workerID] {
 				delete(task.triedWorkers, workerID)
 				if len(task.triedWorkers) == 0 {
-					// If this was the only worker that tried this task, reset it
-					// task.retries = 0
 					newTasks = append(newTasks, task)
 				}
 			} else {
@@ -311,11 +309,10 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			p.mu.Unlock()
 			select {
 			case <-p.timer.After(waitDuration):
-				// Time to process the task
 			case <-p.ctx.Done():
 				return
 			}
-			continue // Re-acquire the lock and re-check conditions
+			continue
 		}
 
 		// Remove the task from the queue
@@ -357,7 +354,6 @@ func (p *Pool[T]) enforceTimeLimit(task *TaskWrapper[T]) {
 	case <-time.After(task.timeLimit - task.totalDuration):
 		task.cancel() // This will cancel the task's context
 	case <-task.ctx.Done():
-		// Task completed or was cancelled for other reasons
 	}
 }
 
@@ -408,10 +404,17 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		}
 	}()
 
-	// Reset attempt-specific duration tracking
-	start := time.Now()
+	// Create attempt-specific context
 	attemptCtx, attemptCancel := context.WithCancel(task.ctx)
 	task.cancel = attemptCancel
+
+	// Wrap context with panic context if enabled
+	if task.panicOnTimeout {
+		attemptCtx = &panicContext{Context: attemptCtx}
+	}
+
+	// Reset attempt-specific duration tracking
+	start := time.Now()
 
 	// If maxDuration is set, enforce it by cancelling the attempt's context when exceeded
 	if task.maxDuration > 0 {
@@ -420,7 +423,6 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			case <-time.After(task.maxDuration):
 				task.cancel() // This cancels the attempt's context when maxDuration is exceeded
 			case <-attemptCtx.Done():
-				// Task completed or cancelled for other reasons
 			}
 		}()
 	}
@@ -465,6 +467,7 @@ func IsUnrecoverable(err error) bool {
 	return errors.As(err, &unrecoverableErr)
 }
 
+// requeueTask updated to handle delays and keep triedWorkers intact
 /*
 	Rules:
 	- if not immediate retry:
@@ -473,8 +476,6 @@ func IsUnrecoverable(err error) bool {
 		- if there are workers that haven't tried this task, put it at the front of the queue of one of them
 		- if all workers have tried this task, reset triedWorkers and put it at the back of a random worker's queue
 */
-
-// requeueTask updated to handle delays and keep triedWorkers intact
 func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -521,7 +522,8 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 		q := p.taskQueues[selectedWorkerID]
 		q.tasks = append(q.tasks, task) // Put at the back of the queue
 		p.taskQueues[selectedWorkerID] = q
-	} else { // Immediate retry
+	} else {
+		// Immediate retry
 		if len(task.triedWorkers) < len(p.workers) {
 			// Find a worker that hasn't tried this task
 			for workerID := range p.workers {
@@ -680,7 +682,6 @@ func (p *Pool[T]) ForceClose() {
 
 // WaitWithCallback waits for the pool to complete while calling a callback function
 func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize, processingCount int) bool, interval time.Duration) error {
-	// defer p.Close()
 	for {
 		select {
 		case <-ctx.Done():
@@ -734,8 +735,8 @@ func (unrecoverableError) Is(err error) bool {
 }
 
 // Timer interface for custom timers
+// TODO: add more ifnormations, that's not fair
 type Timer interface {
-	// TODO: add more ifnormations, that's not fair
 	After(time.Duration) <-chan time.Time
 }
 
@@ -755,10 +756,10 @@ func WithAttempts[T any](attempts int) Option[T] {
 	}
 }
 
-// WithWorkerContext create a specific context for each worker
+// WithWorkerContext creates a specific context for each worker
 func WithWorkerContext[T any](fn ContextFunc) Option[T] {
-	return func(t *Pool[T]) {
-		t.config.contextFunc = fn
+	return func(p *Pool[T]) {
+		p.config.contextFunc = fn
 	}
 }
 
@@ -834,24 +835,31 @@ func WithOnTaskFailure[T any](onTaskFailure OnTaskFailureFunc[T]) Option[T] {
 
 // TaskOption functions for configuring individual tasks
 
-// Add WithMaxDuration TaskOption to set per-attempt max duration
+// WithMaxDuration TaskOption to set per-attempt max duration
 func WithMaxDuration[T any](maxDuration time.Duration) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.maxDuration = maxDuration
 	}
 }
 
-// WithTimeLimit sets a time limit for a task, it take in account all retries
-// If reached the task will be put back at the end of the queue
+// WithTimeLimit sets a time limit for a task, considering all retries
 func WithTimeLimit[T any](limit time.Duration) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.timeLimit = limit
 	}
 }
 
+// WithImmediateRetry enables immediate retry for a task
 func WithImmediateRetry[T any]() TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.immediateRetry = true
+	}
+}
+
+// WithPanicOnTimeout enables panic on timeout for a task
+func WithPanicOnTimeout[T any]() TaskOption[T] {
+	return func(t *TaskWrapper[T]) {
+		t.panicOnTimeout = true
 	}
 }
 
@@ -969,4 +977,16 @@ func (c *Config[T]) Timer() Timer {
 
 func (c *Config[T]) MaxBackOffN() uint {
 	return c.maxBackOffN
+}
+
+// panicContext is a custom context that panics when canceled
+type panicContext struct {
+	context.Context
+}
+
+func (p *panicContext) Err() error {
+	if err := p.Context.Err(); err != nil {
+		panic("context canceled due to timeout")
+	}
+	return nil
 }
