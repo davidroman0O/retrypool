@@ -133,9 +133,6 @@ type Pool[T any] struct {
 
 // NewPool initializes the Pool with given workers and options
 func NewPool[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) *Pool[T] {
-	if len(workers) == 0 {
-		panic("worker count does not match provided workers")
-	}
 
 	pool := &Pool[T]{
 		workers:          make(map[int]Worker[T]),
@@ -162,18 +159,7 @@ func NewPool[T any](ctx context.Context, workers []Worker[T], options ...Option[
 		pool.AddWorker(worker)
 	}
 
-	// pool.startWorkers()
 	return pool
-}
-
-// startWorkers updated to handle dynamic workers
-func (p *Pool[T]) startWorkers() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for workerID := range p.workers {
-		p.wg.Add(1)
-		go p.workerLoop(workerID)
-	}
 }
 
 // AddWorker adds a new worker to the pool dynamically
