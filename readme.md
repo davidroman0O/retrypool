@@ -154,36 +154,74 @@ graph TD
 
 ```
 
-1. Task Submission and Initial Processing:
-   - Tasks are submitted and dispatched to available workers.
-   - If no worker is available, tasks are queued.
+1. Task Submission and Dispatching
+   - Task Creation: A task is created and submitted to the pool using the `Dispatch` method.
+   - Pool Status Check: The pool checks if it's currently accepting new tasks.
+     - If Closed: An error is returned, indicating that no new tasks can be accepted.
+     - If Open: The task proceeds to the next step.
+   - Applying Task Options: Any task-specific options (e.g., time limits, immediate retry) are applied to configure its behavior.
 
-2. Task Execution:
-   - Workers process tasks.
-   - The outcome (success or failure) determines the next steps.
+2. Worker Assignment
+   - Task Queuing: The task is placed into the appropriate queue within the pool.
+     - Queue Selection: Tasks are assigned to queues based on retry attempts or other criteria.
+   - Worker Availability Check: Workers continuously check for tasks in their assigned queues.
+     - If Worker Available: The task is dequeued and assigned to the available worker.
+     - If No Worker Available: The task remains in the queue until a worker becomes available.
 
-3. Retry Mechanism:
-   - Failed tasks go through retry conditions checking.
-   - Unrecoverable errors, max attempts reached, or time limit exceeded lead to dead tasks.
-   - Retryable tasks have a delay calculated based on the configured delay type.
+3. Task Execution
+   - Context Management: A context is created for the task, which may include timeouts or cancellation signals.
+     - Time Limits and Max Duration: If specified, the task enforces time limits for total execution time or per-attempt duration.
+     - Panic on Timeout: If enabled, the task's context is wrapped to trigger a panic if a timeout occurs.
+   - Worker Processing: The assigned worker begins processing the task using its `Run` method.
+     - Error Handling: Any errors during execution are captured for further evaluation.
 
-4. Delay Types:
-   - Fixed, Backoff, Random, or Combined delays can be applied.
+4. Task Outcome Determination
+   - Success Check: The pool checks if the task completed successfully.
+     - If Successful: The task is marked as completed, and any success callbacks are invoked.
+     - If Failed: The error is evaluated to determine the next steps.
 
-5. Requeuing:
-   - Tasks can be requeued for immediate retry or normal processing.
-   - Immediate retry tasks are prioritized and assigned to untried workers if available.
+5. Error Handling and Retry Logic
+   - Unrecoverable Errors: If the error is deemed unrecoverable, the task is added to the dead tasks list.
+   - Retry Eligibility Check: The pool checks if the task can be retried based on:
+     - Retry Conditions: Configurable conditions determine if a retry should occur (e.g., specific error types).
+     - Max Attempts: The task's retry count is compared against the maximum allowed attempts.
+     - Time Limits: Total execution time is checked against any specified time limits.
+   - Proceeding with Retry: If eligible, the task is prepared for retry.
 
-6. Task and Pool Options:
-   - Various options can be set for individual tasks or the entire pool.
-   - These include time limits, retry conditions, callbacks, and delay configurations.
+6. Delay Calculation and Requeuing
+   - Delay Determination: The pool calculates the delay before the next retry using the configured delay type:
+     - Fixed Delay: A constant delay between retries.
+     - Exponential Backoff: Delay increases exponentially with each retry attempt.
+     - Random Jitter: Adds randomness to the delay to prevent thundering herd problems.
+     - Combined Delay: Uses a combination of the above strategies.
+   - Task Requeuing: The task is requeued with the calculated delay.
+     - Immediate Retry Option: If enabled, the task is placed at the front of the queue for quicker retry.
+     - Worker Assignment: The task may be assigned to a different worker, especially if some workers have not yet attempted it.
 
-7. Worker Management:
-   - Workers can be added, removed, or interrupted dynamically.
+7. Worker Management
+   - Dynamic Worker Addition: New workers can be added to the pool at runtime using the `AddWorker` method.
+   - Worker Removal: Workers can be gracefully removed from the pool using the `RemoveWorker` method.
+     - Task Reassignment: Tasks assigned to a removed worker are requeued and reassigned.
+     - Force Removal: If a worker does not stop within a specified timeout, it can be forcefully terminated.
+   - Worker Contexts: Each worker operates within its own context, allowing for individual cancellation or timeout handling.
 
-8. Pool Operations:
-   - The pool can be closed normally or forcefully.
-   - A wait with callback mechanism is available for monitoring pool status.
+8. Pool Lifecycle Management
+   - Graceful Shutdown: The `Close` method stops the pool from accepting new tasks and waits for all running tasks to complete.
+   - Forceful Shutdown: The `ForceClose` method stops the pool immediately without waiting for tasks to finish.
+   - Monitoring and Callbacks: The pool provides mechanisms to monitor its state and invoke callbacks on task success or failure.
+     - OnTaskSuccess Callback: Invoked when a task completes successfully.
+     - OnTaskFailure Callback: Invoked when a task fails and cannot be retried.
+
+9. Dead Task Handling
+   - Dead Tasks List: Tasks that have failed permanently are added to the dead tasks list.
+   - Retrieval: Users can retrieve the list of dead tasks using the `DeadTasks` method for inspection or logging.
+
+10. Configurable Options and Customization
+    - Retry Policies: Customize retry behavior using options like `WithAttempts`, `WithRetryIf`, and `WithDelayType`.
+    - Delay Strategies: Implement custom delay strategies by providing a `DelayTypeFunc`.
+    - Task Options: Individual tasks can have specific settings, such as maximum duration or immediate retry preference.
+    - Context Customization: Use `WithWorkerContext` to define how worker contexts are created.
+    - Callbacks and Hooks: Integrate custom logic by setting `OnRetry`, `OnTaskSuccess`, and `OnTaskFailure` functions.
 
 This mechanism ensures that tasks have multiple opportunities to complete successfully, with built-in safeguards against indefinite retries. The flexible worker assignment allows for efficient resource utilization and fault tolerance.
 
