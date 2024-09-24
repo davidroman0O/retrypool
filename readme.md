@@ -154,6 +154,8 @@ graph TD
 
 ```
 
+Overview of the Task Processing Algorithm:
+
 1. Task Submission and Dispatching
    - Task Creation: A task is created and submitted to the pool using the `Dispatch` method.
    - Pool Status Check: The pool checks if it's currently accepting new tasks.
