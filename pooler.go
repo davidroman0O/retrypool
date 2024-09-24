@@ -320,17 +320,25 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		}
 
 		p.mu.Lock()
+		// Check if forcePanicFlag is set
+		if forcePanicFlag.Load() {
+			p.mu.Unlock()
+			panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
+		}
+
 		for p.isAllQueuesEmpty() && !p.stopped {
 			p.cond.Wait()
 
 			// Check if context is canceled
 			if ctx.Err() != nil {
-				if forcePanicFlag.Load() {
-					p.mu.Unlock()
-					panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
-				}
 				p.mu.Unlock()
 				return
+			}
+
+			// Check if forcePanicFlag is set again after wait
+			if forcePanicFlag.Load() {
+				p.mu.Unlock()
+				panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
 			}
 		}
 
@@ -341,12 +349,14 @@ func (p *Pool[T]) workerLoop(workerID int) {
 
 		// Check if context is canceled before proceeding
 		if ctx.Err() != nil {
-			if forcePanicFlag.Load() {
-				p.mu.Unlock()
-				panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
-			}
 			p.mu.Unlock()
 			return
+		}
+
+		// Check forcePanicFlag before proceeding
+		if forcePanicFlag.Load() {
+			p.mu.Unlock()
+			panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
 		}
 
 		retries, idx, task, ok := p.getNextTask(workerID)
@@ -387,13 +397,8 @@ func (p *Pool[T]) workerLoop(workerID int) {
 
 		// Check if context is canceled before processing the task
 		if ctx.Err() != nil {
-			if forcePanicFlag.Load() {
-				panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
-			}
 			return
 		}
-
-		// No need to call enforceTimeLimit here; it's handled within runWorkerWithFailsafe
 
 		p.runWorkerWithFailsafe(workerID, task)
 
@@ -509,7 +514,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				err = fmt.Errorf("panic occurred: %v", r)
+				err = fmt.Errorf("panic occurred in worker %d: %v", workerID, r)
 			}
 		}()
 
@@ -523,6 +528,13 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		}
 		err = state.worker.Run(attemptCtx, task.data)
 	}()
+
+	// Check for panicOnTimeoutError
+	var timeoutErr *panicOnTimeoutError
+	if errors.As(err, &timeoutErr) {
+		// Handle the timeout error
+		err = fmt.Errorf("worker %d stopped due to timeout: %w", workerID, timeoutErr)
+	}
 
 	duration := time.Since(start)
 
@@ -542,7 +554,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			return
 		}
 		// Check if the error is due to time limit or max duration exceeded
-		if err == context.DeadlineExceeded || (err == context.Canceled && duration >= task.maxDuration) {
+		if errors.Is(err, context.DeadlineExceeded) || (errors.Is(err, context.Canceled) && duration >= task.maxDuration) {
 			// Exceeded maxDuration for this attempt
 			p.requeueTask(task, fmt.Errorf("task exceeded max duration of %v for attempt", task.maxDuration))
 			return
@@ -1098,14 +1110,27 @@ func (c *Config[T]) MaxBackOffN() uint {
 	return c.maxBackOffN
 }
 
-// panicContext is a custom context that panics when canceled
+// panicContext is a custom context that returns a specific error on timeout
 type panicContext struct {
 	context.Context
 }
 
 func (p *panicContext) Err() error {
 	if err := p.Context.Err(); err != nil {
-		panic("context canceled due to timeout")
+		return &panicOnTimeoutError{cause: err}
 	}
 	return nil
+}
+
+// panicOnTimeoutError indicates that the context was canceled due to a timeout
+type panicOnTimeoutError struct {
+	cause error
+}
+
+func (e *panicOnTimeoutError) Error() string {
+	return fmt.Sprintf("context canceled due to timeout: %v", e.cause)
+}
+
+func (e *panicOnTimeoutError) Unwrap() error {
+	return e.cause
 }
