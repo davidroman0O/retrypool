@@ -102,46 +102,56 @@ The following diagram illustrates how tasks are processed:
 
 ```mermaid
 graph TD
-    A[Task Submitted] --> B{Dispatch to Available Worker}
-    B -->|Worker Available| C[Worker Processes Task]
-    B -->|No Worker Available| D[Queue Task]
-    D --> E{Check Queue}
-    E -->|Worker Becomes Available| C
-    E -->|Still No Worker| D
-
-    C --> F{Task Successful?}
-    F -->|Yes| G[Task Completed]
-    F -->|No| H{Retry Conditions}
-
-    H -->|Unrecoverable Error| I[Mark as Dead Task]
-    H -->|Max Attempts Reached| I
-    H -->|Time Limit Exceeded| I
-    I --> J[Add to Dead Tasks List]
-
-    H -->|Retry Possible| K[Calculate Delay]
-    K --> L{Delay Type}
-    L -->|Fixed| M[Apply Fixed Delay]
-    L -->|Backoff| N[Apply Exponential Backoff]
-    L -->|Random| O[Apply Random Delay]
-    L -->|Combined| P[Apply Combined Delay]
-
-    M --> Q[Requeue Task]
-    N --> Q
-    O --> Q
+    A[Task Submitted] --> B{Is Pool Closed?}
+    B -->|Yes| C[Return Error]
+    B -->|No| D[Dispatch Task to Pool]
+    D --> E[Apply Task Options]
+    E --> F[Assign Task to Worker]
+    F --> G{Is Worker Available?}
+    G -->|Yes| H[Worker Processes Task]
+    G -->|No| I[Queue Task]
+    I --> J[Wait for Worker]
+    J --> G
+    H --> K{Does Task Have Time Limit or Max Duration?}
+    K -->|Yes| L[Enforce Time Limit/Max Duration]
+    K -->|No| M[Proceed]
+    L --> N{Does Task Have PanicOnTimeout?}
+    N -->|Yes| O[Wrap Context with Panic Context]
+    N -->|No| P[Proceed]
+    O --> Q[Worker Runs Task]
     P --> Q
+    M --> Q
+    Q --> R{Task Successful?}
+    R -->|Yes| S[Task Completed]
+    R -->|No| T{Is Error Unrecoverable?}
+    T -->|Yes| U[Add to Dead Tasks]
+    T -->|No| V{Can Task be Retried?}
+    V -->|No| U
+    V -->|Yes| W{Max Attempts Reached or Time Limit Exceeded?}
+    W -->|Yes| U
+    W -->|No| X[Calculate Delay]
+    X --> Y{Apply Delay Type}
+    Y -->|Fixed| Z[Fixed Delay]
+    Y -->|Backoff| AA[Exponential Backoff]
+    Y -->|Random| AB[Random Delay]
+    Y -->|Combined| AC[Combined Delay]
+    Z --> AD[Requeue Task]
+    AA --> AD
+    AB --> AD
+    AC --> AD
+    AD --> AE{Immediate Retry?}
+    AE -->|Yes| AF[Put at Front of Queue]
+    AE -->|No| AG[Put at Back of Queue]
+    AF --> AH{Available Untried Worker?}
+    AH -->|Yes| AI[Assign to Untried Worker]
+    AH -->|No| AJ[Reset TriedWorkers]
+    AJ --> AI
+    AI --> G
+    AG --> AK[Wait for Worker]
+    AK --> G
+    U --> AL[Task Ends]
+    S --> AL
 
-    Q --> R{Immediate Retry?}
-    R -->|Yes| S[Put at Front of Queue]
-    R -->|No| T[Put at Back of Queue]
-
-    S --> U{Available Untried Worker?}
-    U -->|Yes| V[Assign to Untried Worker]
-    U -->|No| W[Reset Tried Workers]
-
-    T --> X[Wait for Next Available Worker]
-    V --> B
-    W --> B
-    X --> B
 ```
 
 1. Task Submission and Initial Processing:
