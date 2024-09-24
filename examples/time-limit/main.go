@@ -36,10 +36,10 @@ func main() {
 
 	pool := retrypool.NewPool(ctx, workers,
 		retrypool.WithAttempts[SimulatedTask](1), // No retries for this example
-		retrypool.WithOnTaskSuccess[SimulatedTask](func(_ retrypool.WorkerController, _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask]) {
+		retrypool.WithOnTaskSuccess[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask]) {
 			fmt.Printf("Task %d succeeded\n", task.Data().ID)
 		}),
-		retrypool.WithOnTaskFailure[SimulatedTask](func(_ retrypool.WorkerController, _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask], err error) {
+		retrypool.WithOnTaskFailure[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask], err error) {
 			fmt.Printf("Task %d failed: %v\n", task.Data().ID, err)
 		}),
 	)

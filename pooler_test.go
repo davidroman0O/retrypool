@@ -794,7 +794,7 @@ func TestInterruptWorker(t *testing.T) {
 	}
 
 	// Interrupt the worker (assuming workerID is 0)
-	err := pool.InterruptWorker(0)
+	err := pool.RemoveWorker(0)
 	if err != nil {
 		t.Fatalf("Failed to interrupt worker: %v", err)
 	}
@@ -832,12 +832,12 @@ func TestOnTaskSuccessAndFailureCallbacks(t *testing.T) {
 	var counter int
 
 	pool := NewPool(ctx, []Worker[int]{worker},
-		WithOnTaskSuccess[int](func(controller WorkerController, workerID int, worker Worker[int], task *TaskWrapper[int]) {
+		WithOnTaskSuccess[int](func(controller WorkerController[int], workerID int, worker Worker[int], task *TaskWrapper[int]) {
 			mu.Lock()
 			successCalled = true
 			mu.Unlock()
 		}),
-		WithOnTaskFailure[int](func(controller WorkerController, workerID int, worker Worker[int], task *TaskWrapper[int], err error) {
+		WithOnTaskFailure[int](func(controller WorkerController[int], workerID int, worker Worker[int], task *TaskWrapper[int], err error) {
 			mu.Lock()
 			failureCalled = true
 			if f, ok := worker.(*FlakyWorker); ok {

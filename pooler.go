@@ -109,19 +109,23 @@ type Config[T any] struct {
 
 // Pool struct updated to include Config and support dynamic worker management
 type Pool[T any] struct {
-	workers       map[int]Worker[T]          // Map of workers with unique worker IDs
-	nextWorkerID  int                        // Counter for assigning unique worker IDs
-	workerChans   map[int]chan struct{}      // Channels to signal workers to stop
-	workerCancels map[int]context.CancelFunc // Cancel functions for worker contexts
-	taskQueues    map[int]taskQueue[T]
-	processing    int
-	mu            sync.Mutex
-	cond          *sync.Cond
-	wg            sync.WaitGroup
-	stopped       bool
-	closed        atomic.Bool
-	ctx           context.Context
-	deadTasks     []DeadTask[T]
+	workers          map[int]Worker[T]          // Map of workers with unique worker IDs
+	nextWorkerID     int                        // Counter for assigning unique worker IDs
+	workerChans      map[int]chan struct{}      // Channels to signal workers to stop
+	workerCancels    map[int]context.CancelFunc // Cancel functions for worker contexts
+	workerContexts   map[int]context.Context    // Contexts for workers
+	workerDoneChans  map[int]chan struct{}      // Channels to signal worker completion
+	workerForcePanic map[int]*atomic.Bool       // Flags to force panic in workers
+	workersToRemove  map[int]bool
+	taskQueues       map[int]taskQueue[T]
+	processing       int
+	mu               sync.Mutex
+	cond             *sync.Cond
+	wg               sync.WaitGroup
+	stopped          bool
+	closed           atomic.Bool
+	ctx              context.Context
+	deadTasks        []DeadTask[T]
 
 	config Config[T]
 	timer  Timer
@@ -134,29 +138,31 @@ func NewPool[T any](ctx context.Context, workers []Worker[T], options ...Option[
 	}
 
 	pool := &Pool[T]{
-		workers:       make(map[int]Worker[T]),
-		nextWorkerID:  0,
-		workerChans:   make(map[int]chan struct{}),
-		workerCancels: make(map[int]context.CancelFunc),
-		taskQueues:    make(map[int]taskQueue[T]),
-		config:        newDefaultConfig[T](),
-		timer:         &timerImpl{},
-		ctx:           ctx,
+		workers:          make(map[int]Worker[T]),
+		nextWorkerID:     0,
+		workerChans:      make(map[int]chan struct{}),
+		workerCancels:    make(map[int]context.CancelFunc),
+		workerContexts:   make(map[int]context.Context),
+		workerDoneChans:  make(map[int]chan struct{}),
+		workerForcePanic: make(map[int]*atomic.Bool),
+		taskQueues:       make(map[int]taskQueue[T]),
+		workersToRemove:  make(map[int]bool),
+		config:           newDefaultConfig[T](),
+		timer:            &timerImpl{},
+		ctx:              ctx,
 	}
 	for _, option := range options {
 		option(pool)
 	}
 
+	pool.cond = sync.NewCond(&pool.mu)
+
 	// Initialize workers with unique IDs
 	for _, worker := range workers {
-		workerID := pool.nextWorkerID
-		pool.nextWorkerID++
-		pool.workers[workerID] = worker
-		pool.workerChans[workerID] = make(chan struct{})
+		pool.AddWorker(worker)
 	}
 
-	pool.cond = sync.NewCond(&pool.mu)
-	pool.startWorkers()
+	// pool.startWorkers()
 	return pool
 }
 
@@ -172,113 +178,149 @@ func (p *Pool[T]) startWorkers() {
 
 // AddWorker adds a new worker to the pool dynamically
 func (p *Pool[T]) AddWorker(worker Worker[T]) int {
+	done := make(chan int)
+	go func() {
+		defer close(done)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		workerID := p.nextWorkerID
+		p.nextWorkerID++
+
+		p.workers[workerID] = worker
+		p.workerChans[workerID] = make(chan struct{})
+		p.workerDoneChans[workerID] = make(chan struct{})
+		p.workerForcePanic[workerID] = new(atomic.Bool)
+
+		workerCtx, workerCancel := context.WithCancel(p.ctx)
+		p.workerContexts[workerID] = workerCtx
+		p.workerCancels[workerID] = workerCancel
+
+		p.wg.Add(1)
+		go p.workerLoop(workerID)
+		done <- workerID
+	}()
+
+	return <-done
+}
+
+// Method to mark worker for removal
+func (p *Pool[T]) RemovalWorker(workerID int) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	workerID := p.nextWorkerID
-	p.nextWorkerID++
-
-	p.workers[workerID] = worker
-	p.workerChans[workerID] = make(chan struct{})
-
-	p.wg.Add(1)
-	go p.workerLoop(workerID)
-
-	return workerID
+	p.workersToRemove[workerID] = true
+	p.mu.Unlock()
 }
 
 // WorkerController interface provides methods to control workers
-type WorkerController interface {
-	InterruptWorker(workerID int) error
-	RemoveWorker(workerID int) error
+type WorkerController[T any] interface {
+	AddWorker(worker Worker[T]) int
+	RemovalWorker(workerID int)
 }
 
-// InterruptWorker interrupts a worker's execution
-// TODO: add resume worker...
-func (p *Pool[T]) InterruptWorker(workerID int) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	cancel, exists := p.workerCancels[workerID]
-	if !exists {
-		return fmt.Errorf("worker %d does not exist", workerID)
-	}
-
-	cancel()
-
-	// Signal the worker to stop
-	close(p.workerChans[workerID])
-
-	// Requeue any tasks assigned to this worker
-	for retries, queue := range p.taskQueues {
-		newTasks := make([]*TaskWrapper[T], 0, len(queue.tasks))
-		for _, task := range queue.tasks {
-			if task.triedWorkers[workerID] {
-				delete(task.triedWorkers, workerID)
-				p.requeueTask(task, errors.New("worker interrupted"))
-			} else {
-				newTasks = append(newTasks, task)
-			}
-		}
-		p.taskQueues[retries] = taskQueue[T]{tasks: newTasks}
-	}
-
-	p.cond.Broadcast() // Signal that the queue has changed
-
-	return nil
-}
-
-// RemoveWorker removes a worker from the pool
 func (p *Pool[T]) RemoveWorker(workerID int) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	_, exists := p.workers[workerID]
 	if !exists {
+		p.mu.Unlock()
 		return fmt.Errorf("worker %d does not exist", workerID)
 	}
-
-	// Signal the worker to stop
-	close(p.workerChans[workerID])
-
-	// Wait for the worker to finish its current task
-	for p.processing > 0 {
-		p.cond.Wait()
-	}
-
-	// Remove the worker from the pool
-	delete(p.workers, workerID)
-	delete(p.workerChans, workerID)
 
 	// Cancel the worker's context
 	if cancel, exists := p.workerCancels[workerID]; exists {
 		cancel()
-		delete(p.workerCancels, workerID)
 	}
 
+	// Close the worker's stop channel
+	close(p.workerChans[workerID])
+
+	// Signal the worker to wake up if it's waiting
+	p.cond.Broadcast()
+
+	doneChan := p.workerDoneChans[workerID]
+	p.mu.Unlock() // Release lock while waiting
+
+	const workerStopTimeout = 5 * time.Second
+	const workerForceStopTimeout = 5 * time.Second
+
+	// Wait for the worker to finish, with a timeout
+	select {
+	case <-doneChan:
+		// Worker has exited
+	case <-time.After(workerStopTimeout):
+		// Worker did not exit in time, force panic
+		p.mu.Lock()
+		p.workerForcePanic[workerID].Store(true)
+		p.mu.Unlock()
+
+		// Signal the worker again
+		p.cond.Broadcast()
+
+		// Wait again for the worker to exit
+		select {
+		case <-doneChan:
+			// Worker has exited
+		case <-time.After(workerForceStopTimeout):
+			// Even after forcing panic, worker did not exit
+			return fmt.Errorf("worker %d did not exit after forced panic", workerID)
+		}
+	}
+
+	// Now safe to remove worker from the pool
+	p.mu.Lock()
+	delete(p.workers, workerID)
+	delete(p.workerChans, workerID)
+	delete(p.workerCancels, workerID)
+	delete(p.workerContexts, workerID)
+	delete(p.workerDoneChans, workerID)
+	delete(p.workerForcePanic, workerID)
+	p.mu.Unlock()
+
 	// Requeue any tasks assigned to this worker
+	p.requeueTasksFromWorker(workerID)
+
+	return nil
+}
+
+// requeueTasksFromWorker reassigns tasks from the removed worker to other workers
+func (p *Pool[T]) requeueTasksFromWorker(workerID int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	for retries, queue := range p.taskQueues {
 		newTasks := make([]*TaskWrapper[T], 0, len(queue.tasks))
 		for _, task := range queue.tasks {
 			if task.triedWorkers[workerID] {
 				delete(task.triedWorkers, workerID)
-				if len(task.triedWorkers) == 0 {
-					newTasks = append(newTasks, task)
-				}
-			} else {
-				newTasks = append(newTasks, task)
 			}
+			newTasks = append(newTasks, task)
 		}
 		p.taskQueues[retries] = taskQueue[T]{tasks: newTasks}
 	}
 
-	return nil
+	// Signal workers that the task queues have changed
+	p.cond.Broadcast()
 }
 
 // workerLoop updated to handle scheduledTime, triedWorkers, and worker interruption
 func (p *Pool[T]) workerLoop(workerID int) {
 	defer p.wg.Done()
 	stopChan := p.workerChans[workerID]
+	doneChan := p.workerDoneChans[workerID]
+	ctx := p.workerContexts[workerID]
+	forcePanicFlag := p.workerForcePanic[workerID]
+
+	var once sync.Once
+	defer func() {
+		if r := recover(); r != nil {
+			// Handle the panic, possibly logging it
+			fmt.Printf("Worker %d recovered from panic: %v\n", workerID, r)
+		}
+		// Close doneChan if not already closed
+		once.Do(func() {
+			close(doneChan)
+		})
+	}()
 
 	for {
 		select {
@@ -290,9 +332,29 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		p.mu.Lock()
 		for p.isAllQueuesEmpty() && !p.stopped {
 			p.cond.Wait()
+
+			// Check if context is canceled
+			if ctx.Err() != nil {
+				if forcePanicFlag.Load() {
+					p.mu.Unlock()
+					panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
+				}
+				p.mu.Unlock()
+				return
+			}
 		}
 
 		if p.stopped && p.isAllQueuesEmpty() {
+			p.mu.Unlock()
+			return
+		}
+
+		// Check if context is canceled before proceeding
+		if ctx.Err() != nil {
+			if forcePanicFlag.Load() {
+				p.mu.Unlock()
+				panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
+			}
 			p.mu.Unlock()
 			return
 		}
@@ -333,12 +395,26 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		p.processing++
 		p.mu.Unlock()
 
+		// Check if context is canceled before processing the task
+		if ctx.Err() != nil {
+			if forcePanicFlag.Load() {
+				panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
+			}
+			return
+		}
+
 		if task.timeLimit > 0 {
 			go p.enforceTimeLimit(task)
 		}
 		p.runWorkerWithFailsafe(workerID, task)
 
 		p.mu.Lock()
+		if p.workersToRemove[workerID] {
+			delete(p.workersToRemove, workerID)
+			p.mu.Unlock()
+			go p.RemoveWorker(workerID)
+			return
+		}
 		p.processing--
 		p.cond.Signal()
 		p.mu.Unlock()
@@ -396,14 +472,6 @@ func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
 
 // runWorkerWithFailsafe updated to handle OnRetry, RetryIf, and callbacks
 func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
-	defer func() {
-		if r := recover(); r != nil {
-			err := fmt.Errorf("panic occurred: %v", r)
-			task.errors = append(task.errors, err)
-			p.requeueTask(task, err)
-		}
-	}()
-
 	// Create attempt-specific context
 	attemptCtx, attemptCancel := context.WithCancel(task.ctx)
 	task.cancel = attemptCancel
@@ -427,8 +495,20 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		}()
 	}
 
-	// Attempt to run the worker
-	err := p.workers[workerID].Run(attemptCtx, task.data)
+	var err error
+
+	// Attempt to run the worker within a panic-catching function
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic occurred: %v", r)
+			}
+		}()
+
+		// Attempt to run the worker
+		err = p.workers[workerID].Run(attemptCtx, task.data)
+	}()
+
 	duration := time.Since(start)
 	task.totalDuration += duration
 	task.durations = append(task.durations, duration)
@@ -870,10 +950,10 @@ type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duratio
 type OnRetryFunc[T any] func(attempt int, err error, task *TaskWrapper[T])
 
 // OnTaskSuccessFunc is the type of function called when a task succeeds
-type OnTaskSuccessFunc[T any] func(controller WorkerController, workerID int, worker Worker[T], task *TaskWrapper[T])
+type OnTaskSuccessFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T])
 
 // OnTaskFailureFunc is the type of function called when a task fails
-type OnTaskFailureFunc[T any] func(controller WorkerController, workerID int, worker Worker[T], task *TaskWrapper[T], err error)
+type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T], err error)
 
 // RetryIfFunc signature
 type RetryIfFunc func(error) bool
