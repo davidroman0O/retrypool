@@ -389,9 +389,8 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			return
 		}
 
-		if task.timeLimit > 0 {
-			go p.enforceTimeLimit(task)
-		}
+		// No need to call enforceTimeLimit here; it's handled within runWorkerWithFailsafe
+
 		p.runWorkerWithFailsafe(workerID, task)
 
 		p.mu.Lock()
@@ -407,15 +406,21 @@ func (p *Pool[T]) workerLoop(workerID int) {
 	}
 }
 
-func (p *Pool[T]) enforceTimeLimit(task *TaskWrapper[T]) {
-	if task.timeLimit <= 0 {
+func (p *Pool[T]) enforceTimeLimit(cancelFunc context.CancelFunc, timeLimit, totalDuration time.Duration, ctx context.Context) {
+	if timeLimit <= 0 {
+		return
+	}
+
+	remainingTime := timeLimit - totalDuration
+	if remainingTime <= 0 {
+		cancelFunc()
 		return
 	}
 
 	select {
-	case <-time.After(task.timeLimit - task.totalDuration):
-		task.cancel() // This will cancel the task's context
-	case <-task.ctx.Done():
+	case <-p.timer.After(remainingTime):
+		cancelFunc() // This cancels the attempt's context
+	case <-ctx.Done():
 	}
 }
 
@@ -460,7 +465,7 @@ func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
 func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	// Create attempt-specific context
 	attemptCtx, attemptCancel := context.WithCancel(task.ctx)
-	task.cancel = attemptCancel
+	defer attemptCancel() // Ensure the context is canceled when done
 
 	// Wrap context with panic context if enabled
 	if task.panicOnTimeout {
@@ -474,10 +479,23 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	if task.maxDuration > 0 {
 		go func() {
 			select {
-			case <-time.After(task.maxDuration):
-				task.cancel() // This cancels the attempt's context when maxDuration is exceeded
+			case <-p.timer.After(task.maxDuration):
+				attemptCancel() // Cancel the attempt's context when maxDuration is exceeded
 			case <-attemptCtx.Done():
 			}
+		}()
+	}
+
+	// Enforce time limit for the overall task duration
+	if task.timeLimit > 0 {
+		// Capture the current total duration to avoid data races
+		p.mu.Lock()
+		currentTotalDuration := task.totalDuration
+		p.mu.Unlock()
+
+		// Pass necessary data to avoid accessing shared fields concurrently
+		go func() {
+			p.enforceTimeLimit(attemptCancel, task.timeLimit, currentTotalDuration, task.ctx)
 		}()
 	}
 
@@ -496,11 +514,18 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	}()
 
 	duration := time.Since(start)
+
+	// Safely update shared fields
+	p.mu.Lock()
 	task.totalDuration += duration
 	task.durations = append(task.durations, duration)
+	p.mu.Unlock()
 
 	if err != nil {
+		p.mu.Lock()
 		task.errors = append(task.errors, err)
+		p.mu.Unlock()
+
 		if IsUnrecoverable(err) {
 			p.addToDeadTasks(task, err)
 			return
