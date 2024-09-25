@@ -1037,3 +1037,121 @@ func TestCombineDelayAndMaxBackOffN(t *testing.T) {
 		}
 	}
 }
+
+/////
+
+// TestWorker is a worker implementation specifically for this test
+type TestWorker struct {
+	mu           sync.Mutex
+	processCount int
+	processChan  chan struct{}
+}
+
+func NewTestWorker() *TestWorker {
+	return &TestWorker{
+		processChan: make(chan struct{}, 1),
+	}
+}
+
+func (w *TestWorker) Run(ctx context.Context, data int) error {
+	w.mu.Lock()
+	w.processCount++
+	w.mu.Unlock()
+
+	select {
+	case w.processChan <- struct{}{}:
+	default:
+	}
+
+	// Simulate some work
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(50 * time.Millisecond):
+		return nil
+	}
+}
+
+func (w *TestWorker) GetProcessCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.processCount
+}
+
+func TestWorkerInterruptAndRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testWorker := NewTestWorker()
+	pool := NewPool(ctx, []Worker[int]{testWorker})
+
+	// Dispatch a task
+	err := pool.Dispatch(1)
+	if err != nil {
+		t.Fatalf("Failed to dispatch task: %v", err)
+	}
+
+	// Wait for the worker to start processing
+	select {
+	case <-testWorker.processChan:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out waiting for worker to start processing")
+	}
+
+	// Interrupt the worker
+	err = pool.InterruptWorker(0)
+	if err != nil {
+		t.Fatalf("Failed to interrupt worker: %v", err)
+	}
+
+	// Wait for the worker to stop processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Restart the worker
+	err = pool.RestartWorker(0)
+	if err != nil {
+		t.Fatalf("Failed to restart worker: %v", err)
+	}
+
+	// Dispatch another task
+	err = pool.Dispatch(2)
+	if err != nil {
+		t.Fatalf("Failed to dispatch task after restart: %v", err)
+	}
+
+	// Wait for the worker to process the new task
+	select {
+	case <-testWorker.processChan:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out waiting for worker to process task after restart")
+	}
+
+	// Test interrupting and immediately restarting
+	err = pool.InterruptWorker(0, WithRestart())
+	if err != nil {
+		t.Fatalf("Failed to interrupt and restart worker: %v", err)
+	}
+
+	// Dispatch one more task
+	err = pool.Dispatch(3)
+	if err != nil {
+		t.Fatalf("Failed to dispatch task after interrupt and restart: %v", err)
+	}
+
+	// Wait for the worker to process the new task
+	select {
+	case <-testWorker.processChan:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out waiting for worker to process task after interrupt and restart")
+	}
+
+	// Verify that the worker processed all tasks
+	processCount := testWorker.GetProcessCount()
+	if processCount != 3 {
+		t.Errorf("Expected worker to process 3 tasks in total, but processed %d", processCount)
+	}
+
+	// Clean up
+	cancel()
+	pool.Close()
+}

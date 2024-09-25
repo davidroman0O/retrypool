@@ -25,7 +25,7 @@ type DeadTask[T any] struct {
 	Errors        []error
 }
 
-// TaskWrapper now includes scheduledTime, triedWorkers, errors, durations, and panicOnTimeout
+// TaskWrapper includes scheduledTime, triedWorkers, errors, durations, and panicOnTimeout
 type TaskWrapper[T any] struct {
 	data           T
 	retries        int
@@ -39,7 +39,7 @@ type TaskWrapper[T any] struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	immediateRetry bool
-	panicOnTimeout bool // New field to trigger panic on timeout
+	panicOnTimeout bool // Field to trigger panic on timeout
 }
 
 func (t *TaskWrapper[T]) Data() T {
@@ -74,7 +74,7 @@ func (t *TaskWrapper[T]) Durations() []time.Duration {
 	return t.durations
 }
 
-// taskQueue now stores pointers to TaskWrapper
+// taskQueue stores pointers to TaskWrapper
 type taskQueue[T any] struct {
 	tasks []*TaskWrapper[T]
 }
@@ -115,6 +115,9 @@ type workerState[T any] struct {
 	cancel         context.CancelFunc
 	ctx            context.Context
 	forcePanicFlag *atomic.Bool
+	currentTask    *TaskWrapper[T] // Field to track the current task
+	interrupted    bool            // New field to track if the worker has been interrupted
+
 }
 
 // Pool struct updated to include Config and support dynamic worker management
@@ -173,7 +176,14 @@ func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 		workerID := p.nextWorkerID
 		p.nextWorkerID++
 
-		workerCtx, workerCancel := context.WithCancel(p.ctx)
+		var workerCtx context.Context
+		var workerCancel context.CancelFunc
+		if p.config.contextFunc != nil {
+			workerCtx = p.config.contextFunc()
+		} else {
+			workerCtx = p.ctx
+		}
+		workerCtx, workerCancel = context.WithCancel(workerCtx)
 		state := &workerState[T]{
 			worker:         worker,
 			stopChan:       make(chan struct{}),
@@ -204,8 +214,43 @@ func (p *Pool[T]) RemovalWorker(workerID int) {
 type WorkerController[T any] interface {
 	AddWorker(worker Worker[T]) int
 	RemovalWorker(workerID int)
+	RestartWorker(workerID int) error
+	InterruptWorker(workerID int, options ...WorkerInterruptOption) error
 }
 
+func (p *Pool[T]) RestartWorker(workerID int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state, exists := p.workers[workerID]
+	if !exists {
+		return fmt.Errorf("worker %d does not exist", workerID)
+	}
+
+	if !state.interrupted {
+		return fmt.Errorf("worker %d is not interrupted and cannot be restarted", workerID)
+	}
+
+	// Create a new context for the worker
+	workerCtx, workerCancel := context.WithCancel(p.ctx)
+	state.ctx = workerCtx
+	state.cancel = workerCancel
+	state.forcePanicFlag.Store(false)
+	state.interrupted = false
+
+	// Create a new stopChan and doneChan
+	state.stopChan = make(chan struct{})
+	state.doneChan = make(chan struct{})
+
+	// Start a new goroutine for the worker
+	p.wg.Add(1)
+	go p.workerLoop(workerID)
+
+	fmt.Printf("Worker %d has been restarted\n", workerID)
+	return nil
+}
+
+// RemoveWorker removes a worker from the pool
 func (p *Pool[T]) RemoveWorker(workerID int) error {
 	p.mu.Lock()
 
@@ -269,10 +314,11 @@ func (p *Pool[T]) requeueTasksFromWorker(workerID int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// Remove the worker's triedTasks from all tasks
 	for retries, queue := range p.taskQueues {
 		newTasks := make([]*TaskWrapper[T], 0, len(queue.tasks))
 		for _, task := range queue.tasks {
-			if task.triedWorkers[workerID] {
+			if task.triedWorkers != nil {
 				delete(task.triedWorkers, workerID)
 			}
 			newTasks = append(newTasks, task)
@@ -297,19 +343,21 @@ func (p *Pool[T]) workerLoop(workerID int) {
 	stopChan := state.stopChan
 	doneChan := state.doneChan
 	ctx := state.ctx
-	forcePanicFlag := state.forcePanicFlag
 	p.mu.Unlock()
 
-	var once sync.Once
 	defer func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
 		if r := recover(); r != nil {
-			// Handle the panic, possibly logging it
 			fmt.Printf("Worker %d recovered from panic: %v\n", workerID, r)
 		}
-		// Close doneChan if not already closed
-		once.Do(func() {
+
+		select {
+		case <-doneChan: // Channel is already closed
+		default:
 			close(doneChan)
-		})
+		}
 	}()
 
 	for {
@@ -320,12 +368,6 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		}
 
 		p.mu.Lock()
-		// Check if forcePanicFlag is set
-		if forcePanicFlag.Load() {
-			p.mu.Unlock()
-			panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
-		}
-
 		for p.isAllQueuesEmpty() && !p.stopped {
 			p.cond.Wait()
 
@@ -333,12 +375,6 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			if ctx.Err() != nil {
 				p.mu.Unlock()
 				return
-			}
-
-			// Check if forcePanicFlag is set again after wait
-			if forcePanicFlag.Load() {
-				p.mu.Unlock()
-				panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
 			}
 		}
 
@@ -351,12 +387,6 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		if ctx.Err() != nil {
 			p.mu.Unlock()
 			return
-		}
-
-		// Check forcePanicFlag before proceeding
-		if forcePanicFlag.Load() {
-			p.mu.Unlock()
-			panic(fmt.Sprintf("Worker %d forced to panic due to timeout during removal", workerID))
 		}
 
 		retries, idx, task, ok := p.getNextTask(workerID)
@@ -392,11 +422,17 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		}
 		task.triedWorkers[workerID] = true
 
+		// Set the current task
+		state.currentTask = task
+
 		p.processing++
 		p.mu.Unlock()
 
 		// Check if context is canceled before processing the task
 		if ctx.Err() != nil {
+			p.mu.Lock()
+			p.processing--
+			p.mu.Unlock()
 			return
 		}
 
@@ -409,6 +445,16 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			go p.RemoveWorker(workerID)
 			return
 		}
+
+		// Unset the current task
+		state.currentTask = nil
+
+		if state.interrupted {
+			p.processing--
+			p.mu.Unlock()
+			return // Exit the loop if the worker was interrupted
+		}
+
 		p.processing--
 		p.cond.Signal()
 		p.mu.Unlock()
@@ -470,15 +516,182 @@ func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
 	return 0, 0, nil, false
 }
 
+// RangeTasks iterates over all tasks in the pool, including those currently being processed.
+// The callback function receives the task data and the worker ID (-1 if the task is in the queue).
+// If the callback returns false, the iteration stops.
+type TaskStatus int
+
+const (
+	TaskStatusQueued TaskStatus = iota
+	TaskStatusProcessing
+)
+
+func (p *Pool[T]) RangeTasks(cb func(data T, workerID int, status TaskStatus) bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Iterate over tasks currently being processed
+	for workerID, state := range p.workers {
+		if state.currentTask != nil {
+			if !cb(state.currentTask.data, workerID, TaskStatusProcessing) {
+				return false
+			}
+		}
+	}
+
+	// Iterate over tasks in the queues
+	for _, q := range p.taskQueues {
+		for _, task := range q.tasks {
+			if !cb(task.data, -1, TaskStatusQueued) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+type WorkerInterruptOption func(*WorkerInterruptConfig)
+
+type WorkerInterruptConfig struct {
+	RemoveWorker bool
+	RemoveTask   bool
+	ReassignTask bool
+	ForcePanic   bool
+	Restart      bool
+}
+
+// Option to restart the worker after interruption
+func WithRestart() WorkerInterruptOption {
+	return func(cfg *WorkerInterruptConfig) {
+		cfg.Restart = true
+	}
+}
+
+// Option to remove the worker after interruption.
+func WithRemoveWorker() WorkerInterruptOption {
+	return func(cfg *WorkerInterruptConfig) {
+		cfg.RemoveWorker = true
+	}
+}
+
+// Option to remove the task the worker was processing.
+func WithRemoveTask() WorkerInterruptOption {
+	return func(cfg *WorkerInterruptConfig) {
+		cfg.RemoveTask = true
+	}
+}
+
+// Option to reassign the task for retrying.
+func WithReassignTask() WorkerInterruptOption {
+	return func(cfg *WorkerInterruptConfig) {
+		cfg.ReassignTask = true
+	}
+}
+
+// Option to force the worker to panic.
+func WithForcePanic() WorkerInterruptOption {
+	return func(cfg *WorkerInterruptConfig) {
+		cfg.ForcePanic = true
+	}
+}
+
+// InterruptWorker cancels a worker's current task and optionally removes the worker.
+// It can also force the worker to panic.
+func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state, exists := p.workers[workerID]
+	if !exists {
+		return fmt.Errorf("worker %d does not exist", workerID)
+	}
+
+	// Apply options
+	cfg := &WorkerInterruptConfig{
+		RemoveWorker: false,
+		RemoveTask:   false,
+		ReassignTask: false,
+		ForcePanic:   false,
+		Restart:      false,
+	}
+	for _, opt := range options {
+		opt(cfg)
+	}
+
+	// Set the forcePanicFlag if requested
+	if cfg.ForcePanic {
+		state.forcePanicFlag.Store(true)
+	}
+
+	// Cancel the worker's context to trigger the interrupt
+	state.cancel()
+
+	// Cancel the current task's context if it's running
+	task := state.currentTask
+	if task != nil {
+		task.cancel()
+	}
+
+	// Close the stopChan to signal the worker to stop
+	close(state.stopChan)
+
+	// Handle task options
+	if task != nil {
+		if cfg.RemoveTask {
+			// Task is already canceled and will not be retried
+		} else if cfg.ReassignTask {
+			// Reset the task's context
+			taskCtx, cancel := context.WithCancel(p.ctx)
+			task.ctx = taskCtx
+			task.cancel = cancel
+			task.triedWorkers = make(map[int]bool)
+			task.scheduledTime = time.Now()
+			// Add the task back to the taskQueues for the current retry count
+			q := p.taskQueues[task.retries]
+			q.tasks = append(q.tasks, task)
+			p.taskQueues[task.retries] = q
+		}
+	}
+
+	if cfg.RemoveWorker {
+		// delete(p.workers, workerID)
+		err := p.RemoveWorker(workerID)
+		if err != nil {
+			return fmt.Errorf("failed to remove worker %d: %v", workerID, err)
+		}
+		// fmt.Printf("Worker %d has been removed\n", workerID)
+	} else {
+		state.interrupted = true
+		// fmt.Printf("Worker %d has been interrupted\n", workerID)
+
+		if cfg.Restart {
+			p.mu.Unlock()
+			err := p.RestartWorker(workerID)
+			p.mu.Lock()
+			if err != nil {
+				return fmt.Errorf("failed to restart worker %d: %v", workerID, err)
+			}
+		}
+	}
+
+	p.cond.Broadcast() // Signal all workers
+
+	return nil
+}
+
 // runWorkerWithFailsafe updated to handle OnRetry, RetryIf, and callbacks
 func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	// Create attempt-specific context
 	attemptCtx, attemptCancel := context.WithCancel(task.ctx)
 	defer attemptCancel() // Ensure the context is canceled when done
 
-	// Wrap context with panic context if enabled
+	// Wrap context with panicContext by default
+	attemptCtx = &panicContext{Context: attemptCtx}
+
+	// Wrap context with panicOnTimeoutContext if enabled
 	if task.panicOnTimeout {
-		attemptCtx = &panicContext{Context: attemptCtx}
+		attemptCtx = &panicOnTimeoutContext{Context: attemptCtx}
 	}
 
 	// Reset attempt-specific duration tracking
@@ -592,14 +805,6 @@ func IsUnrecoverable(err error) bool {
 }
 
 // requeueTask updated to handle delays and keep triedWorkers intact
-/*
-	Rules:
-	- if not immediate retry:
-		- randomly select a worker that hasn't tried this task, put it at the back of the queue
-	- if immediate retry:
-		- if there are workers that haven't tried this task, put it at the front of the queue of one of them
-		- if all workers have tried this task, reset triedWorkers and put it at the back of a random worker's queue
-*/
 func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1110,12 +1315,37 @@ func (c *Config[T]) MaxBackOffN() uint {
 	return c.maxBackOffN
 }
 
-// panicContext is a custom context that returns a specific error on timeout
+// panicContext is a custom context that causes a panic when Err() is called after cancellation.
 type panicContext struct {
 	context.Context
 }
 
 func (p *panicContext) Err() error {
+	if err := p.Context.Err(); err != nil {
+		panic(&panicError{cause: err})
+	}
+	return nil
+}
+
+// panicError is an error type that represents a panic caused by context cancellation.
+type panicError struct {
+	cause error
+}
+
+func (e *panicError) Error() string {
+	return fmt.Sprintf("panic due to context cancellation: %v", e.cause)
+}
+
+func (e *panicError) Unwrap() error {
+	return e.cause
+}
+
+// panicOnTimeoutContext is a custom context that returns a specific error on timeout
+type panicOnTimeoutContext struct {
+	context.Context
+}
+
+func (p *panicOnTimeoutContext) Err() error {
 	if err := p.Context.Err(); err != nil {
 		return &panicOnTimeoutError{cause: err}
 	}
