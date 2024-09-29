@@ -20,7 +20,7 @@ func (w *SimpleWorker) Run(ctx context.Context, data int) error {
 func main() {
 	ctx := context.Background()
 	workers := []retrypool.Worker[int]{&SimpleWorker{}, &SimpleWorker{}}
-	pool := retrypool.NewPool(ctx, workers)
+	pool := retrypool.New(ctx, workers)
 
 	for i := 1; i <= 10; i++ {
 		err := pool.Dispatch(i * 100)

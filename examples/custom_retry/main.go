@@ -22,7 +22,7 @@ func (w *FlakyWorker) Run(ctx context.Context, data int) error {
 func main() {
 	ctx := context.Background()
 	workers := []retrypool.Worker[int]{&FlakyWorker{}, &FlakyWorker{}}
-	pool := retrypool.NewPool(ctx, workers,
+	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[int](3),
 		retrypool.WithDelay[int](time.Second),
 		retrypool.WithOnRetry[int](func(attempt int, err error, task *retrypool.TaskWrapper[int]) {

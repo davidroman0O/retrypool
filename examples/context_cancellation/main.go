@@ -26,7 +26,7 @@ func main() {
 	defer cancel()
 
 	workers := []retrypool.Worker[int]{&SlowWorker{}, &SlowWorker{}}
-	pool := retrypool.NewPool(ctx, workers)
+	pool := retrypool.New(ctx, workers)
 
 	for i := 1; i <= 10; i++ {
 		err := pool.Dispatch(i)

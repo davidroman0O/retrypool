@@ -58,7 +58,7 @@ func (w *UnrecoverableWorker) Run(ctx context.Context, data int) error {
 func TestBasicDispatch(t *testing.T) {
 	ctx := context.Background()
 	worker := &IncrementWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker})
+	pool := New(ctx, []Worker[int]{worker})
 
 	err := pool.Dispatch(1)
 	if err != nil {
@@ -80,7 +80,7 @@ func TestBasicDispatch(t *testing.T) {
 func TestRetriesWithFixedDelay(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 2}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
 		WithDelay[int](50*time.Millisecond),
 		WithDelayType[int](FixedDelay[int]),
@@ -108,7 +108,7 @@ func TestUnlimitedRetriesWithBackoff(t *testing.T) {
 	defer cancel()
 
 	worker := &FlakyWorker{failuresLeft: 5}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](UnlimitedAttempts),
 		WithDelay[int](100*time.Millisecond),
 		WithDelayType[int](BackOffDelay[int]),
@@ -132,7 +132,7 @@ func TestUnlimitedRetriesWithBackoff(t *testing.T) {
 func TestTaskTimeLimit(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 5}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](UnlimitedAttempts),
 		WithDelay[int](100*time.Millisecond),
 		WithDelayType[int](FixedDelay[int]),
@@ -163,7 +163,7 @@ func TestTaskTimeLimit(t *testing.T) {
 func TestCustomRetryIf(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 2}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
 		WithRetryIf[int](func(err error) bool {
 			return err.Error() == "temporary error"
@@ -187,7 +187,7 @@ func TestOnRetryCallback(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 2}
 	retryAttempts := 0
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
 		WithOnRetry[int](func(attempt int, err error, task *TaskWrapper[int]) {
 			retryAttempts++
@@ -215,7 +215,7 @@ func TestOnRetryCallback(t *testing.T) {
 func TestUnrecoverableError(t *testing.T) {
 	ctx := context.Background()
 	worker := &UnrecoverableWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
 	)
 
@@ -249,7 +249,7 @@ func TestMultipleWorkers(t *testing.T) {
 	ctx := context.Background()
 	worker1 := &IncrementWorker{}
 	worker2 := &IncrementWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker1, worker2})
+	pool := New(ctx, []Worker[int]{worker1, worker2})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 10; i++ {
@@ -271,7 +271,7 @@ func TestMultipleWorkers(t *testing.T) {
 func TestProcessingCountAndQueueSize(t *testing.T) {
 	ctx := context.Background()
 	worker := &IncrementWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker})
+	pool := New(ctx, []Worker[int]{worker})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 5; i++ {
@@ -302,7 +302,7 @@ func TestProcessingCountAndQueueSize(t *testing.T) {
 func TestForceClose(t *testing.T) {
 	ctx := context.Background()
 	worker := &IncrementWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker})
+	pool := New(ctx, []Worker[int]{worker})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 10; i++ {
@@ -329,7 +329,7 @@ func TestForceClose(t *testing.T) {
 func TestWaitWithCallback(t *testing.T) {
 	ctx := context.Background()
 	worker := &IncrementWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker})
+	pool := New(ctx, []Worker[int]{worker})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 5; i++ {
@@ -360,7 +360,7 @@ func TestMaxDelay(t *testing.T) {
 	defer cancel()
 	worker := &FlakyWorker{failuresLeft: 10}
 
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](5), // Limit attempts to ensure the task fails
 		WithDelay[int](100*time.Millisecond),
 		WithMaxDelay[int](300*time.Millisecond),
@@ -396,7 +396,7 @@ func TestMaxDelay(t *testing.T) {
 func TestMaxJitterWithRandomDelay(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 1}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
 		WithMaxJitter[int](100*time.Millisecond),
 		WithDelayType[int](RandomDelay[int]),
@@ -426,7 +426,7 @@ func TestContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	worker := &FlakyWorker{failuresLeft: 10}
 
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](UnlimitedAttempts),
 		WithDelay[int](100*time.Millisecond),
 	)
@@ -457,7 +457,7 @@ func TestContextCancellation(t *testing.T) {
 func TestTimeLimitWithUnlimitedRetries(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 10}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](UnlimitedAttempts),
 		WithDelay[int](50*time.Millisecond),
 		WithDelayType[int](FixedDelay[int]),
@@ -486,7 +486,7 @@ func TestMultipleTasksMultipleWorkers(t *testing.T) {
 	ctx := context.Background()
 	worker1 := &IncrementWorker{}
 	worker2 := &IncrementWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker1, worker2})
+	pool := New(ctx, []Worker[int]{worker1, worker2})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 20; i++ {
@@ -509,7 +509,7 @@ func TestMaxAttempts(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 10}
 	maxAttempts := 3
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](maxAttempts),
 		WithDelay[int](50*time.Millisecond),
 		WithDelayType[int](FixedDelay[int]),
@@ -537,7 +537,7 @@ func TestMaxAttempts(t *testing.T) {
 func TestUnrecoverableErrorWithCustomRetryIf(t *testing.T) {
 	ctx := context.Background()
 	worker := &UnrecoverableWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
 		WithRetryIf[int](func(err error) bool {
 			return true // Retry on all errors
@@ -589,7 +589,7 @@ func TestCustomTimer(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 2}
 	customTimer := &CustomTimer{}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](3),
 		WithDelay[int](100*time.Millisecond),
 		WithDelayType[int](FixedDelay[int]),
@@ -640,7 +640,7 @@ func TestDynamicWorkerManagement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	worker1 := &IncrementWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker1})
+	pool := New(ctx, []Worker[int]{worker1})
 
 	// Dispatch initial tasks
 	for i := 0; i < 5; i++ {
@@ -696,7 +696,7 @@ func TestRemoveWorker(t *testing.T) {
 	defer cancel()
 	worker1 := &IncrementWorker{}
 	worker2 := &IncrementWorker{}
-	pool := NewPool(ctx, []Worker[int]{worker1, worker2})
+	pool := New(ctx, []Worker[int]{worker1, worker2})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 20; i++ {
@@ -772,7 +772,7 @@ func TestInterruptWorker(t *testing.T) {
 	worker := &SlowWorker{
 		started: make(chan struct{}),
 	}
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithRetryIf[int](func(err error) bool {
 			return err.Error() == "worker interrupted"
 		}),
@@ -831,7 +831,7 @@ func TestOnTaskSuccessAndFailureCallbacks(t *testing.T) {
 
 	var counter int
 
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithOnTaskSuccess[int](func(controller WorkerController[int], workerID int, worker Worker[int], task *TaskWrapper[int]) {
 			mu.Lock()
 			successCalled = true
@@ -903,7 +903,7 @@ func TestTriedWorkersHandling(t *testing.T) {
 		workers[i] = worker
 	}
 
-	pool := NewPool(ctx, workers,
+	pool := New(ctx, workers,
 		WithAttempts[int](numWorkers),
 		WithRetryIf[int](func(err error) bool {
 			return true
@@ -937,7 +937,7 @@ func TestDeadTaskErrorsAndDurations(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 3}
 
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
 		WithDelay[int](200*time.Millisecond),
 		WithDelayType[int](FixedDelay[int]),
@@ -999,7 +999,7 @@ func TestCombineDelayAndMaxBackOffN(t *testing.T) {
 		return delay
 	}
 
-	pool := NewPool(ctx, []Worker[int]{worker},
+	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](3),
 		WithDelay[int](100*time.Millisecond),
 		WithDelayType[int](CombineDelay[int](BackOffDelay[int], recordingDelay)),
@@ -1083,7 +1083,7 @@ func TestWorkerInterruptAndRestart(t *testing.T) {
 	defer cancel()
 
 	testWorker := NewTestWorker()
-	pool := NewPool(ctx, []Worker[int]{testWorker})
+	pool := New(ctx, []Worker[int]{testWorker})
 
 	// Dispatch a task
 	err := pool.Dispatch(1)

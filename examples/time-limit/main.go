@@ -34,7 +34,7 @@ func main() {
 	ctx := context.Background()
 	workers := []retrypool.Worker[SimulatedTask]{&SimulatedWorker{}, &SimulatedWorker{}}
 
-	pool := retrypool.NewPool(ctx, workers,
+	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[SimulatedTask](1), // No retries for this example
 		retrypool.WithOnTaskSuccess[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask]) {
 			fmt.Printf("Task %d succeeded\n", task.Data().ID)

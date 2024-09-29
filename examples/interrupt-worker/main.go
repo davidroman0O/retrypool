@@ -42,7 +42,7 @@ func main() {
 	}
 
 	// Create the pool
-	pool := retrypool.NewPool[int](ctx, workers)
+	pool := retrypool.New[int](ctx, workers)
 
 	// Dispatch tasks
 	for i := 1; i <= 10; i++ {

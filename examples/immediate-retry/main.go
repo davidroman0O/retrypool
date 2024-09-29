@@ -51,7 +51,7 @@ func main() {
 		}
 	}
 
-	pool := retrypool.NewPool(ctx, workers,
+	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[Task](retrypool.UnlimitedAttempts),
 		retrypool.WithDelay[Task](50*time.Millisecond),
 		retrypool.WithDelayType[Task](retrypool.CombineDelay[Task](

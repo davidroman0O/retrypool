@@ -25,7 +25,7 @@ func (w *UnrecoverableWorker) Run(ctx context.Context, data int) error {
 func main() {
 	ctx := context.Background()
 	workers := []retrypool.Worker[int]{&UnrecoverableWorker{}, &UnrecoverableWorker{}}
-	pool := retrypool.NewPool(ctx, workers,
+	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[int](3),
 		retrypool.WithOnRetry[int](func(attempt int, err error, task *retrypool.TaskWrapper[int]) {
 			log.Printf("Retrying task %v, attempt %d: %v", task, attempt, err)

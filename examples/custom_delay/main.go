@@ -46,7 +46,7 @@ func customDelayType[T any](n int, _ error, config *retrypool.Config[T]) time.Du
 func main() {
 	ctx := context.Background()
 	workers := []retrypool.Worker[int]{&RetryWorker{}, &RetryWorker{}}
-	pool := retrypool.NewPool(ctx, workers,
+	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[int](5),
 		retrypool.WithDelay[int](100*time.Millisecond),
 		retrypool.WithMaxDelay[int](2*time.Second),

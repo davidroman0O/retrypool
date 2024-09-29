@@ -28,7 +28,7 @@ func main() {
 	workers := []retrypool.Worker[int]{&MyWorker{}, &MyWorker{}, &MyWorker{}}
 	var pool *retrypool.Pool[int]
 
-	pool = retrypool.NewPool(ctx, workers, retrypool.WithOnTaskSuccess(func(controller retrypool.WorkerController[int], workerID int, worker retrypool.Worker[int], task *retrypool.TaskWrapper[int]) {
+	pool = retrypool.New(ctx, workers, retrypool.WithOnTaskSuccess(func(controller retrypool.WorkerController[int], workerID int, worker retrypool.Worker[int], task *retrypool.TaskWrapper[int]) {
 		log.Printf("Worker %d processed data %d\n", workerID, task.Data())
 		if workerID == 1 {
 			log.Println("Remove worker 1")

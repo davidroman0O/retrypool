@@ -139,8 +139,8 @@ type Pool[T any] struct {
 	timer  Timer
 }
 
-// NewPool initializes the Pool with given workers and options
-func NewPool[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) *Pool[T] {
+// New initializes the Pool with given workers and options
+func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) *Pool[T] {
 
 	pool := &Pool[T]{
 		workers:         make(map[int]*workerState[T]),
@@ -540,9 +540,9 @@ func (p *Pool[T]) RangeTasks(cb func(data T, workerID int, status TaskStatus) bo
 	}
 
 	// Iterate over tasks in the queues
-	for _, q := range p.taskQueues {
-		for _, task := range q.tasks {
-			if !cb(task.data, -1, TaskStatusQueued) {
+	for workerID, queue := range p.taskQueues {
+		for _, task := range queue.tasks {
+			if !cb(task.data, workerID, TaskStatusQueued) {
 				return false
 			}
 		}
@@ -937,24 +937,29 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 	}
 	task.scheduledTime = time.Now()
 
-	// Find the queue with the least number of tasks
+	workerIDs := make([]int, 0, len(p.workers))
+	for workerID := range p.workers {
+		workerIDs = append(workerIDs, workerID)
+	}
+
+	if len(workerIDs) == 0 {
+		return errors.New("no workers available")
+	}
+
+	var selectedWorkerID int
+	// Find the worker with the smallest queue
 	minQueueSize := int(^uint(0) >> 1) // Max int
-	var minQueue int
-	for retries, queue := range p.taskQueues {
-		if len(queue.tasks) < minQueueSize {
-			minQueueSize = len(queue.tasks)
-			minQueue = retries
+	for _, workerID := range workerIDs {
+		queueSize := len(p.taskQueues[workerID].tasks)
+		if queueSize < minQueueSize {
+			minQueueSize = queueSize
+			selectedWorkerID = workerID
 		}
 	}
 
-	// If all queues are empty, start with queue 0
-	if minQueueSize == int(^uint(0)>>1) {
-		minQueue = 0
-	}
-
-	q := p.taskQueues[minQueue]
+	q := p.taskQueues[selectedWorkerID]
 	q.tasks = append(q.tasks, task)
-	p.taskQueues[minQueue] = q
+	p.taskQueues[selectedWorkerID] = q
 
 	// Signal all waiting workers that there's a new task
 	p.cond.Broadcast()

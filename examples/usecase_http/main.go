@@ -114,7 +114,7 @@ func main() {
 		&APIWorker{ID: 3, BearerToken: "token3"},
 	}
 
-	pool := retrypool.NewPool(ctx, workers,
+	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[TaskData](3),
 		retrypool.WithDelay[TaskData](time.Second),
 		retrypool.WithMaxDelay[TaskData](5*time.Second),

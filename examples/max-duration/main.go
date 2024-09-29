@@ -53,7 +53,7 @@ func main() {
 	}
 
 	// Initialize pool with workers
-	pool := retrypool.NewPool(ctx, workers)
+	pool := retrypool.New(ctx, workers)
 
 	// Dispatch multiple tasks with some randomness
 	for i := 1; i <= 5; i++ {

@@ -26,7 +26,7 @@ func (w *SlowWorker) Run(ctx context.Context, data interface{}) error {
 
 func main() {
 	// Create a new pool with a single worker
-	pool := retrypool.NewPool(context.Background(), []retrypool.Worker[interface{}]{&SlowWorker{}}, retrypool.WithAttempts[interface{}](1))
+	pool := retrypool.New(context.Background(), []retrypool.Worker[interface{}]{&SlowWorker{}}, retrypool.WithAttempts[interface{}](1))
 	defer pool.Close()
 
 	// Dispatch a task with a 2-second timeout and panic on timeout enabled

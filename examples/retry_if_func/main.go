@@ -41,7 +41,7 @@ func main() {
 	ctx := context.Background()
 	workers := []retrypool.Worker[int]{&CustomWorker{}, &CustomWorker{}}
 
-	pool := retrypool.NewPool(ctx, workers,
+	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[int](5),
 		retrypool.WithDelay[int](100*time.Millisecond),
 		retrypool.WithRetryIf[int](CustomRetryIfFunc),
