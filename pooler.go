@@ -105,6 +105,8 @@ type Config[T any] struct {
 	maxBackOffN uint
 
 	contextFunc ContextFunc
+
+	panicHandler PanicHandlerFunc[T]
 }
 
 // workerState holds all per-worker data
@@ -727,6 +729,10 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
+				if p.config.panicHandler != nil {
+					p.config.panicHandler(task, r)
+				}
+				// Also set err to indicate that a panic occurred
 				err = fmt.Errorf("panic occurred in worker %d: %v", workerID, r)
 			}
 		}()
@@ -1369,3 +1375,6 @@ func (e *panicOnTimeoutError) Error() string {
 func (e *panicOnTimeoutError) Unwrap() error {
 	return e.cause
 }
+
+// PanicHandlerFunc is the type of function called when a panic occurs in a task.
+type PanicHandlerFunc[T any] func(task *TaskWrapper[T], v interface{})
