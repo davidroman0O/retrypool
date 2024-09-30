@@ -1096,6 +1096,13 @@ func (t *timerImpl) After(d time.Duration) <-chan time.Time {
 
 // Option functions for configuring the Pool
 
+// WithPanicHandler sets a custom panic handler for the pool.
+func WithPanicHandler[T any](handler PanicHandlerFunc[T]) Option[T] {
+	return func(p *Pool[T]) {
+		p.config.panicHandler = handler
+	}
+}
+
 // WithAttempts sets the maximum number of attempts
 func WithAttempts[T any](attempts int) Option[T] {
 	return func(p *Pool[T]) {
