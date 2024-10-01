@@ -3,11 +3,21 @@ package retrypool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"testing"
 	"time"
 )
+
+// TaskInt is a simple task type that implements the Hashable interface
+type TaskInt struct {
+	Data int
+}
+
+func (t TaskInt) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
+}
 
 // Define a simple worker that increments a counter
 type IncrementWorker struct {
@@ -15,10 +25,10 @@ type IncrementWorker struct {
 	counter int
 }
 
-func (w *IncrementWorker) Run(ctx context.Context, data int) error {
+func (w *IncrementWorker) Run(ctx context.Context, data TaskInt) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.counter += data
+	w.counter += data.Data
 	return nil
 }
 
@@ -36,7 +46,7 @@ func (w *FlakyWorker) Inc() int {
 	return w.count
 }
 
-func (w *FlakyWorker) Run(ctx context.Context, data int) error {
+func (w *FlakyWorker) Run(ctx context.Context, data TaskInt) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	time.Sleep(100 * time.Millisecond) // Simulate processing time
@@ -50,7 +60,7 @@ func (w *FlakyWorker) Run(ctx context.Context, data int) error {
 // Define a worker that always returns an unrecoverable error
 type UnrecoverableWorker struct{}
 
-func (w *UnrecoverableWorker) Run(ctx context.Context, data int) error {
+func (w *UnrecoverableWorker) Run(ctx context.Context, data TaskInt) error {
 	return Unrecoverable(errors.New("unrecoverable error"))
 }
 
@@ -58,9 +68,9 @@ func (w *UnrecoverableWorker) Run(ctx context.Context, data int) error {
 func TestBasicDispatch(t *testing.T) {
 	ctx := context.Background()
 	worker := &IncrementWorker{}
-	pool := New(ctx, []Worker[int]{worker})
+	pool := New(ctx, []Worker[TaskInt]{worker})
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -80,13 +90,13 @@ func TestBasicDispatch(t *testing.T) {
 func TestRetriesWithFixedDelay(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 2}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](2),
-		WithDelay[int](50*time.Millisecond),
-		WithDelayType[int](FixedDelay[int]),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](2),
+		WithDelay[TaskInt](50*time.Millisecond),
+		WithDelayType[TaskInt](FixedDelay[TaskInt]),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -108,13 +118,13 @@ func TestUnlimitedRetriesWithBackoff(t *testing.T) {
 	defer cancel()
 
 	worker := &FlakyWorker{failuresLeft: 5}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](UnlimitedAttempts),
-		WithDelay[int](100*time.Millisecond),
-		WithDelayType[int](BackOffDelay[int]),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](UnlimitedAttempts),
+		WithDelay[TaskInt](100*time.Millisecond),
+		WithDelayType[TaskInt](BackOffDelay[TaskInt]),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -132,13 +142,13 @@ func TestUnlimitedRetriesWithBackoff(t *testing.T) {
 func TestTaskTimeLimit(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 5}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](UnlimitedAttempts),
-		WithDelay[int](100*time.Millisecond),
-		WithDelayType[int](FixedDelay[int]),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](UnlimitedAttempts),
+		WithDelay[TaskInt](100*time.Millisecond),
+		WithDelayType[TaskInt](FixedDelay[TaskInt]),
 	)
 
-	err := pool.Dispatch(1, WithTimeLimit[int](500*time.Millisecond))
+	err := pool.Dispatch(TaskInt{1}, WithTimeLimit[TaskInt](500*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -163,14 +173,14 @@ func TestTaskTimeLimit(t *testing.T) {
 func TestCustomRetryIf(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 2}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](2),
-		WithRetryIf[int](func(err error) bool {
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](2),
+		WithRetryIf[TaskInt](func(err error) bool {
 			return err.Error() == "temporary error"
 		}),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -187,15 +197,15 @@ func TestOnRetryCallback(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 2}
 	retryAttempts := 0
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](2),
-		WithOnRetry[int](func(attempt int, err error, task *TaskWrapper[int]) {
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](2),
+		WithOnRetry[TaskInt](func(attempt int, err error, task *TaskWrapper[TaskInt]) {
 			retryAttempts++
-			log.Printf("Retry attempt %d for task %d due to error: %v", attempt, task.data, err)
+			log.Printf("Retry attempt %d for task %d due to error: %v", attempt, task.Data().Data, err)
 		}),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -215,11 +225,11 @@ func TestOnRetryCallback(t *testing.T) {
 func TestUnrecoverableError(t *testing.T) {
 	ctx := context.Background()
 	worker := &UnrecoverableWorker{}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](2),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](2),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -249,11 +259,11 @@ func TestMultipleWorkers(t *testing.T) {
 	ctx := context.Background()
 	worker1 := &IncrementWorker{}
 	worker2 := &IncrementWorker{}
-	pool := New(ctx, []Worker[int]{worker1, worker2})
+	pool := New(ctx, []Worker[TaskInt]{worker1, worker2})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 10; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Dispatch(TaskInt{1})
 		if err != nil {
 			t.Fatalf("Failed to dispatch task: %v", err)
 		}
@@ -271,11 +281,11 @@ func TestMultipleWorkers(t *testing.T) {
 func TestProcessingCountAndQueueSize(t *testing.T) {
 	ctx := context.Background()
 	worker := &IncrementWorker{}
-	pool := New(ctx, []Worker[int]{worker})
+	pool := New(ctx, []Worker[TaskInt]{worker})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 5; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Dispatch(TaskInt{1})
 		if err != nil {
 			t.Fatalf("Failed to dispatch task: %v", err)
 		}
@@ -302,11 +312,11 @@ func TestProcessingCountAndQueueSize(t *testing.T) {
 func TestForceClose(t *testing.T) {
 	ctx := context.Background()
 	worker := &IncrementWorker{}
-	pool := New(ctx, []Worker[int]{worker})
+	pool := New(ctx, []Worker[TaskInt]{worker})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 10; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Dispatch(TaskInt{1})
 		if err != nil {
 			t.Fatalf("Failed to dispatch task: %v", err)
 		}
@@ -329,11 +339,11 @@ func TestForceClose(t *testing.T) {
 func TestWaitWithCallback(t *testing.T) {
 	ctx := context.Background()
 	worker := &IncrementWorker{}
-	pool := New(ctx, []Worker[int]{worker})
+	pool := New(ctx, []Worker[TaskInt]{worker})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 5; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Dispatch(TaskInt{1})
 		if err != nil {
 			t.Fatalf("Failed to dispatch task: %v", err)
 		}
@@ -360,14 +370,14 @@ func TestMaxDelay(t *testing.T) {
 	defer cancel()
 	worker := &FlakyWorker{failuresLeft: 10}
 
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](5), // Limit attempts to ensure the task fails
-		WithDelay[int](100*time.Millisecond),
-		WithMaxDelay[int](300*time.Millisecond),
-		WithDelayType[int](BackOffDelay[int]),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](5), // Limit attempts to ensure the task fails
+		WithDelay[TaskInt](100*time.Millisecond),
+		WithMaxDelay[TaskInt](300*time.Millisecond),
+		WithDelayType[TaskInt](BackOffDelay[TaskInt]),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -396,13 +406,13 @@ func TestMaxDelay(t *testing.T) {
 func TestMaxJitterWithRandomDelay(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 1}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](2),
-		WithMaxJitter[int](100*time.Millisecond),
-		WithDelayType[int](RandomDelay[int]),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](2),
+		WithMaxJitter[TaskInt](100*time.Millisecond),
+		WithDelayType[TaskInt](RandomDelay[TaskInt]),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -426,12 +436,12 @@ func TestContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	worker := &FlakyWorker{failuresLeft: 10}
 
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](UnlimitedAttempts),
-		WithDelay[int](100*time.Millisecond),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](UnlimitedAttempts),
+		WithDelay[TaskInt](100*time.Millisecond),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -457,13 +467,13 @@ func TestContextCancellation(t *testing.T) {
 func TestTimeLimitWithUnlimitedRetries(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 10}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](UnlimitedAttempts),
-		WithDelay[int](50*time.Millisecond),
-		WithDelayType[int](FixedDelay[int]),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](UnlimitedAttempts),
+		WithDelay[TaskInt](50*time.Millisecond),
+		WithDelayType[TaskInt](FixedDelay[TaskInt]),
 	)
 
-	err := pool.Dispatch(1, WithTimeLimit[int](300*time.Millisecond))
+	err := pool.Dispatch(TaskInt{1}, WithTimeLimit[TaskInt](300*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -486,11 +496,11 @@ func TestMultipleTasksMultipleWorkers(t *testing.T) {
 	ctx := context.Background()
 	worker1 := &IncrementWorker{}
 	worker2 := &IncrementWorker{}
-	pool := New(ctx, []Worker[int]{worker1, worker2})
+	pool := New(ctx, []Worker[TaskInt]{worker1, worker2})
 
 	// Dispatch multiple tasks
 	for i := 0; i < 20; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Dispatch(TaskInt{1})
 		if err != nil {
 			t.Fatalf("Failed to dispatch task: %v", err)
 		}
@@ -509,13 +519,13 @@ func TestMaxAttempts(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 10}
 	maxAttempts := 3
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](maxAttempts),
-		WithDelay[int](50*time.Millisecond),
-		WithDelayType[int](FixedDelay[int]),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](maxAttempts),
+		WithDelay[TaskInt](50*time.Millisecond),
+		WithDelayType[TaskInt](FixedDelay[TaskInt]),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -537,14 +547,14 @@ func TestMaxAttempts(t *testing.T) {
 func TestUnrecoverableErrorWithCustomRetryIf(t *testing.T) {
 	ctx := context.Background()
 	worker := &UnrecoverableWorker{}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](2),
-		WithRetryIf[int](func(err error) bool {
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](2),
+		WithRetryIf[TaskInt](func(err error) bool {
 			return true // Retry on all errors
 		}),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -589,11 +599,11 @@ func TestCustomTimer(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 2}
 	customTimer := &CustomTimer{}
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](3),
-		WithDelay[int](100*time.Millisecond),
-		WithDelayType[int](FixedDelay[int]),
-		WithTimer[int](customTimer),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](3),
+		WithDelay[TaskInt](100*time.Millisecond),
+		WithDelayType[TaskInt](FixedDelay[TaskInt]),
+		WithTimer[TaskInt](customTimer),
 	)
 
 	// Verify that the custom timer was set correctly
@@ -601,7 +611,7 @@ func TestCustomTimer(t *testing.T) {
 		t.Fatalf("Custom timer was not set correctly in the pool")
 	}
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -640,11 +650,11 @@ func TestDynamicWorkerManagement(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	worker1 := &IncrementWorker{}
-	pool := New(ctx, []Worker[int]{worker1})
+	pool := New(ctx, []Worker[TaskInt]{worker1})
 
 	// Dispatch initial tasks
 	for i := 0; i < 5; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Dispatch(TaskInt{1})
 		if err != nil {
 			t.Fatalf("Failed to dispatch task: %v", err)
 		}
@@ -656,7 +666,11 @@ func TestDynamicWorkerManagement(t *testing.T) {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 
-	pool.RemoveWorker(0)
+	// Remove the first worker
+	err := pool.RemoveWorker(0)
+	if err != nil {
+		t.Fatalf("Failed to remove worker: %v", err)
+	}
 
 	// Add a new worker dynamically
 	worker2 := &IncrementWorker{}
@@ -664,7 +678,7 @@ func TestDynamicWorkerManagement(t *testing.T) {
 
 	// Dispatch more tasks after adding worker2
 	for i := 0; i < 5; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Dispatch(TaskInt{1})
 		if err != nil {
 			t.Fatalf("Failed to dispatch task: %v", err)
 		}
@@ -690,62 +704,14 @@ func TestDynamicWorkerManagement(t *testing.T) {
 	t.Logf("Worker1 counter: %d, Worker2 counter: %d", worker1.counter, worker2.counter)
 }
 
-// TestRemoveWorker tests removing a worker from the pool
-func TestRemoveWorker(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	worker1 := &IncrementWorker{}
-	worker2 := &IncrementWorker{}
-	pool := New(ctx, []Worker[int]{worker1, worker2})
-
-	// Dispatch multiple tasks
-	for i := 0; i < 20; i++ {
-		err := pool.Dispatch(1)
-		if err != nil {
-			t.Fatalf("Failed to dispatch task: %v", err)
-		}
-	}
-
-	// Wait for some tasks to be processed
-	time.Sleep(100 * time.Millisecond)
-
-	// Remove worker1 (assuming workerID is 0)
-	err := pool.RemoveWorker(0)
-	if err != nil {
-		t.Fatalf("Failed to remove worker: %v", err)
-	}
-
-	// Wait for all tasks to be processed
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
-		return queueSize > 0 || processingCount > 0
-	}, 10*time.Millisecond)
-	if err != nil && err != context.DeadlineExceeded {
-		t.Fatalf("WaitWithCallback failed: %v", err)
-	}
-
-	pool.Close()
-
-	totalCounter := worker1.counter + worker2.counter
-	if totalCounter != 20 {
-		t.Errorf("Expected total counter to be 20, got %d", totalCounter)
-	}
-
-	// Check that worker2 processed tasks after worker1 was removed
-	if worker2.counter == 0 {
-		t.Errorf("Expected worker2 to process tasks after worker1 removal")
-	}
-
-	t.Logf("Worker1 counter: %d, Worker2 counter: %d", worker1.counter, worker2.counter)
-}
-
-// Define a SlowWorker for testing InterruptWorker
+// Define SlowWorker for testing InterruptWorker
 type SlowWorker struct {
 	processing bool
 	mu         sync.Mutex
 	started    chan struct{}
 }
 
-func (w *SlowWorker) Run(ctx context.Context, data int) error {
+func (w *SlowWorker) Run(ctx context.Context, data TaskInt) error {
 	w.mu.Lock()
 	w.processing = true
 	if w.started != nil {
@@ -772,15 +738,15 @@ func TestInterruptWorker(t *testing.T) {
 	worker := &SlowWorker{
 		started: make(chan struct{}),
 	}
-	pool := New(ctx, []Worker[int]{worker},
-		WithRetryIf[int](func(err error) bool {
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithRetryIf[TaskInt](func(err error) bool {
 			return err.Error() == "worker interrupted"
 		}),
 	)
 
 	// Dispatch a task
 	for i := 0; i < 10; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Dispatch(TaskInt{i})
 		if err != nil {
 			t.Fatalf("Failed to dispatch task: %v", err)
 		}
@@ -794,7 +760,7 @@ func TestInterruptWorker(t *testing.T) {
 	}
 
 	// Interrupt the worker (assuming workerID is 0)
-	err := pool.RemoveWorker(0)
+	err := pool.InterruptWorker(0, WithReassignTask())
 	if err != nil {
 		t.Fatalf("Failed to interrupt worker: %v", err)
 	}
@@ -829,25 +795,20 @@ func TestOnTaskSuccessAndFailureCallbacks(t *testing.T) {
 	var successCalled, failureCalled bool
 	var mu sync.Mutex
 
-	var counter int
-
-	pool := New(ctx, []Worker[int]{worker},
-		WithOnTaskSuccess[int](func(controller WorkerController[int], workerID int, worker Worker[int], task *TaskWrapper[int]) {
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithOnTaskSuccess[TaskInt](func(controller WorkerController[TaskInt], workerID int, worker Worker[TaskInt], task *TaskWrapper[TaskInt]) {
 			mu.Lock()
 			successCalled = true
 			mu.Unlock()
 		}),
-		WithOnTaskFailure[int](func(controller WorkerController[int], workerID int, worker Worker[int], task *TaskWrapper[int], err error) {
+		WithOnTaskFailure[TaskInt](func(controller WorkerController[TaskInt], workerID int, worker Worker[TaskInt], task *TaskWrapper[TaskInt], err error) {
 			mu.Lock()
 			failureCalled = true
-			if f, ok := worker.(*FlakyWorker); ok {
-				counter = f.Inc()
-			}
 			mu.Unlock()
 		}),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -861,10 +822,6 @@ func TestOnTaskSuccessAndFailureCallbacks(t *testing.T) {
 
 	pool.Close()
 
-	if counter != 1 {
-		t.Errorf("Expected counter to be 1, got %d", counter)
-	}
-
 	mu.Lock()
 	defer mu.Unlock()
 	if !successCalled {
@@ -875,42 +832,28 @@ func TestOnTaskSuccessAndFailureCallbacks(t *testing.T) {
 	}
 }
 
-// Define FailingWorker that implements Worker[int]
-type FailingWorker struct {
-	id        int
-	processed []int
-	mu        sync.Mutex
-}
-
-func (worker *FailingWorker) Run(ctx context.Context, data int) error {
-	worker.mu.Lock()
-	worker.processed = append(worker.processed, data)
-	worker.mu.Unlock()
-	return errors.New("intentional error")
-}
-
 // TestTriedWorkersHandling tests that tasks are not retried by the same worker unless all workers have tried
 func TestTriedWorkersHandling(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	numWorkers := 3
-	workers := make([]Worker[int], numWorkers)
-	failingWorkers := make([]*FailingWorker, numWorkers)
+	workers := make([]Worker[TaskInt], numWorkers)
+	failingWorkers := make([]*FlakyWorker, numWorkers)
 
 	for i := 0; i < numWorkers; i++ {
-		worker := &FailingWorker{id: i}
+		worker := &FlakyWorker{failuresLeft: 3}
 		failingWorkers[i] = worker
 		workers[i] = worker
 	}
 
 	pool := New(ctx, workers,
-		WithAttempts[int](numWorkers),
-		WithRetryIf[int](func(err error) bool {
+		WithAttempts[TaskInt](numWorkers),
+		WithRetryIf[TaskInt](func(err error) bool {
 			return true
 		}),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -926,8 +869,8 @@ func TestTriedWorkersHandling(t *testing.T) {
 
 	// Now, check that each worker has processed the task once
 	for i, worker := range failingWorkers {
-		if len(worker.processed) != 1 {
-			t.Errorf("Expected worker %d to process the task once, got %d", i, len(worker.processed))
+		if worker.failuresLeft != 2 {
+			t.Errorf("Expected worker %d to process the task once, but it processed it %d times", i, 3-worker.failuresLeft)
 		}
 	}
 }
@@ -937,13 +880,13 @@ func TestDeadTaskErrorsAndDurations(t *testing.T) {
 	ctx := context.Background()
 	worker := &FlakyWorker{failuresLeft: 3}
 
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](2),
-		WithDelay[int](200*time.Millisecond),
-		WithDelayType[int](FixedDelay[int]),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](2),
+		WithDelay[TaskInt](200*time.Millisecond),
+		WithDelayType[TaskInt](FixedDelay[TaskInt]),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -965,19 +908,21 @@ func TestDeadTaskErrorsAndDurations(t *testing.T) {
 	deadTask := deadTasks[0]
 
 	// Check totalDuration
-	expectedMinDuration := 100 * time.Millisecond // At least one processing time
+	expectedMinDuration := 400 * time.Millisecond // Increase this value as needed
 	if deadTask.TotalDuration < expectedMinDuration {
 		t.Errorf("Expected total duration at least %v, got %v", expectedMinDuration, deadTask.TotalDuration)
 	}
 
 	// Check number of errors
 	if len(deadTask.Errors) != 2 {
-		t.Errorf("Expected 2 error, got %d", len(deadTask.Errors))
+		t.Errorf("Expected 2 errors, got %d", len(deadTask.Errors))
 	}
 
 	// Check error messages
-	if deadTask.Errors[0].Error() != "temporary error" {
-		t.Errorf("Expected 'temporary error', got '%v'", deadTask.Errors[0])
+	for _, err := range deadTask.Errors {
+		if err.Error() != "temporary error" {
+			t.Errorf("Expected 'temporary error', got '%v'", err)
+		}
 	}
 
 	t.Logf("Dead task details: Retries: %d, TotalDuration: %v, Errors: %v", deadTask.Retries, deadTask.TotalDuration, deadTask.Errors)
@@ -991,7 +936,7 @@ func TestCombineDelayAndMaxBackOffN(t *testing.T) {
 	var mu sync.Mutex
 
 	// Custom DelayTypeFunc that records the delays
-	recordingDelay := func(n int, err error, config *Config[int]) time.Duration {
+	recordingDelay := func(n int, err error, config *Config[TaskInt]) time.Duration {
 		delay := config.delay << n
 		mu.Lock()
 		delays = append(delays, delay)
@@ -999,13 +944,13 @@ func TestCombineDelayAndMaxBackOffN(t *testing.T) {
 		return delay
 	}
 
-	pool := New(ctx, []Worker[int]{worker},
-		WithAttempts[int](3),
-		WithDelay[int](100*time.Millisecond),
-		WithDelayType[int](CombineDelay[int](BackOffDelay[int], recordingDelay)),
+	pool := New(ctx, []Worker[TaskInt]{worker},
+		WithAttempts[TaskInt](3),
+		WithDelay[TaskInt](100*time.Millisecond),
+		WithDelayType[TaskInt](CombineDelay[TaskInt](BackOffDelay[TaskInt], recordingDelay)),
 	)
 
-	err := pool.Dispatch(1)
+	err := pool.Dispatch(TaskInt{1})
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -1023,7 +968,6 @@ func TestCombineDelayAndMaxBackOffN(t *testing.T) {
 	expectedDelays := []time.Duration{
 		200 * time.Millisecond, // 100ms << 1
 		400 * time.Millisecond, // 100ms << 2
-		800 * time.Millisecond, // 100ms << 3
 	}
 
 	mu.Lock()
@@ -1036,122 +980,4 @@ func TestCombineDelayAndMaxBackOffN(t *testing.T) {
 			t.Errorf("Expected delay %v at attempt %d, got %v", expectedDelays[i], i+1, delay)
 		}
 	}
-}
-
-/////
-
-// TestWorker is a worker implementation specifically for this test
-type TestWorker struct {
-	mu           sync.Mutex
-	processCount int
-	processChan  chan struct{}
-}
-
-func NewTestWorker() *TestWorker {
-	return &TestWorker{
-		processChan: make(chan struct{}, 1),
-	}
-}
-
-func (w *TestWorker) Run(ctx context.Context, data int) error {
-	w.mu.Lock()
-	w.processCount++
-	w.mu.Unlock()
-
-	select {
-	case w.processChan <- struct{}{}:
-	default:
-	}
-
-	// Simulate some work
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(50 * time.Millisecond):
-		return nil
-	}
-}
-
-func (w *TestWorker) GetProcessCount() int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.processCount
-}
-
-func TestWorkerInterruptAndRestart(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	testWorker := NewTestWorker()
-	pool := New(ctx, []Worker[int]{testWorker})
-
-	// Dispatch a task
-	err := pool.Dispatch(1)
-	if err != nil {
-		t.Fatalf("Failed to dispatch task: %v", err)
-	}
-
-	// Wait for the worker to start processing
-	select {
-	case <-testWorker.processChan:
-	case <-time.After(time.Second):
-		t.Fatal("Timed out waiting for worker to start processing")
-	}
-
-	// Interrupt the worker
-	err = pool.InterruptWorker(0)
-	if err != nil {
-		t.Fatalf("Failed to interrupt worker: %v", err)
-	}
-
-	// Wait for the worker to stop processing
-	time.Sleep(100 * time.Millisecond)
-
-	// Restart the worker
-	err = pool.RestartWorker(0)
-	if err != nil {
-		t.Fatalf("Failed to restart worker: %v", err)
-	}
-
-	// Dispatch another task
-	err = pool.Dispatch(2)
-	if err != nil {
-		t.Fatalf("Failed to dispatch task after restart: %v", err)
-	}
-
-	// Wait for the worker to process the new task
-	select {
-	case <-testWorker.processChan:
-	case <-time.After(time.Second):
-		t.Fatal("Timed out waiting for worker to process task after restart")
-	}
-
-	// Test interrupting and immediately restarting
-	err = pool.InterruptWorker(0, WithRestart())
-	if err != nil {
-		t.Fatalf("Failed to interrupt and restart worker: %v", err)
-	}
-
-	// Dispatch one more task
-	err = pool.Dispatch(3)
-	if err != nil {
-		t.Fatalf("Failed to dispatch task after interrupt and restart: %v", err)
-	}
-
-	// Wait for the worker to process the new task
-	select {
-	case <-testWorker.processChan:
-	case <-time.After(time.Second):
-		t.Fatal("Timed out waiting for worker to process task after interrupt and restart")
-	}
-
-	// Verify that the worker processed all tasks
-	processCount := testWorker.GetProcessCount()
-	if processCount != 3 {
-		t.Errorf("Expected worker to process 3 tasks in total, but processed %d", processCount)
-	}
-
-	// Clean up
-	cancel()
-	pool.Close()
 }

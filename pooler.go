@@ -12,13 +12,26 @@ import (
 	"time"
 )
 
+// Hashable is the interface used to get the hash code of a value.
+type Hashable interface {
+	Hashcode() interface{}
+}
+
+// hashcode returns the hashcode used for set elements.
+func hashcode(v interface{}) interface{} {
+	if h, ok := v.(Hashable); ok {
+		return h.Hashcode()
+	}
+	return v
+}
+
 // Worker interface for task processing
-type Worker[T any] interface {
+type Worker[T Hashable] interface {
 	Run(ctx context.Context, data T) error
 }
 
 // DeadTask struct to hold failed task information
-type DeadTask[T any] struct {
+type DeadTask[T Hashable] struct {
 	Data          T
 	Retries       int
 	TotalDuration time.Duration
@@ -26,7 +39,7 @@ type DeadTask[T any] struct {
 }
 
 // TaskWrapper includes scheduledTime, triedWorkers, errors, durations, and panicOnTimeout
-type TaskWrapper[T any] struct {
+type TaskWrapper[T Hashable] struct {
 	data           T
 	retries        int
 	totalDuration  time.Duration
@@ -44,6 +57,10 @@ type TaskWrapper[T any] struct {
 
 func (t *TaskWrapper[T]) Data() T {
 	return t.data
+}
+
+func (t *TaskWrapper[T]) Hashcode() interface{} {
+	return hashcode(t.data)
 }
 
 func (t *TaskWrapper[T]) Retries() int {
@@ -75,18 +92,18 @@ func (t *TaskWrapper[T]) Durations() []time.Duration {
 }
 
 // taskQueue stores pointers to TaskWrapper
-type taskQueue[T any] struct {
-	tasks []*TaskWrapper[T]
+type taskQueue[T Hashable] struct {
+	tasks map[interface{}]*TaskWrapper[T]
 }
 
 // Option type for configuring the Pool
-type Option[T any] func(*Pool[T])
+type Option[T Hashable] func(*Pool[T])
 
 // TaskOption type for configuring individual tasks
-type TaskOption[T any] func(*TaskWrapper[T])
+type TaskOption[T Hashable] func(*TaskWrapper[T])
 
 // Config struct to hold retry configurations
-type Config[T any] struct {
+type Config[T Hashable] struct {
 	attempts         int
 	attemptsForError map[error]int
 	delay            time.Duration
@@ -110,7 +127,7 @@ type Config[T any] struct {
 }
 
 // workerState holds all per-worker data
-type workerState[T any] struct {
+type workerState[T Hashable] struct {
 	worker         Worker[T]
 	stopChan       chan struct{}
 	doneChan       chan struct{}
@@ -123,7 +140,7 @@ type workerState[T any] struct {
 }
 
 // Pool struct updated to include Config and support dynamic worker management
-type Pool[T any] struct {
+type Pool[T Hashable] struct {
 	workers         map[int]*workerState[T] // Map of workers with unique worker IDs
 	nextWorkerID    int                     // Counter for assigning unique worker IDs
 	workersToRemove map[int]bool
@@ -142,7 +159,7 @@ type Pool[T any] struct {
 }
 
 // New initializes the Pool with given workers and options
-func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) *Pool[T] {
+func New[T Hashable](ctx context.Context, workers []Worker[T], options ...Option[T]) *Pool[T] {
 
 	pool := &Pool[T]{
 		workers:         make(map[int]*workerState[T]),
@@ -213,7 +230,7 @@ func (p *Pool[T]) RemovalWorker(workerID int) {
 }
 
 // WorkerController interface provides methods to control workers
-type WorkerController[T any] interface {
+type WorkerController[T Hashable] interface {
 	AddWorker(worker Worker[T]) int
 	RemovalWorker(workerID int)
 	RestartWorker(workerID int) error
@@ -316,20 +333,64 @@ func (p *Pool[T]) requeueTasksFromWorker(workerID int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Remove the worker's triedTasks from all tasks
-	for retries, queue := range p.taskQueues {
-		newTasks := make([]*TaskWrapper[T], 0, len(queue.tasks))
+	// Collect all tasks from the removed worker's queue
+	tasksToRequeue := make([]*TaskWrapper[T], 0)
+	if queue, exists := p.taskQueues[workerID]; exists {
+		for _, task := range queue.tasks {
+			tasksToRequeue = append(tasksToRequeue, task)
+		}
+		// Clear the queue for the removed worker
+		delete(p.taskQueues, workerID)
+	}
+
+	// Remove the worker from triedWorkers for all tasks in all queues
+	for _, queue := range p.taskQueues {
 		for _, task := range queue.tasks {
 			if task.triedWorkers != nil {
 				delete(task.triedWorkers, workerID)
 			}
-			newTasks = append(newTasks, task)
 		}
-		p.taskQueues[retries] = taskQueue[T]{tasks: newTasks}
+	}
+
+	// Requeue the tasks
+	for _, task := range tasksToRequeue {
+		// Reset triedWorkers for this task
+		task.triedWorkers = make(map[int]bool)
+
+		// Find a new worker for this task
+		selectedWorkerID := p.selectWorkerForTask(task)
+
+		// Add the task to the selected worker's queue
+		if q, exists := p.taskQueues[selectedWorkerID]; exists {
+			if q.tasks == nil {
+				q.tasks = make(map[interface{}]*TaskWrapper[T])
+			}
+			q.tasks[task.Hashcode()] = task
+		} else {
+			p.taskQueues[selectedWorkerID] = taskQueue[T]{
+				tasks: map[interface{}]*TaskWrapper[T]{task.Hashcode(): task},
+			}
+		}
 	}
 
 	// Signal workers that the task queues have changed
 	p.cond.Broadcast()
+}
+
+// Helper function to select a worker for a task
+func (p *Pool[T]) selectWorkerForTask(task *TaskWrapper[T]) int {
+	workerIDs := make([]int, 0, len(p.workers))
+	for workerID := range p.workers {
+		workerIDs = append(workerIDs, workerID)
+	}
+
+	// If there are no workers, this is an error condition
+	if len(workerIDs) == 0 {
+		// In a real implementation, you might want to handle this error more gracefully
+		panic("No workers available to assign task")
+	}
+
+	return workerIDs[rand.Intn(len(workerIDs))]
 }
 
 // workerLoop updated to handle scheduledTime, triedWorkers, and worker interruption
@@ -373,7 +434,6 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		for p.isAllQueuesEmpty() && !p.stopped {
 			p.cond.Wait()
 
-			// Check if context is canceled
 			if ctx.Err() != nil {
 				p.mu.Unlock()
 				return
@@ -385,13 +445,12 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			return
 		}
 
-		// Check if context is canceled before proceeding
 		if ctx.Err() != nil {
 			p.mu.Unlock()
 			return
 		}
 
-		retries, idx, task, ok := p.getNextTask(workerID)
+		retries, hashcode, task, ok := p.getNextTask(workerID)
 		if !ok {
 			p.mu.Unlock()
 			continue
@@ -410,27 +469,21 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		}
 
 		// Remove the task from the queue
-		q := p.taskQueues[retries]
-		q.tasks = append(q.tasks[:idx], q.tasks[idx+1:]...)
-		if len(q.tasks) == 0 {
+		delete(p.taskQueues[retries].tasks, hashcode)
+		if len(p.taskQueues[retries].tasks) == 0 {
 			delete(p.taskQueues, retries)
-		} else {
-			p.taskQueues[retries] = q
 		}
 
-		// Mark the task as tried by this worker
 		if task.triedWorkers == nil {
 			task.triedWorkers = make(map[int]bool)
 		}
 		task.triedWorkers[workerID] = true
 
-		// Set the current task
 		state.currentTask = task
 
 		p.processing++
 		p.mu.Unlock()
 
-		// Check if context is canceled before processing the task
 		if ctx.Err() != nil {
 			p.mu.Lock()
 			p.processing--
@@ -448,13 +501,12 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			return
 		}
 
-		// Unset the current task
 		state.currentTask = nil
 
 		if state.interrupted {
 			p.processing--
 			p.mu.Unlock()
-			return // Exit the loop if the worker was interrupted
+			return
 		}
 
 		p.processing--
@@ -492,7 +544,7 @@ func (p *Pool[T]) isAllQueuesEmpty() bool {
 }
 
 // getNextTask returns the next task that the worker hasn't tried
-func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
+func (p *Pool[T]) getNextTask(workerID int) (int, interface{}, *TaskWrapper[T], bool) {
 	// First, check for immediate retry tasks this worker hasn't tried
 	for retries, q := range p.taskQueues {
 		for idx, task := range q.tasks {
@@ -609,7 +661,6 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 		return fmt.Errorf("worker %d does not exist", workerID)
 	}
 
-	// Apply options
 	cfg := &WorkerInterruptConfig{
 		RemoveWorker: false,
 		RemoveTask:   false,
@@ -621,51 +672,50 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 		opt(cfg)
 	}
 
-	// Set the forcePanicFlag if requested
 	if cfg.ForcePanic {
 		state.forcePanicFlag.Store(true)
 	}
 
-	// Cancel the worker's context to trigger the interrupt
 	state.cancel()
 
-	// Cancel the current task's context if it's running
 	task := state.currentTask
 	if task != nil {
 		task.cancel()
 	}
 
-	// Close the stopChan to signal the worker to stop
 	close(state.stopChan)
 
-	// Handle task options
 	if task != nil {
 		if cfg.RemoveTask {
 			// Task is already canceled and will not be retried
 		} else if cfg.ReassignTask {
-			// Reset the task's context
 			taskCtx, cancel := context.WithCancel(p.ctx)
 			task.ctx = taskCtx
 			task.cancel = cancel
 			task.triedWorkers = make(map[int]bool)
 			task.scheduledTime = time.Now()
+
 			// Add the task back to the taskQueues for the current retry count
-			q := p.taskQueues[task.retries]
-			q.tasks = append(q.tasks, task)
-			p.taskQueues[task.retries] = q
+			if q, exists := p.taskQueues[task.retries]; exists {
+				if q.tasks == nil {
+					q.tasks = make(map[interface{}]*TaskWrapper[T])
+				}
+				q.tasks[task.Hashcode()] = task
+			} else {
+				p.taskQueues[task.retries] = taskQueue[T]{
+					tasks: map[interface{}]*TaskWrapper[T]{task.Hashcode(): task},
+				}
+			}
 		}
 	}
 
 	if cfg.RemoveWorker {
-		// delete(p.workers, workerID)
 		err := p.RemoveWorker(workerID)
 		if err != nil {
 			return fmt.Errorf("failed to remove worker %d: %v", workerID, err)
 		}
-		// fmt.Printf("Worker %d has been removed\n", workerID)
 	} else {
 		state.interrupted = true
-		// fmt.Printf("Worker %d has been interrupted\n", workerID)
 
 		if cfg.Restart {
 			p.mu.Unlock()
@@ -677,7 +727,7 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 		}
 	}
 
-	p.cond.Broadcast() // Signal all workers
+	p.cond.Broadcast()
 
 	return nil
 }
@@ -859,7 +909,10 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 		}
 
 		q := p.taskQueues[selectedWorkerID]
-		q.tasks = append(q.tasks, task) // Put at the back of the queue
+		if q.tasks == nil {
+			q.tasks = make(map[interface{}]*TaskWrapper[T])
+		}
+		q.tasks[task.Hashcode()] = task
 		p.taskQueues[selectedWorkerID] = q
 	} else {
 		// Immediate retry
@@ -868,7 +921,10 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 			for workerID := range p.workers {
 				if !task.triedWorkers[workerID] {
 					q := p.taskQueues[workerID]
-					q.tasks = append([]*TaskWrapper[T]{task}, q.tasks...) // Put at the front of the queue
+					if q.tasks == nil {
+						q.tasks = make(map[interface{}]*TaskWrapper[T])
+					}
+					q.tasks[task.Hashcode()] = task
 					p.taskQueues[workerID] = q
 					break
 				}
@@ -882,7 +938,10 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 			}
 			randomWorkerID := workerIDs[rand.Intn(len(workerIDs))]
 			q := p.taskQueues[randomWorkerID]
-			q.tasks = append(q.tasks, task) // Put at the back of the queue
+			if q.tasks == nil {
+				q.tasks = make(map[interface{}]*TaskWrapper[T])
+			}
+			q.tasks[task.Hashcode()] = task
 			p.taskQueues[randomWorkerID] = q
 		}
 	}
@@ -964,7 +1023,10 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 	}
 
 	q := p.taskQueues[selectedWorkerID]
-	q.tasks = append(q.tasks, task)
+	if q.tasks == nil {
+		q.tasks = make(map[interface{}]*TaskWrapper[T])
+	}
+	q.tasks[task.Hashcode()] = task
 	p.taskQueues[selectedWorkerID] = q
 
 	// Signal all waiting workers that there's a new task
@@ -1044,7 +1106,7 @@ func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize,
 }
 
 // newDefaultConfig initializes default retry configurations
-func newDefaultConfig[T any]() Config[T] {
+func newDefaultConfig[T Hashable]() Config[T] {
 	return Config[T]{
 		attempts:         10,
 		attemptsForError: make(map[error]int),
@@ -1097,91 +1159,91 @@ func (t *timerImpl) After(d time.Duration) <-chan time.Time {
 // Option functions for configuring the Pool
 
 // WithPanicHandler sets a custom panic handler for the pool.
-func WithPanicHandler[T any](handler PanicHandlerFunc[T]) Option[T] {
+func WithPanicHandler[T Hashable](handler PanicHandlerFunc[T]) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.panicHandler = handler
 	}
 }
 
 // WithAttempts sets the maximum number of attempts
-func WithAttempts[T any](attempts int) Option[T] {
+func WithAttempts[T Hashable](attempts int) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.attempts = attempts
 	}
 }
 
 // WithWorkerContext creates a specific context for each worker
-func WithWorkerContext[T any](fn ContextFunc) Option[T] {
+func WithWorkerContext[T Hashable](fn ContextFunc) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.contextFunc = fn
 	}
 }
 
 // WithDelay sets the delay between retries
-func WithDelay[T any](delay time.Duration) Option[T] {
+func WithDelay[T Hashable](delay time.Duration) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.delay = delay
 	}
 }
 
 // WithMaxDelay sets the maximum delay between retries
-func WithMaxDelay[T any](maxDelay time.Duration) Option[T] {
+func WithMaxDelay[T Hashable](maxDelay time.Duration) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.maxDelay = maxDelay
 	}
 }
 
 // WithMaxJitter sets the maximum random jitter between retries
-func WithMaxJitter[T any](maxJitter time.Duration) Option[T] {
+func WithMaxJitter[T Hashable](maxJitter time.Duration) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.maxJitter = maxJitter
 	}
 }
 
 // WithDelayType sets the delay type function
-func WithDelayType[T any](delayType DelayTypeFunc[T]) Option[T] {
+func WithDelayType[T Hashable](delayType DelayTypeFunc[T]) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.delayType = delayType
 	}
 }
 
 // WithOnRetry sets the OnRetry callback function
-func WithOnRetry[T any](onRetry OnRetryFunc[T]) Option[T] {
+func WithOnRetry[T Hashable](onRetry OnRetryFunc[T]) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.onRetry = onRetry
 	}
 }
 
 // WithRetryIf sets the RetryIf function
-func WithRetryIf[T any](retryIf RetryIfFunc) Option[T] {
+func WithRetryIf[T Hashable](retryIf RetryIfFunc) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.retryIf = retryIf
 	}
 }
 
 // WithContext sets the context for the Pool
-func WithContext[T any](ctx context.Context) Option[T] {
+func WithContext[T Hashable](ctx context.Context) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.context = ctx
 	}
 }
 
 // WithTimer allows setting a custom timer
-func WithTimer[T any](timer Timer) Option[T] {
+func WithTimer[T Hashable](timer Timer) Option[T] {
 	return func(p *Pool[T]) {
 		p.timer = timer
 	}
 }
 
 // WithOnTaskSuccess sets the OnTaskSuccess callback function
-func WithOnTaskSuccess[T any](onTaskSuccess OnTaskSuccessFunc[T]) Option[T] {
+func WithOnTaskSuccess[T Hashable](onTaskSuccess OnTaskSuccessFunc[T]) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.onTaskSuccess = onTaskSuccess
 	}
 }
 
 // WithOnTaskFailure sets the OnTaskFailure callback function
-func WithOnTaskFailure[T any](onTaskFailure OnTaskFailureFunc[T]) Option[T] {
+func WithOnTaskFailure[T Hashable](onTaskFailure OnTaskFailureFunc[T]) Option[T] {
 	return func(p *Pool[T]) {
 		p.config.onTaskFailure = onTaskFailure
 	}
@@ -1190,44 +1252,44 @@ func WithOnTaskFailure[T any](onTaskFailure OnTaskFailureFunc[T]) Option[T] {
 // TaskOption functions for configuring individual tasks
 
 // WithMaxDuration TaskOption to set per-attempt max duration
-func WithMaxDuration[T any](maxDuration time.Duration) TaskOption[T] {
+func WithMaxDuration[T Hashable](maxDuration time.Duration) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.maxDuration = maxDuration
 	}
 }
 
 // WithTimeLimit sets a time limit for a task, considering all retries
-func WithTimeLimit[T any](limit time.Duration) TaskOption[T] {
+func WithTimeLimit[T Hashable](limit time.Duration) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.timeLimit = limit
 	}
 }
 
 // WithImmediateRetry enables immediate retry for a task
-func WithImmediateRetry[T any]() TaskOption[T] {
+func WithImmediateRetry[T Hashable]() TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.immediateRetry = true
 	}
 }
 
 // WithPanicOnTimeout enables panic on timeout for a task
-func WithPanicOnTimeout[T any]() TaskOption[T] {
+func WithPanicOnTimeout[T Hashable]() TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.panicOnTimeout = true
 	}
 }
 
 // DelayTypeFunc signature
-type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duration
+type DelayTypeFunc[T Hashable] func(n int, err error, config *Config[T]) time.Duration
 
 // OnRetryFunc signature
-type OnRetryFunc[T any] func(attempt int, err error, task *TaskWrapper[T])
+type OnRetryFunc[T Hashable] func(attempt int, err error, task *TaskWrapper[T])
 
 // OnTaskSuccessFunc is the type of function called when a task succeeds
-type OnTaskSuccessFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T])
+type OnTaskSuccessFunc[T Hashable] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T])
 
 // OnTaskFailureFunc is the type of function called when a task fails
-type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T], err error)
+type OnTaskFailureFunc[T Hashable] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T], err error)
 
 // RetryIfFunc signature
 type RetryIfFunc func(error) bool
@@ -1238,7 +1300,7 @@ type ContextFunc func() context.Context
 // DelayType functions
 
 // BackOffDelay increases delay exponentially
-func BackOffDelay[T any](n int, _ error, config *Config[T]) time.Duration {
+func BackOffDelay[T Hashable](n int, _ error, config *Config[T]) time.Duration {
 	const max = 62
 
 	if config.maxBackOffN == 0 {
@@ -1256,17 +1318,17 @@ func BackOffDelay[T any](n int, _ error, config *Config[T]) time.Duration {
 }
 
 // FixedDelay keeps the delay constant
-func FixedDelay[T any](_ int, _ error, config *Config[T]) time.Duration {
+func FixedDelay[T Hashable](_ int, _ error, config *Config[T]) time.Duration {
 	return config.delay
 }
 
 // RandomDelay adds random jitter
-func RandomDelay[T any](_ int, _ error, config *Config[T]) time.Duration {
+func RandomDelay[T Hashable](_ int, _ error, config *Config[T]) time.Duration {
 	return time.Duration(rand.Int63n(int64(config.maxJitter)))
 }
 
 // CombineDelay combines multiple DelayType functions
-func CombineDelay[T any](delays ...DelayTypeFunc[T]) DelayTypeFunc[T] {
+func CombineDelay[T Hashable](delays ...DelayTypeFunc[T]) DelayTypeFunc[T] {
 	const maxInt64 = uint64(math.MaxInt64)
 
 	return func(n int, err error, config *Config[T]) time.Duration {
@@ -1384,4 +1446,4 @@ func (e *panicOnTimeoutError) Unwrap() error {
 }
 
 // PanicHandlerFunc is the type of function called when a panic occurs in a task.
-type PanicHandlerFunc[T any] func(task T, v interface{})
+type PanicHandlerFunc[T Hashable] func(task T, v interface{})
