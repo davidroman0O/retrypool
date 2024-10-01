@@ -12,7 +12,7 @@ import (
 
 type RetryWorker struct{}
 
-func (w *RetryWorker) Run(ctx context.Context, data int) error {
+func (w *RetryWorker) Run(ctx context.Context, data TaskInt) error {
 	if rand.Float32() < 0.5 {
 		return fmt.Errorf("simulated error for data: %d", data)
 	}
@@ -20,7 +20,15 @@ func (w *RetryWorker) Run(ctx context.Context, data int) error {
 	return nil
 }
 
-func customDelayType[T any](n int, _ error, config *retrypool.Config[T]) time.Duration {
+type TaskInt struct {
+	Data int
+}
+
+func (t TaskInt) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
+}
+
+func customDelayType[T retrypool.Hashable](n int, _ error, config *retrypool.Config[T]) time.Duration {
 	// Use getters to access the config properties
 	baseDelay := config.Delay()
 	maxDelay := config.MaxDelay()
@@ -45,17 +53,17 @@ func customDelayType[T any](n int, _ error, config *retrypool.Config[T]) time.Du
 
 func main() {
 	ctx := context.Background()
-	workers := []retrypool.Worker[int]{&RetryWorker{}, &RetryWorker{}}
+	workers := []retrypool.Worker[TaskInt]{&RetryWorker{}, &RetryWorker{}}
 	pool := retrypool.New(ctx, workers,
-		retrypool.WithAttempts[int](5),
-		retrypool.WithDelay[int](100*time.Millisecond),
-		retrypool.WithMaxDelay[int](2*time.Second),
-		retrypool.WithMaxJitter[int](50*time.Millisecond),
-		retrypool.WithDelayType[int](customDelayType[int]),
+		retrypool.WithAttempts[TaskInt](5),
+		retrypool.WithDelay[TaskInt](100*time.Millisecond),
+		retrypool.WithMaxDelay[TaskInt](2*time.Second),
+		retrypool.WithMaxJitter[TaskInt](500*time.Millisecond),
+		retrypool.WithDelayType[TaskInt](customDelayType[TaskInt]),
 	)
 
 	for i := 1; i <= 10; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Dispatch(TaskInt{i})
 		if err != nil {
 			log.Printf("Dispatch error: %v", err)
 		}

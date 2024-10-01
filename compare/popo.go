@@ -178,7 +178,7 @@ func New[T Hashable](ctx context.Context, workers []Worker[T], options ...Option
 		workersToRemove: NewSafeMap[int, bool](),
 		taskQueues:      NewSafeMap[int, *taskQueue[T]](),
 		config:          newDefaultConfig[T](),
-		timer:           &defaultTimer{},
+		timer:           &timerImpl{},
 		ctx:             ctx,
 		tasks:           NewSafeMap[interface{}, *TaskWrapper[T]](),
 		taskProcessing:  NewSafeMap[interface{}, int](),
@@ -513,25 +513,21 @@ func (p *Pool[T]) isAllQueuesEmpty() bool {
 
 // getNextTask returns the next task that the worker hasn't tried
 func (p *Pool[T]) getNextTask(workerID int) (int, int, *TaskWrapper[T], bool) {
+	q, _ := p.taskQueues.Get(workerID)
 	var selectedTask *TaskWrapper[T]
-	var selectedWorkerID int
 	var selectedIndex int
 
-	p.taskQueues.Range(func(currentWorkerID int, q *taskQueue[T]) bool {
-		q.tasks.Range(func(idx int, task *TaskWrapper[T]) bool {
-			if tried, _ := task.triedWorkers.Get(currentWorkerID); !tried {
-				selectedTask = task
-				selectedWorkerID = currentWorkerID
-				selectedIndex = idx
-				return false // Stop iteration
-			}
-			return true
-		})
-		return selectedTask == nil // Continue if no task found
+	q.tasks.Range(func(idx int, task *TaskWrapper[T]) bool {
+		if tried, _ := task.triedWorkers.Get(workerID); !tried {
+			selectedTask = task
+			selectedIndex = idx
+			return false // Stop iteration
+		}
+		return true
 	})
 
 	if selectedTask != nil {
-		return selectedWorkerID, selectedIndex, selectedTask, true
+		return workerID, selectedIndex, selectedTask, true
 	}
 
 	return 0, 0, nil, false
@@ -885,9 +881,6 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 	delay := p.calculateDelay(int(task.Retries()), err)
 	task.SetScheduledTime(time.Now().Add(delay))
 
-	// Use the timer for delay
-	<-p.config.timer.After(delay)
-
 	// Reset triedWorkers
 	task.triedWorkers = NewSafeMap[int, bool]()
 
@@ -1049,7 +1042,7 @@ func newDefaultConfig[T Hashable]() Config[T] {
 		delayType:        CombineDelay[T](BackOffDelay[T], RandomDelay[T]),
 		lastErrorOnly:    false,
 		context:          context.Background(),
-		timer:            &defaultTimer{},
+		timer:            &timerImpl{},
 		onTaskSuccess:    nil, // Default is nil; can be set via options
 		onTaskFailure:    nil, // Default is nil; can be set via options
 	}
@@ -1082,9 +1075,9 @@ type Timer interface {
 }
 
 // timerImpl is the default timer
-type defaultTimer struct{}
+type timerImpl struct{}
 
-func (t *defaultTimer) After(d time.Duration) <-chan time.Time {
+func (t *timerImpl) After(d time.Duration) <-chan time.Time {
 	return time.After(d)
 }
 

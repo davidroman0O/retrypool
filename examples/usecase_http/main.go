@@ -64,6 +64,10 @@ type TaskData struct {
 	Payload interface{}
 }
 
+func (t TaskData) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.URL)
+}
+
 func (w *APIWorker) Run(ctx context.Context, data TaskData) error {
 	client := &http.Client{}
 	payload, err := json.Marshal(data.Payload)

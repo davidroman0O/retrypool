@@ -2,15 +2,24 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
 	"github.com/davidroman0O/retrypool"
 )
 
+type TaskInt struct {
+	Data int
+}
+
+func (t TaskInt) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
+}
+
 type MyWorker struct{}
 
-func (w *MyWorker) Run(ctx context.Context, data int) error {
+func (w *MyWorker) Run(ctx context.Context, data TaskInt) error {
 	// Simulate work
 	select {
 	case <-time.After(100 * time.Millisecond):
@@ -25,10 +34,10 @@ func (w *MyWorker) Run(ctx context.Context, data int) error {
 func main() {
 	ctx := context.Background()
 
-	workers := []retrypool.Worker[int]{&MyWorker{}, &MyWorker{}, &MyWorker{}}
-	var pool *retrypool.Pool[int]
+	workers := []retrypool.Worker[TaskInt]{&MyWorker{}, &MyWorker{}, &MyWorker{}}
+	var pool *retrypool.Pool[TaskInt]
 
-	pool = retrypool.New(ctx, workers, retrypool.WithOnTaskSuccess(func(controller retrypool.WorkerController[int], workerID int, worker retrypool.Worker[int], task *retrypool.TaskWrapper[int]) {
+	pool = retrypool.New(ctx, workers, retrypool.WithOnTaskSuccess(func(controller retrypool.WorkerController[TaskInt], workerID int, worker retrypool.Worker[TaskInt], task *retrypool.TaskWrapper[TaskInt]) {
 		log.Printf("Worker %d processed data %d\n", workerID, task.Data())
 		if workerID == 1 {
 			log.Println("Remove worker 1")
@@ -41,7 +50,7 @@ func main() {
 
 	// Dispatch initial tasks
 	for i := 0; i < 10; i++ {
-		pool.Dispatch(i)
+		pool.Dispatch(TaskInt{i})
 	}
 
 	// Pause worker 1
@@ -49,7 +58,7 @@ func main() {
 
 	// Dispatch more tasks
 	for i := 10; i < 20; i++ {
-		pool.Dispatch(i)
+		pool.Dispatch(TaskInt{i})
 	}
 
 	// Wait for a while
@@ -57,7 +66,7 @@ func main() {
 
 	// Dispatch more tasks
 	for i := 20; i < 30; i++ {
-		pool.Dispatch(i)
+		pool.Dispatch(TaskInt{i})
 	}
 
 	// Wait for tasks to complete

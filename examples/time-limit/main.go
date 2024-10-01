@@ -16,6 +16,10 @@ type SimulatedTask struct {
 	Duration time.Duration
 }
 
+func (t SimulatedTask) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.ID)
+}
+
 // SimulatedWorker simulates work by sleeping for the task's duration
 type SimulatedWorker struct{}
 

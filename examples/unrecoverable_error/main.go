@@ -9,9 +9,17 @@ import (
 	"github.com/davidroman0O/retrypool"
 )
 
+type TaskInt struct {
+	Data int
+}
+
+func (t TaskInt) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
+}
+
 type UnrecoverableWorker struct{}
 
-func (w *UnrecoverableWorker) Run(ctx context.Context, data int) error {
+func (w *UnrecoverableWorker) Run(ctx context.Context, data TaskInt) error {
 	if rand.Float32() < 0.3 {
 		return retrypool.Unrecoverable(fmt.Errorf("unrecoverable error for data: %d", data))
 	}
@@ -24,16 +32,16 @@ func (w *UnrecoverableWorker) Run(ctx context.Context, data int) error {
 
 func main() {
 	ctx := context.Background()
-	workers := []retrypool.Worker[int]{&UnrecoverableWorker{}, &UnrecoverableWorker{}}
+	workers := []retrypool.Worker[TaskInt]{&UnrecoverableWorker{}, &UnrecoverableWorker{}}
 	pool := retrypool.New(ctx, workers,
-		retrypool.WithAttempts[int](3),
-		retrypool.WithOnRetry[int](func(attempt int, err error, task *retrypool.TaskWrapper[int]) {
+		retrypool.WithAttempts[TaskInt](3),
+		retrypool.WithOnRetry[TaskInt](func(attempt int, err error, task *retrypool.TaskWrapper[TaskInt]) {
 			log.Printf("Retrying task %v, attempt %d: %v", task, attempt, err)
 		}),
 	)
 
 	for i := 1; i <= 20; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Dispatch(TaskInt{i})
 		if err != nil {
 			log.Printf("Dispatch error: %v", err)
 		}

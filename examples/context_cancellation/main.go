@@ -11,9 +11,9 @@ import (
 
 type SlowWorker struct{}
 
-func (w *SlowWorker) Run(ctx context.Context, data int) error {
+func (w *SlowWorker) Run(ctx context.Context, data TaskInt) error {
 	select {
-	case <-time.After(time.Duration(data) * time.Second):
+	case <-time.After(time.Duration(data.Data) * time.Second):
 		fmt.Printf("Processed: %d\n", data)
 		return nil
 	case <-ctx.Done():
@@ -21,15 +21,23 @@ func (w *SlowWorker) Run(ctx context.Context, data int) error {
 	}
 }
 
+type TaskInt struct {
+	Data int
+}
+
+func (t TaskInt) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
+}
+
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	workers := []retrypool.Worker[int]{&SlowWorker{}, &SlowWorker{}}
+	workers := []retrypool.Worker[TaskInt]{&SlowWorker{}, &SlowWorker{}}
 	pool := retrypool.New(ctx, workers)
 
 	for i := 1; i <= 10; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Dispatch(TaskInt{i})
 		if err != nil {
 			log.Printf("Dispatch error: %v", err)
 		}

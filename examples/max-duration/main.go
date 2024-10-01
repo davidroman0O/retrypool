@@ -17,7 +17,7 @@ type ExampleWorker struct {
 }
 
 // Randomly simulate a task that can either succeed or take too long
-func (w *ExampleWorker) Run(ctx context.Context, data string) error {
+func (w *ExampleWorker) Run(ctx context.Context, data TaskStr) error {
 	log.Printf("Worker %d processing task: %s", w.ID, data)
 
 	// Random task duration between 1 to 4 seconds
@@ -40,6 +40,14 @@ func (w *ExampleWorker) Run(ctx context.Context, data string) error {
 	}
 }
 
+type TaskStr struct {
+	Data string
+}
+
+func (t TaskStr) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano()) // Seed the random generator
 
@@ -47,7 +55,7 @@ func main() {
 	defer cancel()
 
 	// Create workers
-	workers := []retrypool.Worker[string]{
+	workers := []retrypool.Worker[TaskStr]{
 		&ExampleWorker{ID: 1},
 		&ExampleWorker{ID: 2},
 	}
@@ -59,9 +67,9 @@ func main() {
 	for i := 1; i <= 5; i++ {
 		taskData := fmt.Sprintf("Task-%d", i)
 		err := pool.Dispatch(
-			taskData,
-			retrypool.WithMaxDuration[string](2*time.Second), // Max duration per attempt
-			retrypool.WithTimeLimit[string](5*time.Second),   // Overall time limit across retries
+			TaskStr{taskData},
+			retrypool.WithMaxDuration[TaskStr](2*time.Second), // Max duration per attempt
+			retrypool.WithTimeLimit[TaskStr](5*time.Second),   // Overall time limit across retries
 		)
 		if err != nil {
 			log.Fatalf("Failed to dispatch task: %v", err)

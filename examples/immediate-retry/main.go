@@ -16,6 +16,10 @@ type Task struct {
 	ImmediateRetry bool
 }
 
+func (t Task) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.ID)
+}
+
 type DemoWorker struct {
 	ID        int
 	mu        sync.Mutex
@@ -60,11 +64,12 @@ func main() {
 		retrypool.WithOnRetry[Task](func(attempt int, err error, task *retrypool.TaskWrapper[Task]) {
 			workers := task.TriedWorkers()
 			tried := []int{}
-			for k, v := range workers {
+			workers.Range(func(k int, v bool) bool {
 				if v {
 					tried = append(tried, k)
 				}
-			}
+				return true
+			})
 			log.Printf("Retrying task %d (attempt %d - %v): %v", task.Data().ID, attempt, tried, err)
 		}),
 	)

@@ -11,27 +11,35 @@ import (
 
 type FlakyWorker struct{}
 
-func (w *FlakyWorker) Run(ctx context.Context, data int) error {
-	if data%3 == 0 {
+func (w *FlakyWorker) Run(ctx context.Context, data TaskInt) error {
+	if data.Data%3 == 0 {
 		return fmt.Errorf("simulated error for data: %d", data)
 	}
 	fmt.Printf("Processed: %d\n", data)
 	return nil
 }
 
+type TaskInt struct {
+	Data int
+}
+
+func (t TaskInt) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
+}
+
 func main() {
 	ctx := context.Background()
-	workers := []retrypool.Worker[int]{&FlakyWorker{}, &FlakyWorker{}}
+	workers := []retrypool.Worker[TaskInt]{&FlakyWorker{}, &FlakyWorker{}}
 	pool := retrypool.New(ctx, workers,
-		retrypool.WithAttempts[int](3),
-		retrypool.WithDelay[int](time.Second),
-		retrypool.WithOnRetry[int](func(attempt int, err error, task *retrypool.TaskWrapper[int]) {
+		retrypool.WithAttempts[TaskInt](3),
+		retrypool.WithDelay[TaskInt](time.Second),
+		retrypool.WithOnRetry[TaskInt](func(attempt int, err error, task *retrypool.TaskWrapper[TaskInt]) {
 			log.Printf("Retrying task %d, attempt %d: %v", task, attempt, err)
 		}),
 	)
 
 	for i := 1; i <= 10; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Dispatch(TaskInt{i})
 		if err != nil {
 			log.Printf("Dispatch error: %v", err)
 		}

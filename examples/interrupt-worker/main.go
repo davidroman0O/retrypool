@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -14,7 +15,7 @@ type MyWorker struct {
 	ID int
 }
 
-func (w *MyWorker) Run(ctx context.Context, data int) error {
+func (w *MyWorker) Run(ctx context.Context, data TaskInt) error {
 	log.Printf("Worker %d started processing task: %d\n", w.ID, data)
 	// Simulate work
 	select {
@@ -27,6 +28,14 @@ func (w *MyWorker) Run(ctx context.Context, data int) error {
 	}
 }
 
+type TaskInt struct {
+	Data int
+}
+
+func (t TaskInt) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
+}
+
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
@@ -35,25 +44,25 @@ func main() {
 	defer cancel()
 
 	// Create workers
-	workers := []retrypool.Worker[int]{
+	workers := []retrypool.Worker[TaskInt]{
 		&MyWorker{ID: 0},
 		&MyWorker{ID: 1},
 		&MyWorker{ID: 2},
 	}
 
 	// Create the pool
-	pool := retrypool.New[int](ctx, workers)
+	pool := retrypool.New[TaskInt](ctx, workers)
 
 	// Dispatch tasks
 	for i := 1; i <= 10; i++ {
-		pool.Dispatch(i)
+		pool.Dispatch(TaskInt{Data: i})
 	}
 
 	// Give some time for workers to start processing
 	time.Sleep(1 * time.Second)
 
 	// List current tasks
-	pool.RangeTasks(func(data int, workerID int, status retrypool.TaskStatus) bool {
+	pool.RangeTasks(func(data TaskInt, workerID int, status retrypool.TaskStatus) bool {
 		switch status {
 		case retrypool.TaskStatusProcessing:
 			log.Printf("Worker %d is processing task: %d\n", workerID, data)
@@ -74,7 +83,7 @@ func main() {
 	<-time.After(2 * time.Second)
 
 	// List current tasks again
-	pool.RangeTasks(func(data int, workerID int, status retrypool.TaskStatus) bool {
+	pool.RangeTasks(func(data TaskInt, workerID int, status retrypool.TaskStatus) bool {
 		switch status {
 		case retrypool.TaskStatusProcessing:
 			log.Printf("Worker %d is processing task: %d\n", workerID, data)

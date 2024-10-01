@@ -15,23 +15,31 @@ type SimpleWorker struct {
 	ID int
 }
 
-func (w *SimpleWorker) Run(ctx context.Context, data int) error {
+func (w *SimpleWorker) Run(ctx context.Context, data TaskInt) error {
 	log.Printf("Worker %d processing task: %d", w.ID, data)
 	time.Sleep(time.Second) // Simulate work
 	return nil
+}
+
+type TaskInt struct {
+	Data int
+}
+
+func (t TaskInt) Hashcode() interface{} {
+	return fmt.Sprintf("%d", t.Data)
 }
 
 func main() {
 	ctx := context.Background()
 
 	// Create 5 workers
-	workers := make([]retrypool.Worker[int], 5)
+	workers := make([]retrypool.Worker[TaskInt], 5)
 	for i := 0; i < 5; i++ {
 		workers[i] = &SimpleWorker{ID: i}
 	}
 
 	// Create the pool
-	pool := retrypool.New[int](ctx, workers)
+	pool := retrypool.New[TaskInt](ctx, workers)
 
 	// Function to dispatch tasks and print queue sizes
 	dispatchAndPrint := func(useEqualDistribution bool) {
@@ -39,7 +47,7 @@ func main() {
 		for i := 0; i < 20; i++ { // Increased to 20 tasks for better demonstration
 			var err error
 			// if useEqualDistribution {
-			err = pool.Dispatch(i)
+			err = pool.Dispatch(TaskInt{Data: i})
 			// } else {
 			// 	err = pool.Dispatch(i)
 			// }
@@ -50,9 +58,9 @@ func main() {
 
 		// Print queue sizes and tasks
 		workerQueues := make(map[int][]int)
-		pool.RangeTasks(func(data int, workerID int, status retrypool.TaskStatus) bool {
+		pool.RangeTasks(func(data TaskInt, workerID int, status retrypool.TaskStatus) bool {
 			if status == retrypool.TaskStatusQueued {
-				workerQueues[workerID] = append(workerQueues[workerID], data)
+				workerQueues[workerID] = append(workerQueues[workerID], data.Data)
 			}
 			return true
 		})
