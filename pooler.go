@@ -777,7 +777,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		// Check if the error is due to time limit or max duration exceeded
 		if errors.Is(err, context.DeadlineExceeded) || (errors.Is(err, context.Canceled) && duration >= task.maxDuration) {
 			// Exceeded maxDuration for this attempt
-			p.requeueTask(task, fmt.Errorf("task exceeded max duration of %v for attempt", task.maxDuration))
+			p.requeueTask(task, fmt.Errorf("task exceeded max duration of %v for attempt", task.maxDuration), false)
 			return
 		}
 
@@ -798,13 +798,13 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		case DeadTaskActionRetry:
 			if err != context.Canceled && p.config.retryIf(err) && task.retries < p.config.attempts {
 				p.config.onRetry(task.retries, err, task)
-				p.requeueTask(task, err)
+				p.requeueTask(task, err, false)
 			} else {
 				p.addToDeadTasks(task, err)
 			}
 		case DeadTaskActionForceRetry:
 			p.config.onRetry(task.retries, err, task)
-			p.requeueTask(task, err)
+			p.requeueTask(task, err, true)
 		case DeadTaskActionDoNothing:
 			// Do nothing, as requested
 		}
@@ -826,7 +826,7 @@ func IsUnrecoverable(err error) bool {
 }
 
 // requeueTask updated to handle delays and keep triedWorkers intact
-func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
+func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error, forceRetry bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -842,7 +842,7 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error) {
 	task.durations = nil
 
 	// Check if max attempts reached (unless unlimited retries)
-	if p.config.attempts != UnlimitedAttempts && task.retries >= p.config.attempts {
+	if !forceRetry && p.config.attempts != UnlimitedAttempts && task.retries >= p.config.attempts {
 		p.addToDeadTasks(task, err)
 		return
 	}
