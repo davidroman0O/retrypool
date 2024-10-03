@@ -66,7 +66,7 @@ func TestBasicDispatch(t *testing.T) {
 	}
 
 	// Wait for the task to be processed
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 
@@ -92,7 +92,7 @@ func TestRetriesWithFixedDelay(t *testing.T) {
 	}
 
 	// Wait for the task to be processed
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 
@@ -119,7 +119,7 @@ func TestUnlimitedRetriesWithBackoff(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 100*time.Millisecond)
 
@@ -143,7 +143,7 @@ func TestTaskTimeLimit(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 
@@ -224,7 +224,7 @@ func TestUnrecoverableError(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 
@@ -342,7 +342,7 @@ func TestWaitWithCallback(t *testing.T) {
 	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := pool.WaitWithCallback(waitCtx, func(queueSize, processingCount int) bool {
+	err := pool.WaitWithCallback(waitCtx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 100*time.Millisecond)
 	if err != nil {
@@ -372,7 +372,7 @@ func TestMaxDelay(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 	if err != nil && err != context.DeadlineExceeded {
@@ -439,7 +439,7 @@ func TestContextCancellation(t *testing.T) {
 	// Cancel the context after a short delay
 	time.AfterFunc(300*time.Millisecond, cancel)
 
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 	if err != context.Canceled {
@@ -549,7 +549,7 @@ func TestUnrecoverableErrorWithCustomRetryIf(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 
@@ -652,7 +652,7 @@ func TestDynamicWorkerManagement(t *testing.T) {
 
 	t.Log("first dispatch ", pool.QueueSize())
 	// Wait for initial tasks to be processed
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 
@@ -672,7 +672,7 @@ func TestDynamicWorkerManagement(t *testing.T) {
 
 	t.Log("second dispatch ", pool.QueueSize())
 	// Wait for all tasks to be processed
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 
@@ -716,7 +716,7 @@ func TestRemoveWorker(t *testing.T) {
 	}
 
 	// Wait for all tasks to be processed
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 	if err != nil && err != context.DeadlineExceeded {
@@ -810,7 +810,7 @@ func TestInterruptWorker(t *testing.T) {
 	}
 
 	// Wait for the task to be processed
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 	if err != nil && err != context.DeadlineExceeded {
@@ -837,13 +837,14 @@ func TestOnTaskSuccessAndFailureCallbacks(t *testing.T) {
 			successCalled = true
 			mu.Unlock()
 		}),
-		WithOnTaskFailure[int](func(controller WorkerController[int], workerID int, worker Worker[int], task *TaskWrapper[int], err error) {
+		WithOnTaskFailure[int](func(controller WorkerController[int], workerID int, worker Worker[int], task *TaskWrapper[int], err error) DeadTaskAction {
 			mu.Lock()
 			failureCalled = true
 			if f, ok := worker.(*FlakyWorker); ok {
 				counter = f.Inc()
 			}
 			mu.Unlock()
+			return DeadTaskActionRetry
 		}),
 	)
 
@@ -852,7 +853,7 @@ func TestOnTaskSuccessAndFailureCallbacks(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 	if err != nil {
@@ -915,7 +916,7 @@ func TestTriedWorkersHandling(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 	if err != nil {
@@ -948,7 +949,7 @@ func TestDeadTaskErrorsAndDurations(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 	if err != nil {
@@ -1010,7 +1011,7 @@ func TestCombineDelayAndMaxBackOffN(t *testing.T) {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
 
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, 10*time.Millisecond)
 	if err != nil {

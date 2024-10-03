@@ -227,7 +227,7 @@ retrypool.WithTimer[int](&CustomTimer{})
 Wait for the pool to complete tasks while performing periodic checks or updates.
 
 ```go
-err := pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+err := pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int)  bool {
     // Return true to continue waiting, false to stop
     return queueSize > 0 || processingCount > 0
 }, time.Second)

@@ -101,6 +101,7 @@ type Config[T any] struct {
 
 	onTaskSuccess OnTaskSuccessFunc[T] // Callback when a task succeeds
 	onTaskFailure OnTaskFailureFunc[T] // Callback when a task fails
+	onNewDeadTask OnNewDeadTaskFunc[T]
 
 	maxBackOffN uint
 
@@ -136,6 +137,7 @@ type Pool[T any] struct {
 	closed          atomic.Bool
 	ctx             context.Context
 	deadTasks       []DeadTask[T]
+	deadTasksMutex  sync.Mutex
 
 	config Config[T]
 	timer  Timer
@@ -772,26 +774,38 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			p.addToDeadTasks(task, err)
 			return
 		}
+
 		// Check if the error is due to time limit or max duration exceeded
 		if errors.Is(err, context.DeadlineExceeded) || (errors.Is(err, context.Canceled) && duration >= task.maxDuration) {
 			// Exceeded maxDuration for this attempt
 			p.requeueTask(task, fmt.Errorf("task exceeded max duration of %v for attempt", task.maxDuration))
 			return
 		}
-		if err != context.Canceled && p.config.retryIf(err) {
-			p.config.onRetry(task.retries, err, task)
-			if p.config.onTaskFailure != nil {
-				p.mu.Lock()
-				state, exists := p.workers[workerID]
-				p.mu.Unlock()
-				if exists {
-					p.config.onTaskFailure(p, workerID, state.worker, task, err)
-				}
+
+		var action DeadTaskAction = DeadTaskActionRetry // Default action
+
+		if p.config.onTaskFailure != nil {
+			p.mu.Lock()
+			state, exists := p.workers[workerID]
+			p.mu.Unlock()
+			if exists {
+				action = p.config.onTaskFailure(p, workerID, state.worker, task, err)
 			}
-			p.requeueTask(task, err)
-		} else {
-			log.Printf("Task not retried due to RetryIf policy: %v\n", err)
+		}
+
+		switch action {
+		case DeadTaskActionAddToDeadTasks:
 			p.addToDeadTasks(task, err)
+		case DeadTaskActionRetry:
+			if err != context.Canceled && p.config.retryIf(err) {
+				p.config.onRetry(task.retries, err, task)
+				p.requeueTask(task, err)
+			} else {
+				log.Printf("Task not retried due to RetryIf policy: %v\n", err)
+				p.addToDeadTasks(task, err)
+			}
+		case DeadTaskActionDoNothing:
+			// Do nothing, as requested
 		}
 	} else {
 		if p.config.onTaskSuccess != nil {
@@ -901,6 +915,9 @@ func (p *Pool[T]) calculateDelay(n int, err error) time.Duration {
 
 // addToDeadTasks adds task to dead tasks list
 func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
+	p.deadTasksMutex.Lock()
+	defer p.deadTasksMutex.Unlock()
+
 	totalDuration := task.totalDuration
 	for _, duration := range task.durations {
 		totalDuration += duration
@@ -910,12 +927,34 @@ func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	if finalError != nil && (len(errors) == 0 || finalError.Error() != errors[len(errors)-1].Error()) {
 		errors = append(errors, finalError)
 	}
-	p.deadTasks = append(p.deadTasks, DeadTask[T]{
+
+	deadTask := DeadTask[T]{
 		Data:          task.data,
 		Retries:       task.retries,
 		TotalDuration: totalDuration,
 		Errors:        errors,
-	})
+	}
+
+	p.deadTasks = append(p.deadTasks, deadTask)
+
+	if p.config.onNewDeadTask != nil {
+		p.config.onNewDeadTask(&deadTask)
+	}
+}
+
+// PullDeadTask removes and returns a dead task from the pool
+func (p *Pool[T]) PullDeadTask(idx int) (*DeadTask[T], error) {
+	p.deadTasksMutex.Lock()
+	defer p.deadTasksMutex.Unlock()
+
+	if idx < 0 || idx >= len(p.deadTasks) {
+		return nil, fmt.Errorf("invalid dead task index: %d", idx)
+	}
+
+	deadTask := p.deadTasks[idx]
+	p.deadTasks = append(p.deadTasks[:idx], p.deadTasks[idx+1:]...)
+
+	return &deadTask, nil
 }
 
 // Dispatch updated to accept TaskOptions
@@ -1028,14 +1067,21 @@ func (p *Pool[T]) ForceClose() {
 	p.cond.Broadcast()
 }
 
+// Add this method to get the dead task count
+func (p *Pool[T]) DeadTaskCount() int {
+	p.deadTasksMutex.Lock()
+	defer p.deadTasksMutex.Unlock()
+	return len(p.deadTasks)
+}
+
 // WaitWithCallback waits for the pool to complete while calling a callback function
-func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize, processingCount int) bool, interval time.Duration) error {
+func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize, processingCount, deadTaskCount int) bool, interval time.Duration) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			if !callback(p.QueueSize(), p.ProcessingCount()) {
+			if !callback(p.QueueSize(), p.ProcessingCount(), p.DeadTaskCount()) {
 				return nil
 			}
 			time.Sleep(interval)
@@ -1187,6 +1233,13 @@ func WithOnTaskFailure[T any](onTaskFailure OnTaskFailureFunc[T]) Option[T] {
 	}
 }
 
+// WithOnNewDeadTask is a new option for handling new dead tasks
+func WithOnNewDeadTask[T any](onNewDeadTask OnNewDeadTaskFunc[T]) Option[T] {
+	return func(p *Pool[T]) {
+		p.config.onNewDeadTask = onNewDeadTask
+	}
+}
+
 // TaskOption functions for configuring individual tasks
 
 // WithMaxDuration TaskOption to set per-attempt max duration
@@ -1223,11 +1276,23 @@ type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duratio
 // OnRetryFunc signature
 type OnRetryFunc[T any] func(attempt int, err error, task *TaskWrapper[T])
 
+// DeadTaskAction represents the action to take for a failed task
+type DeadTaskAction int
+
+const (
+	DeadTaskActionRetry DeadTaskAction = iota
+	DeadTaskActionAddToDeadTasks
+	DeadTaskActionDoNothing
+)
+
 // OnTaskSuccessFunc is the type of function called when a task succeeds
 type OnTaskSuccessFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T])
 
 // OnTaskFailureFunc is the type of function called when a task fails
-type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T], err error)
+type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T], err error) DeadTaskAction
+
+// OnNewDeadTaskFunc is a new type for handling new dead tasks
+type OnNewDeadTaskFunc[T any] func(task *DeadTask[T])
 
 // RetryIfFunc signature
 type RetryIfFunc func(error) bool

@@ -87,7 +87,7 @@ func main() {
 	}
 
 	// Wait for all tasks to complete
-	err := pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err := pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		log.Printf("Queue size: %d, Processing: %d", queueSize, processingCount)
 		return queueSize > 0 || processingCount > 0
 	}, 500*time.Millisecond)

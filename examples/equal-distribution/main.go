@@ -76,7 +76,7 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+		pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 			return queueSize > 0 || processingCount > 0
 		}, time.Second)
 	}()

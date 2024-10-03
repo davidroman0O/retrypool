@@ -90,7 +90,7 @@ func main() {
 	}
 	log.Printf("Worker 1 restarted\n")
 
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		log.Printf("Queue size: %d, Processing count: %d", queueSize, processingCount)
 		return queueSize > 0 || processingCount > 0
 	}, 1*time.Second)

@@ -39,8 +39,9 @@ func main() {
 		retrypool.WithOnTaskSuccess[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask]) {
 			fmt.Printf("Task %d succeeded\n", task.Data().ID)
 		}),
-		retrypool.WithOnTaskFailure[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask], err error) {
+		retrypool.WithOnTaskFailure[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask], err error) retrypool.DeadTaskAction {
 			fmt.Printf("Task %d failed: %v\n", task.Data().ID, err)
+			return retrypool.DeadTaskActionRetry
 		}),
 	)
 
@@ -59,7 +60,7 @@ func main() {
 	}
 
 	// Wait for all tasks to complete
-	err := pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	err := pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		fmt.Printf("Queue size: %d, Processing: %d\n", queueSize, processingCount)
 		return queueSize > 0 || processingCount > 0
 	}, 500*time.Millisecond)

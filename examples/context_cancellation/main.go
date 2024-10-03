@@ -35,7 +35,7 @@ func main() {
 		}
 	}
 
-	pool.WaitWithCallback(ctx, func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		fmt.Printf("Queue size: %d, Processing: %d\n", queueSize, processingCount)
 		return queueSize > 0 || processingCount > 0
 	}, 500*time.Millisecond)

@@ -61,7 +61,7 @@ func main() {
 	}
 
 	// Wait for tasks to complete
-	pool.WaitWithCallback(context.Background(), func(queueSize, processingCount int) bool {
+	pool.WaitWithCallback(context.Background(), func(queueSize, processingCount, deadTaskCount int) bool {
 		log.Printf("Queue size: %d, Processing count: %d\n", queueSize, processingCount)
 		return queueSize == 0 && processingCount == 0
 	}, 1*time.Second)

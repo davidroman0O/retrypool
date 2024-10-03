@@ -47,7 +47,7 @@ func main() {
 	}()
 
 	// Wait for the task to complete or panic
-	err = pool.WaitWithCallback(context.Background(), func(queueSize, processingCount int) bool {
+	err = pool.WaitWithCallback(context.Background(), func(queueSize, processingCount, deadTaskCount int) bool {
 		fmt.Printf("Queue size: %d, Processing count: %d\n", queueSize, processingCount)
 		return queueSize > 0 || processingCount > 0
 	}, 500*time.Millisecond)
