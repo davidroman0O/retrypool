@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"math/rand"
 	"sync"
@@ -797,13 +796,15 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		case DeadTaskActionAddToDeadTasks:
 			p.addToDeadTasks(task, err)
 		case DeadTaskActionRetry:
-			if err != context.Canceled && p.config.retryIf(err) {
+			if err != context.Canceled && p.config.retryIf(err) && task.retries < p.config.attempts {
 				p.config.onRetry(task.retries, err, task)
 				p.requeueTask(task, err)
 			} else {
-				log.Printf("Task not retried due to RetryIf policy: %v\n", err)
 				p.addToDeadTasks(task, err)
 			}
+		case DeadTaskActionForceRetry:
+			p.config.onRetry(task.retries, err, task)
+			p.requeueTask(task, err)
 		case DeadTaskActionDoNothing:
 			// Do nothing, as requested
 		}
@@ -1283,6 +1284,7 @@ const (
 	DeadTaskActionRetry DeadTaskAction = iota
 	DeadTaskActionAddToDeadTasks
 	DeadTaskActionDoNothing
+	DeadTaskActionForceRetry
 )
 
 // OnTaskSuccessFunc is the type of function called when a task succeeds
