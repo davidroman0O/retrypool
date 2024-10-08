@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -730,11 +731,18 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				if p.config.panicHandler != nil {
-					p.config.panicHandler(task.Data(), r)
-				}
-				// Also set err to indicate that a panic occurred
+				// Capture the stack trace
+				buf := make([]byte, 4096)
+				n := runtime.Stack(buf, false)
+				stackTrace := string(buf[:n])
+
+				// Create a concise error message
 				err = fmt.Errorf("panic occurred in worker %d: %v", workerID, r)
+
+				if p.config.panicHandler != nil {
+					// Call the panic handler with the task, panic error, and stack trace
+					p.config.panicHandler(task.Data(), r, stackTrace)
+				}
 			}
 		}()
 
@@ -1451,4 +1459,4 @@ func (e *panicOnTimeoutError) Unwrap() error {
 }
 
 // PanicHandlerFunc is the type of function called when a panic occurs in a task.
-type PanicHandlerFunc[T any] func(task T, v interface{})
+type PanicHandlerFunc[T any] func(task T, v interface{}, stackTrace string)
