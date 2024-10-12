@@ -108,6 +108,7 @@ type Config[T any] struct {
 	contextFunc ContextFunc
 
 	panicHandler PanicHandlerFunc[T]
+	panicWorker  PanicWorker
 }
 
 // workerState holds all per-worker data
@@ -354,7 +355,19 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		defer p.mu.Unlock()
 
 		if r := recover(); r != nil {
-			fmt.Printf("Worker %d recovered from panic: %v\n", workerID, r)
+			// log.Printf("Worker %d recovered from panic: %v\n", workerID, r)
+			// Capture the stack trace
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+			stackTrace := string(buf[:n])
+
+			// Create a concise error message
+			err := fmt.Errorf("panic occurred in worker %d: %v", workerID, r)
+
+			if p.config.panicWorker != nil {
+				// Call the panic handler with the task, panic error, and stack trace
+				p.config.panicWorker(workerID, r, err, stackTrace)
+			}
 		}
 
 		select {
@@ -1158,6 +1171,13 @@ func WithPanicHandler[T any](handler PanicHandlerFunc[T]) Option[T] {
 	}
 }
 
+// WithPanicWorker sets a custom panic handler for the pool.
+func WithPanicWorker[T any](handler PanicWorker) Option[T] {
+	return func(p *Pool[T]) {
+		p.config.panicWorker = handler
+	}
+}
+
 // WithAttempts sets the maximum number of attempts
 func WithAttempts[T any](attempts int) Option[T] {
 	return func(p *Pool[T]) {
@@ -1460,3 +1480,5 @@ func (e *panicOnTimeoutError) Unwrap() error {
 
 // PanicHandlerFunc is the type of function called when a panic occurs in a task.
 type PanicHandlerFunc[T any] func(task T, v interface{}, stackTrace string)
+
+type PanicWorker func(worker int, recovery any, err error, stackTrace string)
