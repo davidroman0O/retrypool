@@ -208,6 +208,37 @@ func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 	return <-done
 }
 
+func (p *Pool[T]) GetRandomWorkerID() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	workerIDs := make([]int, 0, len(p.workers))
+	for workerID := range p.workers {
+		workerIDs = append(workerIDs, workerID)
+	}
+	if len(workerIDs) == 0 {
+		return -1
+	}
+	return workerIDs[rand.Intn(len(workerIDs))]
+}
+
+func (p *Pool[T]) GetWorkerCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.workers)
+}
+
+func (p *Pool[T]) GetWorkerIDs() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	workerIDs := make([]int, 0, len(p.workers))
+	for workerID := range p.workers {
+		workerIDs = append(workerIDs, workerID)
+	}
+	return workerIDs
+}
+
 // Method to mark worker for removal
 func (p *Pool[T]) RemovalWorker(workerID int) {
 	p.mu.Lock()
