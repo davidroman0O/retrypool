@@ -1513,3 +1513,65 @@ func (e *panicOnTimeoutError) Unwrap() error {
 type PanicHandlerFunc[T any] func(task T, v interface{}, stackTrace string)
 
 type PanicWorker func(worker int, recovery any, err error, stackTrace string)
+
+// RequestResponse manages the lifecycle of a task request and its response
+type RequestResponse[T any, R any] struct {
+	Request     T             // The request data
+	done        chan struct{} // Channel to signal completion
+	response    R             // Stores the successful response
+	err         error         // Stores any error that occurred
+	mu          sync.Mutex    // Protects response and err
+	isCompleted bool          // Indicates if request is completed
+}
+
+// NewRequestResponse creates a new RequestResponse instance
+func NewRequestResponse[T any, R any](request T) *RequestResponse[T, R] {
+	return &RequestResponse[T, R]{
+		Request: request,
+		done:    make(chan struct{}),
+	}
+}
+
+// Complete safely marks the request as complete with a response
+func (rr *RequestResponse[T, R]) Complete(response R) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+
+	if !rr.isCompleted {
+		rr.response = response
+		rr.isCompleted = true
+		close(rr.done)
+	}
+}
+
+// CompleteWithError safely marks the request as complete with an error
+func (rr *RequestResponse[T, R]) CompleteWithError(err error) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+
+	if !rr.isCompleted {
+		rr.err = err
+		rr.isCompleted = true
+		close(rr.done)
+	}
+}
+
+// Wait waits for the request to complete and returns the response and any error
+func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
+	select {
+	case <-rr.done:
+		rr.mu.Lock()
+		defer rr.mu.Unlock()
+		return rr.response, rr.err
+	case <-ctx.Done():
+		rr.mu.Lock()
+		defer rr.mu.Unlock()
+		var zero R
+		if !rr.isCompleted {
+			rr.err = ctx.Err()
+			rr.isCompleted = true
+			close(rr.done)
+		}
+		return zero, rr.err
+	}
+}
