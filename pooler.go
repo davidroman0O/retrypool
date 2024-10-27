@@ -40,6 +40,8 @@ type TaskWrapper[T any] struct {
 	cancel         context.CancelFunc
 	immediateRetry bool
 	panicOnTimeout bool // Field to trigger panic on timeout
+
+	beingProcessed chan struct{} // optional
 }
 
 func (t *TaskWrapper[T]) Data() T {
@@ -745,6 +747,11 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	// Reset attempt-specific duration tracking
 	start := time.Now()
 
+	// Notify the task that it's being processed
+	if task.beingProcessed != nil {
+		close(task.beingProcessed)
+	}
+
 	// If maxDuration is set, enforce it by cancelling the attempt's context when exceeded
 	if task.maxDuration > 0 {
 		go func() {
@@ -1320,6 +1327,13 @@ func WithTimeLimit[T any](limit time.Duration) TaskOption[T] {
 func WithImmediateRetry[T any]() TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.immediateRetry = true
+	}
+}
+
+// WithBeingProcessed sets a channel to indicate that a task is being processed after dispatch
+func WithBeingProcessed[T any](chn chan struct{}) TaskOption[T] {
+	return func(t *TaskWrapper[T]) {
+		t.beingProcessed = chn
 	}
 }
 
