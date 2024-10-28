@@ -172,6 +172,22 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 	return pool
 }
 
+type WorkerItem[T any] struct {
+	Worker Worker[T]
+	ID     int
+}
+
+func (p *Pool[T]) ListWorkers() []WorkerItem[T] {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	workers := make([]WorkerItem[T], 0, len(p.workers))
+	for id, state := range p.workers {
+		workers = append(workers, WorkerItem[T]{Worker: state.worker, ID: id})
+	}
+	return workers
+}
+
 // AddWorker adds a new worker to the pool dynamically
 func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 	done := make(chan int)
