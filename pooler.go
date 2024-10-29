@@ -845,7 +845,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		p.mu.Unlock()
 
 		if IsUnrecoverable(err) {
-			task.beingProcessed.Close()
+			if task.beingProcessed != nil {
+				task.beingProcessed.Close()
+			}
 			p.addToDeadTasks(task, err)
 			return
 		}
@@ -870,14 +872,18 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 
 		switch action {
 		case DeadTaskActionAddToDeadTasks:
-			task.beingProcessed.Close()
+			if task.beingProcessed != nil {
+				task.beingProcessed.Close()
+			}
 			p.addToDeadTasks(task, err)
 		case DeadTaskActionRetry:
 			if err != context.Canceled && p.config.retryIf(err) && task.retries < p.config.attempts {
 				p.config.onRetry(task.retries, err, task)
 				p.requeueTask(task, err, false)
 			} else {
-				task.beingProcessed.Close()
+				if task.beingProcessed != nil {
+					task.beingProcessed.Close()
+				}
 				p.addToDeadTasks(task, err)
 			}
 		case DeadTaskActionForceRetry:
@@ -894,7 +900,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			if exists {
 				p.config.onTaskSuccess(p, workerID, state.worker, task)
 			}
-			task.beingProcessed.Close()
+			if task.beingProcessed != nil {
+				task.beingProcessed.Close()
+			}
 		}
 	}
 }
