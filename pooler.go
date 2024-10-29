@@ -1357,7 +1357,9 @@ func NewProcessedNotification() processedNotification {
 }
 
 func (p processedNotification) Close() {
-	close(p)
+	if p != nil {
+		close(p)
+	}
 }
 
 // WithBeingProcessed sets a channel to indicate that a task is being processed after dispatch
