@@ -41,7 +41,7 @@ type TaskWrapper[T any] struct {
 	immediateRetry bool
 	panicOnTimeout bool // Field to trigger panic on timeout
 
-	beingProcessed chan struct{} // optional
+	beingProcessed processedNotification // optional
 }
 
 func (t *TaskWrapper[T]) Data() T {
@@ -765,7 +765,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 
 	// Notify the task that it's being processed
 	if task.beingProcessed != nil {
-		close(task.beingProcessed)
+		task.beingProcessed <- struct{}{} // we notify that we're being processed, we might be processed again if we fail
 	}
 
 	// If maxDuration is set, enforce it by cancelling the attempt's context when exceeded
@@ -845,6 +845,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		p.mu.Unlock()
 
 		if IsUnrecoverable(err) {
+			task.beingProcessed.Close()
 			p.addToDeadTasks(task, err)
 			return
 		}
@@ -869,12 +870,14 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 
 		switch action {
 		case DeadTaskActionAddToDeadTasks:
+			task.beingProcessed.Close()
 			p.addToDeadTasks(task, err)
 		case DeadTaskActionRetry:
 			if err != context.Canceled && p.config.retryIf(err) && task.retries < p.config.attempts {
 				p.config.onRetry(task.retries, err, task)
 				p.requeueTask(task, err, false)
 			} else {
+				task.beingProcessed.Close()
 				p.addToDeadTasks(task, err)
 			}
 		case DeadTaskActionForceRetry:
@@ -891,6 +894,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			if exists {
 				p.config.onTaskSuccess(p, workerID, state.worker, task)
 			}
+			task.beingProcessed.Close()
 		}
 	}
 }
@@ -1346,8 +1350,18 @@ func WithImmediateRetry[T any]() TaskOption[T] {
 	}
 }
 
+type processedNotification chan struct{}
+
+func NewProcessedNotification() processedNotification {
+	return make(chan struct{}, 1)
+}
+
+func (p processedNotification) Close() {
+	close(p)
+}
+
 // WithBeingProcessed sets a channel to indicate that a task is being processed after dispatch
-func WithBeingProcessed[T any](chn chan struct{}) TaskOption[T] {
+func WithBeingProcessed[T any](chn processedNotification) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.beingProcessed = chn
 	}
