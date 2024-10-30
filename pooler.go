@@ -1618,6 +1618,11 @@ func (rr *RequestResponse[T, R]) CompleteWithError(err error) {
 	}
 }
 
+// Done returns a channel that's closed when the request is complete
+func (rr *RequestResponse[T, R]) Done() <-chan struct{} {
+	return rr.done
+}
+
 // Wait waits for the request to complete and returns the response and any error
 func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
 	select {
