@@ -60,8 +60,8 @@ func main() {
 		taskData := fmt.Sprintf("Task-%d", i)
 		err := pool.Dispatch(
 			taskData,
-			retrypool.WithMaxDuration[string](2*time.Second), // Max duration per attempt
-			retrypool.WithTimeLimit[string](5*time.Second),   // Overall time limit across retries
+			retrypool.WithMaxContextDuration[string](2*time.Second), // Max duration per attempt
+			retrypool.WithTimeLimit[string](5*time.Second),          // Overall time limit across retries
 		)
 		if err != nil {
 			log.Fatalf("Failed to dispatch task: %v", err)

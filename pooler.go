@@ -1337,8 +1337,8 @@ func WithOnNewDeadTask[T any](onNewDeadTask OnNewDeadTaskFunc[T]) Option[T] {
 
 // TaskOption functions for configuring individual tasks
 
-// WithMaxDuration TaskOption to set per-attempt max duration
-func WithMaxDuration[T any](maxDuration time.Duration) TaskOption[T] {
+// WithMaxContextDuration TaskOption to set per-attempt max duration
+func WithMaxContextDuration[T any](maxDuration time.Duration) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.maxDuration = maxDuration
 	}

@@ -32,7 +32,7 @@ func main() {
 	// Dispatch a task with a 2-second timeout and panic on timeout enabled
 	err := pool.Dispatch(
 		"example task",
-		retrypool.WithMaxDuration[interface{}](2*time.Second),
+		retrypool.WithMaxContextDuration[interface{}](2*time.Second),
 		retrypool.WithPanicOnTimeout[interface{}](),
 	)
 	if err != nil {
