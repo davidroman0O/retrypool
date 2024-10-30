@@ -411,11 +411,19 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			stackTrace := string(buf[:n])
 
 			// Create a concise error message
-			err := fmt.Errorf("panic occurred in worker %d: %v", workerID, r)
+			// err := fmt.Errorf("panic occurred in worker %d: %v", workerID, r)
+			if err, ok := r.(error); ok {
+				err := errors.Join(fmt.Errorf("panic occurred in worker %d", workerID), err)
 
-			if p.config.panicWorker != nil {
-				// Call the panic handler with the task, panic error, and stack trace
-				p.config.panicWorker(workerID, r, err, stackTrace)
+				if p.config.panicWorker != nil {
+					// Call the panic handler with the task, panic error, and stack trace
+					p.config.panicWorker(workerID, r, err, stackTrace)
+				}
+			} else {
+				if p.config.panicWorker != nil {
+					// Call the panic handler with the task, panic error, and stack trace
+					p.config.panicWorker(workerID, r, fmt.Errorf("%v", r), stackTrace)
+				}
 			}
 		}
 
