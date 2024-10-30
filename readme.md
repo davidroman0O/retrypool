@@ -6,6 +6,8 @@
 
 **retrypool** is a robust, flexible, and highly configurable Go library that provides a powerful worker pool with customizable retry mechanisms and advanced backoff strategies. It simplifies concurrent task processing by managing retries, delays, error handling, and dynamic worker management, allowing developers to focus on building resilient applications without reinventing the wheel.
 
+> TODO: update the documentation
+
 ## Features
 
 - **Dynamic Worker Management**: Add or remove workers from the pool at runtime.
