@@ -623,14 +623,14 @@ const (
 	TaskStatusProcessing
 )
 
-func (p *Pool[T]) RangeTasks(cb func(data T, workerID int, status TaskStatus) bool) bool {
+func (p *Pool[T]) RangeTasks(cb func(data TaskWrapper[T], workerID int, status TaskStatus) bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	// Iterate over tasks currently being processed
 	for workerID, state := range p.workers {
 		if state.currentTask != nil {
-			if !cb(state.currentTask.data, workerID, TaskStatusProcessing) {
+			if !cb(*state.currentTask, workerID, TaskStatusProcessing) {
 				return false
 			}
 		}
@@ -639,7 +639,7 @@ func (p *Pool[T]) RangeTasks(cb func(data T, workerID int, status TaskStatus) bo
 	// Iterate over tasks in the queues
 	for workerID, queue := range p.taskQueues {
 		for _, task := range queue.tasks {
-			if !cb(task.data, workerID, TaskStatusQueued) {
+			if !cb(*task, workerID, TaskStatusQueued) {
 				return false
 			}
 		}

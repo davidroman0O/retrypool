@@ -50,9 +50,9 @@ func main() {
 
 		// Print queue sizes and tasks
 		workerQueues := make(map[int][]int)
-		pool.RangeTasks(func(data int, workerID int, status retrypool.TaskStatus) bool {
+		pool.RangeTasks(func(data retrypool.TaskWrapper[int], workerID int, status retrypool.TaskStatus) bool {
 			if status == retrypool.TaskStatusQueued {
-				workerQueues[workerID] = append(workerQueues[workerID], data)
+				workerQueues[workerID] = append(workerQueues[workerID], data.Data())
 			}
 			return true
 		})
