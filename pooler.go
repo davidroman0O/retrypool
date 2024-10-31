@@ -145,7 +145,6 @@ type workerState[T any] struct {
 	forcePanicFlag *atomic.Bool
 	currentTask    *TaskWrapper[T] // Field to track the current task
 	interrupted    bool            // New field to track if the worker has been interrupted
-
 }
 
 // Pool struct updated to include Config and support dynamic worker management
@@ -627,8 +626,14 @@ func (p *Pool[T]) RangeTasks(cb func(data TaskWrapper[T], workerID int, status T
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Iterate over tasks currently being processed
+	// Create a copy of the workers map to avoid concurrent modification issues
+	workersCopy := make(map[int]*workerState[T], len(p.workers))
 	for workerID, state := range p.workers {
+		workersCopy[workerID] = state
+	}
+
+	// Iterate over tasks currently being processed
+	for workerID, state := range workersCopy {
 		if state.currentTask != nil {
 			if !cb(*state.currentTask, workerID, TaskStatusProcessing) {
 				return false
@@ -636,8 +641,14 @@ func (p *Pool[T]) RangeTasks(cb func(data TaskWrapper[T], workerID int, status T
 		}
 	}
 
-	// Iterate over tasks in the queues
+	// Create a copy of the taskQueues map to avoid concurrent modification issues
+	taskQueuesCopy := make(map[int]taskQueue[T], len(p.taskQueues))
 	for workerID, queue := range p.taskQueues {
+		taskQueuesCopy[workerID] = queue
+	}
+
+	// Iterate over tasks in the queues
+	for workerID, queue := range taskQueuesCopy {
 		for _, task := range queue.tasks {
 			if !cb(*task, workerID, TaskStatusQueued) {
 				return false
