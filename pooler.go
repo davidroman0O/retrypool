@@ -6,11 +6,22 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/davidroman0O/retrypool/logs"
 )
+
+/// It is not about performance, if it was I would be in C. It's about flexibility, mind models, and the ability to adapt to change.
+
+func init() {
+	if os.Getenv("DEBUG") == "true" {
+		logs.Initialize(logs.LevelDebug)
+	}
+}
 
 // Worker interface for task processing
 type Worker[T any] interface {
@@ -42,6 +53,17 @@ type TaskWrapper[T any] struct {
 	panicOnTimeout bool // Field to trigger panic on timeout
 
 	beingProcessed processedNotification // optional
+
+	queuedAt    []time.Time
+	processedAt []time.Time
+}
+
+func (t *TaskWrapper[T]) QueuedAt() []time.Time {
+	return t.queuedAt
+}
+
+func (t *TaskWrapper[T]) ProcessedAt() []time.Time {
+	return t.processedAt
 }
 
 func (t *TaskWrapper[T]) Data() T {
@@ -375,6 +397,7 @@ func (p *Pool[T]) requeueTasksFromWorker(workerID int) {
 			if task.triedWorkers != nil {
 				delete(task.triedWorkers, workerID)
 			}
+			task.queuedAt = append(task.queuedAt, time.Now())
 			newTasks = append(newTasks, task)
 		}
 		p.taskQueues[retries] = taskQueue[T]{tasks: newTasks}
@@ -776,6 +799,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		task.beingProcessed <- struct{}{} // we notify that we're being processed, we might be processed again if we fail
 	}
 
+	// Collect when the task was processed
+	task.processedAt = append(task.processedAt, time.Now())
+
 	// If maxDuration is set, enforce it by cancelling the attempt's context when exceeded
 	if task.maxDuration > 0 {
 		go func() {
@@ -942,6 +968,8 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error, forceRetry bool) 
 		return
 	}
 
+	task.queuedAt = append(task.queuedAt, time.Now())
+
 	// Calculate delay before next retry
 	delay := p.calculateDelay(task.retries, err)
 	task.scheduledTime = time.Now().Add(delay)
@@ -1072,6 +1100,8 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 		ctx:            taskCtx,
 		cancel:         cancel,
 		immediateRetry: false,
+		processedAt:    []time.Time{},
+		queuedAt:       []time.Time{},
 	}
 	for _, opt := range options {
 		opt(task)
@@ -1097,6 +1127,8 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 			selectedWorkerID = workerID
 		}
 	}
+
+	task.queuedAt = append(task.queuedAt, time.Now())
 
 	q := p.taskQueues[selectedWorkerID]
 	q.tasks = append(q.tasks, task)
