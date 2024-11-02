@@ -5,17 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"os"
 	"runtime"
 	"sync"
 	"time"
 )
-
-func init() {
-	if os.Getenv("DEBUG") == "true" {
-		// Initialize debug logs if necessary
-	}
-}
 
 // Worker interface for task processing
 type Worker[T any] interface {
@@ -104,22 +97,19 @@ type TaskOption[T any] func(*TaskWrapper[T])
 
 // Config struct to hold retry configurations
 type Config[T any] struct {
-	attempts         int
-	attemptsForError map[error]int
-	delay            time.Duration
-	maxDelay         time.Duration
-	maxJitter        time.Duration
-	onRetry          OnRetryFunc[T]
-	retryIf          RetryIfFunc
-	delayType        DelayTypeFunc[T]
-	lastErrorOnly    bool
-	context          context.Context
+	attempts      int
+	delay         time.Duration
+	maxDelay      time.Duration
+	maxJitter     time.Duration
+	onRetry       OnRetryFunc[T]
+	retryIf       RetryIfFunc
+	delayType     DelayTypeFunc[T]
+	lastErrorOnly bool
+	context       context.Context
 
 	onTaskSuccess OnTaskSuccessFunc[T] // Callback when a task succeeds
 	onTaskFailure OnTaskFailureFunc[T] // Callback when a task fails
 	onNewDeadTask OnNewDeadTaskFunc[T]
-
-	maxBackOffN uint
 
 	contextFunc ContextFunc
 
@@ -136,7 +126,7 @@ type workerState[T any] struct {
 	ctx         context.Context
 	forcePanic  bool
 	currentTask *TaskWrapper[T] // Field to track the current task
-	interrupted bool            // New field to track if the worker has been interrupted
+	interrupted bool            // Field to track if the worker has been interrupted
 }
 
 // Pool struct updated to include Config and support dynamic worker management
@@ -340,10 +330,15 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 	const workerForceStopTimeout = 5 * time.Second
 
 	// Wait for the worker to finish, with a timeout
+	timer := time.NewTimer(workerStopTimeout)
+	defer timer.Stop()
 	select {
 	case <-doneChan:
 		// Worker has exited
-	case <-time.After(workerStopTimeout):
+		if !timer.Stop() {
+			<-timer.C
+		}
+	case <-timer.C:
 		// Worker did not exit in time, force panic
 		p.mu.Lock()
 		state.forcePanic = true
@@ -353,10 +348,15 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 		p.cond.Broadcast()
 
 		// Wait again for the worker to exit
+		timer2 := time.NewTimer(workerForceStopTimeout)
+		defer timer2.Stop()
 		select {
 		case <-doneChan:
 			// Worker has exited
-		case <-time.After(workerForceStopTimeout):
+			if !timer2.Stop() {
+				<-timer2.C
+			}
+		case <-timer2.C:
 			// Even after forcing panic, worker did not exit
 			return fmt.Errorf("worker %d did not exit after forced panic", workerID)
 		}
@@ -378,7 +378,7 @@ func (p *Pool[T]) requeueTasksFromWorker(workerID int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Remove the worker's triedTasks from all tasks
+	// Remove the worker's triedWorkers from all tasks
 	for retries, queue := range p.taskQueues {
 		newTasks := make([]*TaskWrapper[T], 0, len(queue.tasks))
 		for _, task := range queue.tasks {
@@ -422,7 +422,7 @@ func (p *Pool[T]) workerLoop(workerID int) {
 
 			// Create a concise error message
 			if err, ok := r.(error); ok {
-				err := errors.Join(fmt.Errorf("panic occurred in worker %d", workerID), err)
+				err := fmt.Errorf("panic occurred in worker %d: %v", workerID, err)
 
 				if p.config.panicWorker != nil {
 					// Call the panic handler with the task, panic error, and stack trace
@@ -483,12 +483,16 @@ func (p *Pool[T]) workerLoop(workerID int) {
 			waitDuration := task.scheduledTime.Sub(now)
 			p.mu.Unlock()
 			timer := time.NewTimer(waitDuration)
-			defer timer.Stop()
 			select {
 			case <-timer.C:
 			case <-p.ctx.Done():
-				timer.Stop()
+				if !timer.Stop() {
+					<-timer.C
+				}
 				return
+			}
+			if !timer.Stop() {
+				<-timer.C
 			}
 			continue
 		}
@@ -735,7 +739,7 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 	}
 
 	if cfg.RemoveWorker {
-		// delete(p.workers, workerID)
+		// Remove the worker
 		err := p.RemoveWorker(workerID)
 		if err != nil {
 			return fmt.Errorf("failed to remove worker %d: %v", workerID, err)
@@ -824,14 +828,6 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		p.mu.Lock()
 		task.errors = append(task.errors, err)
 		p.mu.Unlock()
-
-		if IsUnrecoverable(err) {
-			if task.beingProcessed != nil {
-				task.beingProcessed.Close()
-			}
-			p.addToDeadTasks(task, err)
-			return
-		}
 
 		// Check if the error is due to time limit or max duration exceeded
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -926,17 +922,6 @@ func (p *Pool[T]) createAttemptContext(task *TaskWrapper[T]) (context.Context, c
 	}
 
 	return attemptCtx, attemptCancel
-}
-
-var ErrUnrecoverable = errors.New("unrecoverable error")
-
-func IsUnrecoverable(err error) bool {
-	return errors.Is(err, ErrUnrecoverable)
-}
-
-// Unrecoverable wraps an error as unrecoverable
-func Unrecoverable(err error) error {
-	return fmt.Errorf("%w: %v", ErrUnrecoverable, err)
 }
 
 // requeueTask updated to handle delays and keep triedWorkers intact
@@ -1059,21 +1044,6 @@ func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	}
 }
 
-// PullDeadTask removes and returns a dead task from the pool
-func (p *Pool[T]) PullDeadTask(idx int) (*DeadTask[T], error) {
-	p.deadTasksMutex.Lock()
-	defer p.deadTasksMutex.Unlock()
-
-	if idx < 0 || idx >= len(p.deadTasks) {
-		return nil, fmt.Errorf("invalid dead task index: %d", idx)
-	}
-
-	deadTask := p.deadTasks[idx]
-	p.deadTasks = append(p.deadTasks[:idx], p.deadTasks[idx+1:]...)
-
-	return &deadTask, nil
-}
-
 // Dispatch updated to accept TaskOptions
 func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 	p.mu.Lock()
@@ -1133,6 +1103,21 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 	return nil
 }
 
+// PullDeadTask removes and returns a dead task from the pool
+func (p *Pool[T]) PullDeadTask(idx int) (*DeadTask[T], error) {
+	p.deadTasksMutex.Lock()
+	defer p.deadTasksMutex.Unlock()
+
+	if idx < 0 || idx >= len(p.deadTasks) {
+		return nil, fmt.Errorf("invalid dead task index: %d", idx)
+	}
+
+	deadTask := p.deadTasks[idx]
+	p.deadTasks = append(p.deadTasks[:idx], p.deadTasks[idx+1:]...)
+
+	return &deadTask, nil
+}
+
 // DeadTasks returns a copy of the dead tasks list
 func (p *Pool[T]) DeadTasks() []DeadTask[T] {
 	p.deadTasksMutex.Lock()
@@ -1190,7 +1175,7 @@ func (p *Pool[T]) ForceClose() {
 	p.cond.Broadcast()
 }
 
-// Add this method to get the dead task count
+// DeadTaskCount returns the number of dead tasks
 func (p *Pool[T]) DeadTaskCount() int {
 	p.deadTasksMutex.Lock()
 	defer p.deadTasksMutex.Unlock()
@@ -1215,23 +1200,19 @@ func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize,
 // newDefaultConfig initializes default retry configurations
 func newDefaultConfig[T any]() Config[T] {
 	return Config[T]{
-		attempts:         10,
-		attemptsForError: make(map[error]int),
-		delay:            100 * time.Millisecond,
-		maxJitter:        100 * time.Millisecond,
-		onRetry:          func(n int, err error, task *TaskWrapper[T]) {},
-		retryIf:          IsRecoverable,
-		delayType:        ExponentialBackoffWithJitter[T],
-		lastErrorOnly:    false,
-		context:          context.Background(),
-		onTaskSuccess:    nil, // Default is nil; can be set via options
-		onTaskFailure:    nil, // Default is nil; can be set via options
+		attempts:  10,
+		delay:     100 * time.Millisecond,
+		maxJitter: 100 * time.Millisecond,
+		onRetry:   func(n int, err error, task *TaskWrapper[T]) {},
+		retryIf: func(err error) bool {
+			return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+		},
+		delayType:     ExponentialBackoffWithJitter[T],
+		lastErrorOnly: false,
+		context:       context.Background(),
+		onTaskSuccess: nil, // Default is nil; can be set via options
+		onTaskFailure: nil, // Default is nil; can be set via options
 	}
-}
-
-// IsRecoverable checks if an error is recoverable
-func IsRecoverable(err error) bool {
-	return !errors.Is(err, ErrUnrecoverable)
 }
 
 // Option functions for configuring the Pool
@@ -1505,10 +1486,6 @@ func (c *Config[T]) Attempts() int {
 	return c.attempts
 }
 
-func (c *Config[T]) AttemptsForError() map[error]int {
-	return c.attemptsForError
-}
-
 func (c *Config[T]) Delay() time.Duration {
 	return c.delay
 }
@@ -1539,8 +1516,4 @@ func (c *Config[T]) LastErrorOnly() bool {
 
 func (c *Config[T]) Context() context.Context {
 	return c.context
-}
-
-func (c *Config[T]) MaxBackOffN() uint {
-	return c.maxBackOffN
 }
