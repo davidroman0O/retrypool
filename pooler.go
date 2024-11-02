@@ -150,7 +150,6 @@ type Pool[T any] struct {
 
 // New initializes the Pool with given workers and options
 func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) *Pool[T] {
-
 	pool := &Pool[T]{
 		workers:         make(map[int]*workerState[T]),
 		nextWorkerID:    0,
@@ -395,7 +394,7 @@ func (p *Pool[T]) requeueTasksFromWorker(workerID int) {
 	p.cond.Broadcast()
 }
 
-// workerLoop updated to handle scheduledTime, triedWorkers, and worker interruption
+// workerLoop handles the lifecycle of a worker
 func (p *Pool[T]) workerLoop(workerID int) {
 	defer p.wg.Done()
 
@@ -762,7 +761,7 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 	return nil
 }
 
-// runWorkerWithFailsafe updated to handle OnRetry, RetryIf, and callbacks
+// runWorkerWithFailsafe handles the execution of a task, including panic recovery and retries
 func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	// Create attempt-specific context
 	attemptCtx, attemptCancel := p.createAttemptContext(task)
@@ -1044,7 +1043,7 @@ func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	}
 }
 
-// Dispatch updated to accept TaskOptions
+// Dispatch adds a new task to the pool
 func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
