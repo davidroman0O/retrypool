@@ -2,48 +2,51 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
-	"math/rand"
 
 	"github.com/davidroman0O/retrypool"
 )
 
-type UnrecoverableWorker struct{}
+// MyTask represents the data structure for the task.
+type MyTask struct {
+	ID int
+}
 
-func (w *UnrecoverableWorker) Run(ctx context.Context, data int) error {
-	if rand.Float32() < 0.3 {
-		return retrypool.Unrecoverable(fmt.Errorf("unrecoverable error for data: %d", data))
+// MyWorker implements the retrypool.Worker interface.
+type MyWorker struct {
+	attempts int
+}
+
+// Run simulates task processing that may return an unrecoverable error.
+func (w *MyWorker) Run(ctx context.Context, data MyTask) error {
+	w.attempts++
+	if w.attempts == 3 {
+		fmt.Printf("Worker processing task %d, attempt %d: unrecoverable error.\n", data.ID, w.attempts)
+		return retrypool.Unrecoverable(errors.New("unrecoverable error"))
 	}
-	if rand.Float32() < 0.5 {
-		return fmt.Errorf("recoverable error for data: %d", data)
-	}
-	fmt.Printf("Processed: %d\n", data)
-	return nil
+	fmt.Printf("Worker processing task %d, attempt %d: recoverable error.\n", data.ID, w.attempts)
+	return errors.New("recoverable error")
 }
 
 func main() {
 	ctx := context.Background()
-	workers := []retrypool.Worker[int]{&UnrecoverableWorker{}, &UnrecoverableWorker{}}
-	pool := retrypool.New(ctx, workers,
-		retrypool.WithAttempts[int](3),
-		retrypool.WithOnRetry[int](func(attempt int, err error, task *retrypool.TaskWrapper[int]) {
-			log.Printf("Retrying task %v, attempt %d: %v", task, attempt, err)
-		}),
-	)
 
-	for i := 1; i <= 20; i++ {
-		err := pool.Dispatch(i)
-		if err != nil {
-			log.Printf("Dispatch error: %v", err)
-		}
+	// Initialize the retrypool with one worker.
+	pool := retrypool.New[MyTask](ctx, []retrypool.Worker[MyTask]{&MyWorker{}})
+
+	// Dispatch a task.
+	err := pool.Dispatch(MyTask{ID: 4})
+	if err != nil {
+		fmt.Printf("Failed to dispatch task: %v\n", err)
 	}
 
+	// Wait for all tasks to complete.
 	pool.Close()
-	fmt.Println("All tasks completed")
 
+	// Retrieve dead tasks.
 	deadTasks := pool.DeadTasks()
-	for _, task := range deadTasks {
-		fmt.Printf("Dead task: %+v\n", task)
+	for _, dt := range deadTasks {
+		fmt.Printf("Dead task %d after %d retries: %v\n", dt.Data.ID, dt.Retries, dt.Errors)
 	}
 }

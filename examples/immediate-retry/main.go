@@ -54,9 +54,6 @@ func main() {
 	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[Task](retrypool.UnlimitedAttempts),
 		retrypool.WithDelay[Task](50*time.Millisecond),
-		retrypool.WithDelayType[Task](retrypool.CombineDelay[Task](
-			retrypool.FixedDelay[Task],
-		)),
 		retrypool.WithOnRetry[Task](func(attempt int, err error, task *retrypool.TaskWrapper[Task]) {
 			workers := task.TriedWorkers()
 			tried := []int{}

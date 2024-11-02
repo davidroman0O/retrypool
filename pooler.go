@@ -4,22 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"math/rand"
 	"os"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"github.com/davidroman0O/retrypool/logs"
 )
-
-/// It is not about performance, if it was I would be in C. It's about flexibility, mind models, and the ability to adapt to change.
 
 func init() {
 	if os.Getenv("DEBUG") == "true" {
-		logs.Initialize(logs.LevelDebug)
+		// Initialize debug logs if necessary
 	}
 }
 
@@ -50,7 +44,6 @@ type TaskWrapper[T any] struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	immediateRetry bool
-	panicOnTimeout bool // Field to trigger panic on timeout
 
 	beingProcessed processedNotification // optional
 
@@ -121,7 +114,6 @@ type Config[T any] struct {
 	delayType        DelayTypeFunc[T]
 	lastErrorOnly    bool
 	context          context.Context
-	timer            Timer
 
 	onTaskSuccess OnTaskSuccessFunc[T] // Callback when a task succeeds
 	onTaskFailure OnTaskFailureFunc[T] // Callback when a task fails
@@ -137,14 +129,14 @@ type Config[T any] struct {
 
 // workerState holds all per-worker data
 type workerState[T any] struct {
-	worker         Worker[T]
-	stopChan       chan struct{}
-	doneChan       chan struct{}
-	cancel         context.CancelFunc
-	ctx            context.Context
-	forcePanicFlag *atomic.Bool
-	currentTask    *TaskWrapper[T] // Field to track the current task
-	interrupted    bool            // New field to track if the worker has been interrupted
+	worker      Worker[T]
+	stopChan    chan struct{}
+	doneChan    chan struct{}
+	cancel      context.CancelFunc
+	ctx         context.Context
+	forcePanic  bool
+	currentTask *TaskWrapper[T] // Field to track the current task
+	interrupted bool            // New field to track if the worker has been interrupted
 }
 
 // Pool struct updated to include Config and support dynamic worker management
@@ -158,13 +150,12 @@ type Pool[T any] struct {
 	cond            *sync.Cond
 	wg              sync.WaitGroup
 	stopped         bool
-	closed          atomic.Bool
+	closed          bool
 	ctx             context.Context
 	deadTasks       []DeadTask[T]
 	deadTasksMutex  sync.Mutex
 
 	config Config[T]
-	timer  Timer
 }
 
 // New initializes the Pool with given workers and options
@@ -176,7 +167,6 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 		workersToRemove: make(map[int]bool),
 		taskQueues:      make(map[int]taskQueue[T]),
 		config:          newDefaultConfig[T](),
-		timer:           &timerImpl{},
 		ctx:             ctx,
 	}
 	for _, option := range options {
@@ -229,12 +219,11 @@ func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 		}
 		workerCtx, workerCancel = context.WithCancel(workerCtx)
 		state := &workerState[T]{
-			worker:         worker,
-			stopChan:       make(chan struct{}),
-			doneChan:       make(chan struct{}),
-			cancel:         workerCancel,
-			ctx:            workerCtx,
-			forcePanicFlag: new(atomic.Bool),
+			worker:   worker,
+			stopChan: make(chan struct{}),
+			doneChan: make(chan struct{}),
+			cancel:   workerCancel,
+			ctx:      workerCtx,
 		}
 
 		p.workers[workerID] = state
@@ -310,7 +299,7 @@ func (p *Pool[T]) RestartWorker(workerID int) error {
 	workerCtx, workerCancel := context.WithCancel(p.ctx)
 	state.ctx = workerCtx
 	state.cancel = workerCancel
-	state.forcePanicFlag.Store(false)
+	state.forcePanic = false
 	state.interrupted = false
 
 	// Create a new stopChan and doneChan
@@ -357,7 +346,7 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 	case <-time.After(workerStopTimeout):
 		// Worker did not exit in time, force panic
 		p.mu.Lock()
-		state.forcePanicFlag.Store(true)
+		state.forcePanic = true
 		p.mu.Unlock()
 
 		// Signal the worker again
@@ -426,14 +415,12 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		defer p.mu.Unlock()
 
 		if r := recover(); r != nil {
-			// log.Printf("Worker %d recovered from panic: %v\n", workerID, r)
 			// Capture the stack trace
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
 			stackTrace := string(buf[:n])
 
 			// Create a concise error message
-			// err := fmt.Errorf("panic occurred in worker %d: %v", workerID, r)
 			if err, ok := r.(error); ok {
 				err := errors.Join(fmt.Errorf("panic occurred in worker %d", workerID), err)
 
@@ -495,9 +482,12 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		if now.Before(task.scheduledTime) {
 			waitDuration := task.scheduledTime.Sub(now)
 			p.mu.Unlock()
+			timer := time.NewTimer(waitDuration)
+			defer timer.Stop()
 			select {
-			case <-p.timer.After(waitDuration):
+			case <-timer.C:
 			case <-p.ctx.Done():
+				timer.Stop()
 				return
 			}
 			continue
@@ -554,24 +544,6 @@ func (p *Pool[T]) workerLoop(workerID int) {
 		p.processing--
 		p.cond.Signal()
 		p.mu.Unlock()
-	}
-}
-
-func (p *Pool[T]) enforceTimeLimit(cancelFunc context.CancelFunc, timeLimit, totalDuration time.Duration, ctx context.Context) {
-	if timeLimit <= 0 {
-		return
-	}
-
-	remainingTime := timeLimit - totalDuration
-	if remainingTime <= 0 {
-		cancelFunc()
-		return
-	}
-
-	select {
-	case <-p.timer.After(remainingTime):
-		cancelFunc() // This cancels the attempt's context
-	case <-ctx.Done():
 	}
 }
 
@@ -727,9 +699,9 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 		opt(cfg)
 	}
 
-	// Set the forcePanicFlag if requested
+	// Set the forcePanic if requested
 	if cfg.ForcePanic {
-		state.forcePanicFlag.Store(true)
+		state.forcePanic = true
 	}
 
 	// Cancel the worker's context to trigger the interrupt
@@ -768,10 +740,8 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 		if err != nil {
 			return fmt.Errorf("failed to remove worker %d: %v", workerID, err)
 		}
-		// fmt.Printf("Worker %d has been removed\n", workerID)
 	} else {
 		state.interrupted = true
-		// fmt.Printf("Worker %d has been interrupted\n", workerID)
 
 		if cfg.Restart {
 			p.mu.Unlock()
@@ -791,51 +761,24 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 // runWorkerWithFailsafe updated to handle OnRetry, RetryIf, and callbacks
 func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	// Create attempt-specific context
-	attemptCtx, attemptCancel := context.WithCancel(task.ctx)
-	defer attemptCancel() // Ensure the context is canceled when done
-
-	// Wrap context with panicContext by default
-	attemptCtx = &panicContext{Context: attemptCtx}
-
-	// Wrap context with panicOnTimeoutContext if enabled
-	if task.panicOnTimeout {
-		attemptCtx = &panicOnTimeoutContext{Context: attemptCtx}
+	attemptCtx, attemptCancel := p.createAttemptContext(task)
+	if attemptCtx == nil {
+		err := fmt.Errorf("task exceeded total time limit of %v", task.timeLimit)
+		p.addToDeadTasks(task, err)
+		return
 	}
+	defer attemptCancel()
 
 	// Reset attempt-specific duration tracking
 	start := time.Now()
 
 	// Notify the task that it's being processed
 	if task.beingProcessed != nil {
-		task.beingProcessed <- struct{}{} // we notify that we're being processed, we might be processed again if we fail
+		task.beingProcessed <- struct{}{}
 	}
 
 	// Collect when the task was processed
-	task.processedAt = append(task.processedAt, time.Now())
-
-	// If maxDuration is set, enforce it by cancelling the attempt's context when exceeded
-	if task.maxDuration > 0 {
-		go func() {
-			select {
-			case <-p.timer.After(task.maxDuration):
-				attemptCancel() // Cancel the attempt's context when maxDuration is exceeded
-			case <-attemptCtx.Done():
-			}
-		}()
-	}
-
-	// Enforce time limit for the overall task duration
-	if task.timeLimit > 0 {
-		// Capture the current total duration to avoid data races
-		p.mu.Lock()
-		currentTotalDuration := task.totalDuration
-		p.mu.Unlock()
-
-		// Pass necessary data to avoid accessing shared fields concurrently
-		go func() {
-			p.enforceTimeLimit(attemptCancel, task.timeLimit, currentTotalDuration, task.ctx)
-		}()
-	}
+	task.processedAt = append(task.processedAt, start)
 
 	var err error
 
@@ -869,13 +812,6 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		err = state.worker.Run(attemptCtx, task.data)
 	}()
 
-	// Check for panicOnTimeoutError
-	var timeoutErr *panicOnTimeoutError
-	if errors.As(err, &timeoutErr) {
-		// Handle the timeout error
-		err = fmt.Errorf("worker %d stopped due to timeout: %w", workerID, timeoutErr)
-	}
-
 	duration := time.Since(start)
 
 	// Safely update shared fields
@@ -898,9 +834,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		}
 
 		// Check if the error is due to time limit or max duration exceeded
-		if errors.Is(err, context.DeadlineExceeded) || (errors.Is(err, context.Canceled) && duration >= task.maxDuration) {
-			// Exceeded maxDuration for this attempt
-			p.requeueTask(task, fmt.Errorf("task exceeded max duration of %v for attempt", task.maxDuration), false)
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			// Exceeded maxDuration or time limit
+			p.requeueTask(task, err, false)
 			return
 		}
 
@@ -922,7 +858,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			}
 			p.addToDeadTasks(task, err)
 		case DeadTaskActionRetry:
-			if err != context.Canceled && p.config.retryIf(err) && task.retries < p.config.attempts {
+			if err != context.Canceled && err != context.DeadlineExceeded && p.config.retryIf(err) && task.retries < p.config.attempts {
 				p.config.onRetry(task.retries, err, task)
 				p.requeueTask(task, err, false)
 			} else {
@@ -952,9 +888,55 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	}
 }
 
+// createAttemptContext creates the context for an attempt, considering maxDuration and timeLimit
+func (p *Pool[T]) createAttemptContext(task *TaskWrapper[T]) (context.Context, context.CancelFunc) {
+	var attemptCtx context.Context
+	var attemptCancel context.CancelFunc
+	var remainingTime time.Duration
+	if task.timeLimit > 0 {
+		p.mu.Lock()
+		currentTotalDuration := task.totalDuration
+		p.mu.Unlock()
+		remainingTime = task.timeLimit - currentTotalDuration
+		if remainingTime <= 0 {
+			// Time limit already exceeded
+			return nil, func() {}
+		}
+	} else {
+		remainingTime = 0
+	}
+
+	if task.maxDuration > 0 {
+		if remainingTime > 0 {
+			// Both timeLimit and maxDuration are set, take the minimum
+			var minDuration time.Duration
+			if task.maxDuration < remainingTime {
+				minDuration = task.maxDuration
+			} else {
+				minDuration = remainingTime
+			}
+			attemptCtx, attemptCancel = context.WithTimeout(task.ctx, minDuration)
+		} else {
+			attemptCtx, attemptCancel = context.WithTimeout(task.ctx, task.maxDuration)
+		}
+	} else if remainingTime > 0 {
+		attemptCtx, attemptCancel = context.WithTimeout(task.ctx, remainingTime)
+	} else {
+		attemptCtx, attemptCancel = context.WithCancel(task.ctx)
+	}
+
+	return attemptCtx, attemptCancel
+}
+
+var ErrUnrecoverable = errors.New("unrecoverable error")
+
 func IsUnrecoverable(err error) bool {
-	var unrecoverableErr unrecoverableError
-	return errors.As(err, &unrecoverableErr)
+	return errors.Is(err, ErrUnrecoverable)
+}
+
+// Unrecoverable wraps an error as unrecoverable
+func Unrecoverable(err error) error {
+	return fmt.Errorf("%w: %v", ErrUnrecoverable, err)
 }
 
 // requeueTask updated to handle delays and keep triedWorkers intact
@@ -1153,8 +1135,8 @@ func (p *Pool[T]) Dispatch(data T, options ...TaskOption[T]) error {
 
 // DeadTasks returns a copy of the dead tasks list
 func (p *Pool[T]) DeadTasks() []DeadTask[T] {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.deadTasksMutex.Lock()
+	defer p.deadTasksMutex.Unlock()
 	return append([]DeadTask[T](nil), p.deadTasks...)
 }
 
@@ -1178,11 +1160,12 @@ func (p *Pool[T]) ProcessingCount() int {
 
 // Close stops the pool and waits for all tasks to complete
 func (p *Pool[T]) Close() {
-	if p.closed.Load() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
 		return
 	}
-	p.closed.Store(true)
-	p.mu.Lock()
+	p.closed = true
 	p.stopped = true
 	p.mu.Unlock()
 	p.cond.Broadcast()
@@ -1191,11 +1174,12 @@ func (p *Pool[T]) Close() {
 
 // ForceClose stops the pool without waiting for tasks to complete
 func (p *Pool[T]) ForceClose() {
-	if p.closed.Load() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
 		return
 	}
-	p.closed.Store(true)
-	p.mu.Lock()
+	p.closed = true
 	p.stopped = true
 	for k := range p.taskQueues {
 		q := p.taskQueues[k]
@@ -1237,10 +1221,9 @@ func newDefaultConfig[T any]() Config[T] {
 		maxJitter:        100 * time.Millisecond,
 		onRetry:          func(n int, err error, task *TaskWrapper[T]) {},
 		retryIf:          IsRecoverable,
-		delayType:        CombineDelay[T](BackOffDelay[T], RandomDelay[T]),
+		delayType:        ExponentialBackoffWithJitter[T],
 		lastErrorOnly:    false,
 		context:          context.Background(),
-		timer:            &timerImpl{},
 		onTaskSuccess:    nil, // Default is nil; can be set via options
 		onTaskFailure:    nil, // Default is nil; can be set via options
 	}
@@ -1248,35 +1231,7 @@ func newDefaultConfig[T any]() Config[T] {
 
 // IsRecoverable checks if an error is recoverable
 func IsRecoverable(err error) bool {
-	return !errors.Is(err, unrecoverableError{})
-}
-
-// Unrecoverable wraps an error as unrecoverable
-func Unrecoverable(err error) error {
-	return unrecoverableError{err}
-}
-
-// unrecoverableError type
-type unrecoverableError struct {
-	error
-}
-
-// Is method for unrecoverableError
-func (unrecoverableError) Is(err error) bool {
-	_, isUnrecoverable := err.(unrecoverableError)
-	return isUnrecoverable
-}
-
-// Timer interface for custom timers
-type Timer interface {
-	After(time.Duration) <-chan time.Time
-}
-
-// timerImpl is the default timer
-type timerImpl struct{}
-
-func (t *timerImpl) After(d time.Duration) <-chan time.Time {
-	return time.After(d)
+	return !errors.Is(err, ErrUnrecoverable)
 }
 
 // Option functions for configuring the Pool
@@ -1358,13 +1313,6 @@ func WithContext[T any](ctx context.Context) Option[T] {
 	}
 }
 
-// WithTimer allows setting a custom timer
-func WithTimer[T any](timer Timer) Option[T] {
-	return func(p *Pool[T]) {
-		p.timer = timer
-	}
-}
-
 // WithOnTaskSuccess sets the OnTaskSuccess callback function
 func WithOnTaskSuccess[T any](onTaskSuccess OnTaskSuccessFunc[T]) Option[T] {
 	return func(p *Pool[T]) {
@@ -1428,13 +1376,6 @@ func WithBeingProcessed[T any](chn processedNotification) TaskOption[T] {
 	}
 }
 
-// WithPanicOnTimeout enables panic on timeout for a task
-func WithPanicOnTimeout[T any]() TaskOption[T] {
-	return func(t *TaskWrapper[T]) {
-		t.panicOnTimeout = true
-	}
-}
-
 // DelayTypeFunc signature
 type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duration
 
@@ -1468,151 +1409,24 @@ type ContextFunc func() context.Context
 
 // DelayType functions
 
-// BackOffDelay increases delay exponentially
-func BackOffDelay[T any](n int, _ error, config *Config[T]) time.Duration {
-	const max = 62
+// ExponentialBackoffWithJitter implements exponential backoff with jitter
+func ExponentialBackoffWithJitter[T any](n int, _ error, config *Config[T]) time.Duration {
+	baseDelay := config.delay
+	maxDelay := config.maxDelay
 
-	if config.maxBackOffN == 0 {
-		if config.delay <= 0 {
-			config.delay = 1
-		}
-		config.maxBackOffN = max - uint(math.Floor(math.Log2(float64(config.delay))))
+	// Calculate exponential backoff
+	delay := baseDelay * (1 << n)
+	if delay > maxDelay {
+		delay = maxDelay
 	}
 
-	if n > int(config.maxBackOffN) {
-		n = int(config.maxBackOffN)
-	}
-
-	return config.delay << n
-}
-
-// FixedDelay keeps the delay constant
-func FixedDelay[T any](_ int, _ error, config *Config[T]) time.Duration {
-	return config.delay
-}
-
-// RandomDelay adds random jitter
-func RandomDelay[T any](_ int, _ error, config *Config[T]) time.Duration {
-	return time.Duration(rand.Int63n(int64(config.maxJitter)))
-}
-
-// CombineDelay combines multiple DelayType functions
-func CombineDelay[T any](delays ...DelayTypeFunc[T]) DelayTypeFunc[T] {
-	const maxInt64 = uint64(math.MaxInt64)
-
-	return func(n int, err error, config *Config[T]) time.Duration {
-		var total uint64
-		for _, delay := range delays {
-			total += uint64(delay(n, err, config))
-			if total > maxInt64 {
-				total = maxInt64
-			}
-		}
-		return time.Duration(total)
-	}
+	// Add jitter
+	jitter := time.Duration(rand.Int63n(int64(config.maxJitter)))
+	return delay + jitter
 }
 
 // Constants
 const UnlimitedAttempts = -1
-
-// Config getters
-func (c *Config[T]) Attempts() int {
-	return c.attempts
-}
-
-func (c *Config[T]) AttemptsForError() map[error]int {
-	return c.attemptsForError
-}
-
-func (c *Config[T]) Delay() time.Duration {
-	return c.delay
-}
-
-func (c *Config[T]) MaxDelay() time.Duration {
-	return c.maxDelay
-}
-
-func (c *Config[T]) MaxJitter() time.Duration {
-	return c.maxJitter
-}
-
-func (c *Config[T]) OnRetry() OnRetryFunc[T] {
-	return c.onRetry
-}
-
-func (c *Config[T]) RetryIf() RetryIfFunc {
-	return c.retryIf
-}
-
-func (c *Config[T]) DelayType() DelayTypeFunc[T] {
-	return c.delayType
-}
-
-func (c *Config[T]) LastErrorOnly() bool {
-	return c.lastErrorOnly
-}
-
-func (c *Config[T]) Context() context.Context {
-	return c.context
-}
-
-func (c *Config[T]) Timer() Timer {
-	return c.timer
-}
-
-func (c *Config[T]) MaxBackOffN() uint {
-	return c.maxBackOffN
-}
-
-// panicContext is a custom context that causes a panic when Err() is called after cancellation.
-type panicContext struct {
-	context.Context
-}
-
-func (p *panicContext) Err() error {
-	if err := p.Context.Err(); err != nil {
-		panic(&panicError{cause: err})
-	}
-	return nil
-}
-
-// panicError is an error type that represents a panic caused by context cancellation.
-type panicError struct {
-	cause error
-}
-
-func (e *panicError) Error() string {
-	return fmt.Sprintf("panic due to context cancellation: %v", e.cause)
-}
-
-func (e *panicError) Unwrap() error {
-	return e.cause
-}
-
-// panicOnTimeoutContext is a custom context that returns a specific error on timeout
-type panicOnTimeoutContext struct {
-	context.Context
-}
-
-func (p *panicOnTimeoutContext) Err() error {
-	if err := p.Context.Err(); err != nil {
-		return &panicOnTimeoutError{cause: err}
-	}
-	return nil
-}
-
-// panicOnTimeoutError indicates that the context was canceled due to a timeout
-type panicOnTimeoutError struct {
-	cause error
-}
-
-func (e *panicOnTimeoutError) Error() string {
-	return fmt.Sprintf("context canceled due to timeout: %v", e.cause)
-}
-
-func (e *panicOnTimeoutError) Unwrap() error {
-	return e.cause
-}
 
 // PanicHandlerFunc is the type of function called when a panic occurs in a task.
 type PanicHandlerFunc[T any] func(task T, v interface{}, stackTrace string)
@@ -1684,4 +1498,49 @@ func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
 		}
 		return zero, rr.err
 	}
+}
+
+// Config getters
+func (c *Config[T]) Attempts() int {
+	return c.attempts
+}
+
+func (c *Config[T]) AttemptsForError() map[error]int {
+	return c.attemptsForError
+}
+
+func (c *Config[T]) Delay() time.Duration {
+	return c.delay
+}
+
+func (c *Config[T]) MaxDelay() time.Duration {
+	return c.maxDelay
+}
+
+func (c *Config[T]) MaxJitter() time.Duration {
+	return c.maxJitter
+}
+
+func (c *Config[T]) OnRetry() OnRetryFunc[T] {
+	return c.onRetry
+}
+
+func (c *Config[T]) RetryIf() RetryIfFunc {
+	return c.retryIf
+}
+
+func (c *Config[T]) DelayType() DelayTypeFunc[T] {
+	return c.delayType
+}
+
+func (c *Config[T]) LastErrorOnly() bool {
+	return c.lastErrorOnly
+}
+
+func (c *Config[T]) Context() context.Context {
+	return c.context
+}
+
+func (c *Config[T]) MaxBackOffN() uint {
+	return c.maxBackOffN
 }
