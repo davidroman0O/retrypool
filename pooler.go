@@ -293,18 +293,20 @@ func (p *Pool[T]) ListWorkers() []WorkerItem[T] {
 // AddWorker adds a new worker to the pool dynamically
 func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	workerID := p.nextWorkerID
 	p.nextWorkerID++
+	p.mu.Unlock()
 
 	var workerCtx context.Context
 	var workerCancel context.CancelFunc
+	p.mu.Lock()
 	if p.config.contextFunc != nil {
 		workerCtx = p.config.contextFunc()
 	} else {
 		workerCtx, workerCancel = context.WithCancel(p.ctx)
 	}
+	p.mu.Unlock()
 	state := &workerState[T]{
 		worker:   worker,
 		stopChan: make(chan struct{}),
@@ -313,12 +315,13 @@ func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 		ctx:      workerCtx,
 	}
 
+	p.mu.Lock()
 	p.workers[workerID] = state
-
 	// Start the worker goroutine using errgroup
 	p.errGroup.Go(func() error {
 		return p.workerLoop(workerID)
 	})
+	p.mu.Unlock()
 
 	logs.Info(context.Background(), "Added new worker", "workerID", workerID)
 
@@ -326,13 +329,13 @@ func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 }
 
 func (p *Pool[T]) GetRandomWorkerID() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	workerIDs := make([]int, 0, len(p.workers))
+	p.mu.Lock()
 	for workerID := range p.workers {
 		workerIDs = append(workerIDs, workerID)
 	}
+	p.mu.Unlock()
 	if len(workerIDs) == 0 {
 		return -1
 	}
@@ -373,12 +376,12 @@ type WorkerController[T any] interface {
 
 func (p *Pool[T]) RestartWorker(workerID int) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	state, exists := p.workers[workerID]
 	if !exists {
+		p.mu.Unlock()
 		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
 	}
+	p.mu.Unlock()
 
 	if !state.interrupted {
 		return fmt.Errorf("%w: worker %d", ErrWorkerNotInterrupted, workerID)
@@ -395,16 +398,17 @@ func (p *Pool[T]) RestartWorker(workerID int) error {
 	state.stopChan = make(chan struct{})
 	state.doneChan = make(chan struct{})
 
+	p.mu.Lock()
 	// Start a new goroutine for the worker
 	p.errGroup.Go(func() error {
 		return p.workerLoop(workerID)
 	})
+	p.mu.Unlock()
 
 	logs.Info(context.Background(), "Worker has been restarted", "workerID", workerID)
 	return nil
 }
 
-// RemoveWorker removes a worker from the pool
 // RemoveWorker removes a worker from the pool
 func (p *Pool[T]) RemoveWorker(workerID int) error {
 	p.mu.Lock()
@@ -759,13 +763,13 @@ func WithForcePanic() WorkerInterruptOption {
 // InterruptWorker cancels a worker's current task and optionally removes the worker.
 // It can also force the worker to panic.
 func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
+	p.mu.Lock()
 	state, exists := p.workers[workerID]
 	if !exists {
 		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
 	}
+	p.mu.Unlock()
 
 	// Apply options
 	cfg := &WorkerInterruptConfig{
@@ -783,20 +787,21 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 
 	// Set the forcePanic if requested
 	if cfg.ForcePanic {
+		p.mu.Lock()
 		state.forcePanic = true
+		p.mu.Unlock()
 	}
 
 	// Cancel the worker's context to trigger the interrupt
 	state.cancel()
 
+	p.mu.Lock()
 	// Cancel the current task's context if it's running
 	task := state.currentTask
 	if task != nil {
 		task.cancel()
 	}
-
-	// Close the stopChan to signal the worker to stop
-	close(state.stopChan)
+	p.mu.Unlock()
 
 	// Handle task options
 	if task != nil {
@@ -810,10 +815,13 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 			task.cancel = cancel
 			task.triedWorkers = make(map[int]bool)
 			task.scheduledTime = time.Now()
+
+			p.mu.Lock()
 			// Add the task back to the taskQueues for the current retry count
 			q := p.taskQueues[task.retries]
 			q.tasks = append(q.tasks, task)
 			p.taskQueues[task.retries] = q
+			p.mu.Unlock()
 
 			logs.Debug(context.Background(), "Task reassigned due to interrupt", "workerID", workerID, "taskData", task.data)
 		}
@@ -827,12 +835,13 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 			return fmt.Errorf("failed to remove worker %d: %w", workerID, err)
 		}
 	} else {
+
+		p.mu.Lock()
 		state.interrupted = true
+		p.mu.Unlock()
 
 		if cfg.Restart {
-			p.mu.Unlock()
 			err := p.RestartWorker(workerID)
-			p.mu.Lock()
 			if err != nil {
 				return fmt.Errorf("failed to restart worker %d: %w", workerID, err)
 			}

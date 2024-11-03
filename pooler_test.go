@@ -3,9 +3,12 @@ package retrypool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/davidroman0O/retrypool/logs"
 )
 
 // Define an IncrementWorker that increments a counter
@@ -141,9 +144,14 @@ type RecordingWorker struct {
 }
 
 func (w *RecordingWorker) Run(ctx context.Context, data int) error {
-	w.mu.Lock()
-	w.tasks = append(w.tasks, data)
-	w.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(100 * time.Millisecond):
+		w.mu.Lock()
+		w.tasks = append(w.tasks, data)
+		w.mu.Unlock()
+	}
 	return nil
 }
 
@@ -161,7 +169,7 @@ func TestAddWorkerDynamically(t *testing.T) {
 
 	// Dispatch tasks
 	for i := 0; i < 10; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Submit(i)
 		if err != nil {
 			t.Fatalf("Failed to dispatch task %d: %v", i, err)
 		}
@@ -186,7 +194,11 @@ func TestAddWorkerDynamically(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	if err := pool.Shutdown(); err != nil {
+		if err != context.Canceled {
+			t.Fatalf("Failed to close pool: %v", err)
+		}
+	}
 
 	// Check newWorker processed tasks
 	newWorker.mu.Lock()
@@ -207,11 +219,11 @@ func TestRemoveWorkerDuringProcessing(t *testing.T) {
 	worker1 := &IncrementWorker{}
 	worker2 := &IncrementWorker{}
 
-	pool := New(ctx, []Worker[int]{worker1, worker2})
+	pool := New(ctx, []Worker[int]{worker1, worker2}, WithLogLevel[int](logs.LevelDebug))
 
 	// Dispatch tasks
 	for i := 0; i < 10; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Submit(1)
 		if err != nil {
 			t.Fatalf("Failed to dispatch task %d: %v", i, err)
 		}
@@ -234,7 +246,7 @@ func TestRemoveWorkerDuringProcessing(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	totalCounter := worker1.counter + worker2.counter
 	if totalCounter != 10 {
@@ -259,11 +271,11 @@ func TestInterruptWorkerWithRemoveWorkerOption(t *testing.T) {
 	worker1 := &IncrementWorker{}
 	worker2 := &IncrementWorker{}
 
-	pool := New(ctx, []Worker[int]{worker1, worker2})
+	pool := New(ctx, []Worker[int]{worker1, worker2}, WithLogLevel[int](logs.LevelDebug))
 
 	// Dispatch tasks
 	for i := 0; i < 10; i++ {
-		err := pool.Dispatch(1)
+		err := pool.Submit(1)
 		if err != nil {
 			t.Fatalf("Failed to dispatch task %d: %v", i, err)
 		}
@@ -280,13 +292,14 @@ func TestInterruptWorkerWithRemoveWorkerOption(t *testing.T) {
 
 	// Wait for tasks to be processed
 	err = pool.WaitWithCallback(ctx, func(q, p, d int) bool {
+		fmt.Println(q, p, d)
 		return q > 0 || p > 0
 	}, 10*time.Millisecond)
 	if err != nil && err != context.DeadlineExceeded {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	totalCounter := worker1.counter + worker2.counter
 	if totalCounter != 10 {
@@ -314,7 +327,7 @@ func TestTaskRetriesUpToMaxAttempts(t *testing.T) {
 	)
 
 	// Dispatch task
-	err := pool.Dispatch(1)
+	err := pool.Submit(1)
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -327,7 +340,7 @@ func TestTaskRetriesUpToMaxAttempts(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	if worker.counter != 3 {
 		t.Errorf("Expected 3 attempts, got %d", worker.counter)
@@ -358,7 +371,7 @@ func TestCustomDelayTypeFunction(t *testing.T) {
 	)
 
 	// Dispatch task
-	err := pool.Dispatch(1)
+	err := pool.Submit(1)
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -371,7 +384,7 @@ func TestCustomDelayTypeFunction(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	expectedDelays := []time.Duration{
 		100 * time.Millisecond,
@@ -403,7 +416,7 @@ func TestImmediateRetryOption(t *testing.T) {
 	)
 
 	// Dispatch task with immediate retry
-	err := pool.Dispatch(1, WithImmediateRetry[int]())
+	err := pool.Submit(1, WithImmediateRetry[int]())
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -416,7 +429,7 @@ func TestImmediateRetryOption(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	if worker.failuresLeft != 0 {
 		t.Errorf("Expected worker to have no failures left, got %d", worker.failuresLeft)
@@ -435,7 +448,7 @@ func TestTaskRespectsTimeLimit(t *testing.T) {
 	)
 
 	// Dispatch task with time limit and max duration per attempt
-	err := pool.Dispatch(1,
+	err := pool.Submit(1,
 		WithTimeLimit[int](500*time.Millisecond),
 		WithMaxContextDuration[int](200*time.Millisecond),
 	)
@@ -451,7 +464,7 @@ func TestTaskRespectsTimeLimit(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	deadTasks := pool.DeadTasks()
 	if len(deadTasks) != 1 {
@@ -475,7 +488,7 @@ func TestTaskCancellationOnContextCancel(t *testing.T) {
 	)
 
 	// Dispatch task
-	err := pool.Dispatch(1)
+	err := pool.Submit(1)
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -492,7 +505,7 @@ func TestTaskCancellationOnContextCancel(t *testing.T) {
 		t.Errorf("Expected context.Canceled error, got %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	// Check task is in dead tasks
 	deadTasks := pool.DeadTasks()
@@ -537,7 +550,7 @@ func TestCallbacksAreInvoked(t *testing.T) {
 	)
 
 	// Dispatch task
-	err := pool.Dispatch(1)
+	err := pool.Submit(1)
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -550,7 +563,7 @@ func TestCallbacksAreInvoked(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -582,7 +595,7 @@ func TestPanicRecoveryInWorker(t *testing.T) {
 	)
 
 	// Dispatch task
-	err := pool.Dispatch(1)
+	err := pool.Submit(1)
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -595,7 +608,7 @@ func TestPanicRecoveryInWorker(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	if !panicHandled {
 		t.Errorf("Expected panic handler to be called")
@@ -617,7 +630,7 @@ func TestPoolContinuesAfterPanic(t *testing.T) {
 	)
 
 	// Dispatch tasks
-	err := pool.Dispatch(1)
+	err := pool.Submit(1)
 	if err != nil {
 		t.Fatalf("Failed to dispatch task 1: %v", err)
 	}
@@ -625,7 +638,7 @@ func TestPoolContinuesAfterPanic(t *testing.T) {
 	// Wait for a moment
 	time.Sleep(100 * time.Millisecond)
 
-	err = pool.Dispatch(2)
+	err = pool.Submit(2)
 	if err != nil {
 		t.Fatalf("Failed to dispatch task 2: %v", err)
 	}
@@ -638,7 +651,7 @@ func TestPoolContinuesAfterPanic(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	if !panicHandled {
 		t.Errorf("Expected panic handler to be called")
@@ -674,7 +687,7 @@ func TestOnTaskFailureDeadTaskAction(t *testing.T) {
 	)
 
 	// Dispatch task
-	err := pool.Dispatch(1)
+	err := pool.Submit(1)
 	if err != nil {
 		t.Fatalf("Failed to dispatch task: %v", err)
 	}
@@ -687,7 +700,7 @@ func TestOnTaskFailureDeadTaskAction(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	deadTasks := pool.DeadTasks()
 	if len(deadTasks) != 1 {
@@ -705,7 +718,7 @@ func TestRangeTasksIteratesAllTasks(t *testing.T) {
 
 	// Dispatch multiple tasks
 	for i := 0; i < 5; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Submit(i)
 		if err != nil {
 			t.Fatalf("Failed to dispatch task %d: %v", i, err)
 		}
@@ -733,7 +746,7 @@ func TestRangeTasksIteratesAllTasks(t *testing.T) {
 		t.Errorf("Expected some tasks to be processing")
 	}
 
-	pool.Close()
+	pool.Shutdown()
 }
 
 // TestCombinedFeaturesWithDynamicWorkers tests a complex scenario involving dynamic workers and task retries.
@@ -748,7 +761,7 @@ func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
 
 	// Dispatch tasks
 	for i := 0; i < 5; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Submit(i)
 		if err != nil {
 			t.Fatalf("Failed to dispatch task %d: %v", i, err)
 		}
@@ -774,7 +787,7 @@ func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	// Check that tasks were processed and retried
 	if worker1.count == 0 && worker2.count == 0 {
