@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/davidroman0O/retrypool"
@@ -39,6 +40,11 @@ func main() {
 	if err != nil {
 		fmt.Printf("Failed to dispatch task: %v\n", err)
 	}
+
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
+		log.Printf("Queue size: %d, Processing count: %d", queueSize, processingCount)
+		return queueSize > 0 || processingCount > 0
+	}, 1*time.Second)
 
 	// Wait for all tasks to complete.
 	pool.Shutdown()

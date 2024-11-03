@@ -147,5 +147,5 @@ func main() {
 		fmt.Printf("Dead task: %+v\n", task)
 	}
 
-	fmt.Println("All tasks completed")
+	fmt.Println("All tasks completed", pool.Metrics())
 }

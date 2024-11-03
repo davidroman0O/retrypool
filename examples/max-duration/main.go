@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/davidroman0O/retrypool"
@@ -32,14 +33,26 @@ func main() {
 	ctx := context.Background()
 
 	// Initialize the retrypool with one worker.
-	pool := retrypool.New[MyTask](ctx, []retrypool.Worker[MyTask]{&MyWorker{}})
+	pool := retrypool.New[MyTask](ctx, []retrypool.Worker[MyTask]{&MyWorker{}}, retrypool.WithAttempts[MyTask](3))
 
 	// Dispatch a task with a max duration of 1 second per attempt.
-	err := pool.Submit(MyTask{ID: 2}, retrypool.WithMaxContextDuration[MyTask](1*time.Second))
+	err := pool.Submit(
+		MyTask{ID: 2},
+		retrypool.WithMaxContextDuration[MyTask](1*time.Second), // doesn't works
+		// retrypool.WithMaxContextDuration[MyTask](4*time.Second), // works
+	)
 	if err != nil {
 		fmt.Printf("Failed to dispatch task: %v\n", err)
 	}
 
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
+		log.Printf("Queue size: %d, Processing count: %d", queueSize, processingCount)
+		return queueSize > 0 || processingCount > 0
+	}, 1*time.Second)
+
 	// Wait for all tasks to complete.
 	pool.Shutdown()
+
+	fmt.Println("Dead tasks", pool.DeadTasks())
+
 }
