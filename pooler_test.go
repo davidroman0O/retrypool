@@ -89,6 +89,12 @@ type SlowWorker struct {
 	started    chan struct{}
 }
 
+func (w *SlowWorker) IsProcessing() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.processing
+}
+
 func (w *SlowWorker) Run(ctx context.Context, data int) error {
 	fmt.Println("called", data)
 	w.mu.Lock()
@@ -824,4 +830,241 @@ func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
 	if worker1.counter == 0 && worker2.counter == 0 {
 		t.Errorf("Expected tasks to be processed by workers")
 	}
+}
+
+// TestTaskQueueDistribution verifies that tasks are distributed evenly across workers
+func TestTaskQueueDistribution(t *testing.T) {
+	ctx := context.Background()
+	numWorkers := 3
+	numTasks := 30
+
+	// Create workers that track how many tasks they process
+	workers := make([]Worker[int], numWorkers)
+	counters := make([]*CountingWorker, numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		worker := &CountingWorker{}
+		workers[i] = worker
+		counters[i] = worker
+	}
+
+	pool := New(ctx, workers)
+
+	// Submit tasks
+	for i := 0; i < numTasks; i++ {
+		err := pool.Submit(i)
+		if err != nil {
+			t.Fatalf("Failed to submit task %d: %v", i, err)
+		}
+	}
+
+	// Wait for tasks to complete
+	err := pool.WaitWithCallback(ctx, func(q, p, d int) bool {
+		return q > 0 || p > 0
+	}, 10*time.Millisecond)
+	if err != nil && err != context.DeadlineExceeded {
+		t.Fatalf("WaitWithCallback failed: %v", err)
+	}
+
+	pool.Shutdown()
+
+	// Calculate distribution metrics
+	total := 0
+	minCount := numTasks
+	maxCount := 0
+
+	for _, counter := range counters {
+		count := counter.GetCount()
+		total += count
+		if count < minCount {
+			minCount = count
+		}
+		if count > maxCount {
+			maxCount = count
+		}
+	}
+
+	// Check that all tasks were processed
+	if total != numTasks {
+		t.Errorf("Expected %d total tasks processed, got %d", numTasks, total)
+	}
+
+	// Check distribution (allow for some variance)
+	expectedPerWorker := numTasks / numWorkers
+	maxVariance := expectedPerWorker / 2
+
+	if maxCount-minCount > maxVariance {
+		t.Errorf("Task distribution too uneven. Min: %d, Max: %d, Expected: %d ±%d",
+			minCount, maxCount, expectedPerWorker, maxVariance)
+	}
+}
+
+// TestConcurrentSubmission tests that concurrent task submission works correctly
+func TestConcurrentSubmission(t *testing.T) {
+	ctx := context.Background()
+	worker := &CountingWorker{}
+	pool := New(ctx, []Worker[int]{worker})
+
+	numTasks := 100
+	var wg sync.WaitGroup
+	wg.Add(numTasks)
+
+	// Submit tasks concurrently
+	for i := 0; i < numTasks; i++ {
+		go func(taskID int) {
+			defer wg.Done()
+			err := pool.Submit(taskID)
+			if err != nil {
+				t.Errorf("Failed to submit task %d: %v", taskID, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Wait for processing to complete
+	err := pool.WaitWithCallback(ctx, func(q, p, d int) bool {
+		return q > 0 || p > 0
+	}, 10*time.Millisecond)
+	if err != nil && err != context.DeadlineExceeded {
+		t.Fatalf("WaitWithCallback failed: %v", err)
+	}
+
+	pool.Shutdown()
+
+	if worker.GetCount() != numTasks {
+		t.Errorf("Expected %d tasks processed, got %d", numTasks, worker.GetCount())
+	}
+}
+
+// TestMaxDurationPerAttempt verifies that tasks respect their max duration per attempt
+func TestMaxDurationPerAttempt(t *testing.T) {
+	ctx := context.Background()
+	maxDuration := 100 * time.Millisecond
+
+	worker := &SlowWorker{}
+	pool := New(ctx, []Worker[int]{worker},
+		WithLogLevel[int](logs.LevelDebug),
+		WithAttempts[int](1), // Only try once
+		WithRetryIf[int](func(err error) bool {
+			// Don't retry on timeout
+			return err != nil && !errors.Is(err, context.DeadlineExceeded)
+		}),
+	)
+
+	// Submit task with max duration
+	err := pool.Submit(1, WithMaxContextDuration[int](maxDuration))
+	if err != nil {
+		t.Fatalf("Failed to submit task: %v", err)
+	}
+
+	// Wait sufficiently long for the task to timeout
+	time.Sleep(maxDuration + 150*time.Millisecond)
+
+	// Check if the task ended up in dead tasks due to timeout
+	deadTasks := pool.DeadTasks()
+	if len(deadTasks) == 0 {
+		t.Error("Expected task to be in dead tasks due to timeout")
+	}
+
+	if len(deadTasks) > 0 {
+		if !errors.Is(deadTasks[0].Errors[0], context.DeadlineExceeded) {
+			t.Errorf("Expected deadline exceeded error, got: %v", deadTasks[0].Errors[0])
+		}
+	}
+
+	fmt.Println(deadTasks)
+
+	pool.Shutdown()
+}
+
+// TestMetricsTracking verifies that pool metrics are tracked correctly
+func TestMetricsTracking(t *testing.T) {
+	ctx := context.Background()
+	worker := &FlakyWorker{failuresLeft: 2}
+
+	pool := New(ctx, []Worker[int]{worker},
+		WithAttempts[int](3),
+		WithRetryIf[int](func(err error) bool { return true }),
+	)
+
+	// Submit a task that will fail twice then succeed
+	err := pool.Submit(1)
+	if err != nil {
+		t.Fatalf("Failed to submit task: %v", err)
+	}
+
+	// Wait for processing to complete
+	err = pool.WaitWithCallback(ctx, func(q, p, d int) bool {
+		return q > 0 || p > 0
+	}, 10*time.Millisecond)
+	if err != nil && err != context.DeadlineExceeded {
+		t.Fatalf("WaitWithCallback failed: %v", err)
+	}
+
+	pool.Shutdown()
+
+	metrics := pool.Metrics()
+
+	expectedMetrics := Metrics{
+		TasksSubmitted: 1,
+		TasksProcessed: 3, // Initial attempt + 2 retries
+		TasksSucceeded: 1,
+		TasksFailed:    2,
+		DeadTasks:      0,
+	}
+
+	if metrics != expectedMetrics {
+		t.Errorf("Metrics mismatch.\nExpected: %+v\nGot: %+v", expectedMetrics, metrics)
+	}
+}
+
+// TestTaskTimingMetrics verifies that task timing information is tracked correctly
+func TestTaskTimingMetrics(t *testing.T) {
+	ctx := context.Background()
+	worker := &SlowIncrementWorker{}
+
+	pool := New(ctx, []Worker[int]{worker})
+
+	// Submit a task
+	err := pool.Submit(1)
+	if err != nil {
+		t.Fatalf("Failed to submit task: %v", err)
+	}
+
+	var taskWrapper *TaskWrapper[int]
+
+	// Wait briefly to let the task get queued and start processing
+	time.Sleep(50 * time.Millisecond)
+
+	// Get the task and check its timing info
+	found := false
+	pool.RangeTasks(func(data TaskWrapper[int], workerID int, status TaskStatus) bool {
+		taskWrapper = &data
+		found = true
+		return false
+	})
+
+	if !found {
+		t.Fatal("Task not found in pool")
+	}
+
+	if len(taskWrapper.QueuedAt()) == 0 {
+		t.Error("QueuedAt timestamps not recorded")
+	}
+
+	if len(taskWrapper.ProcessedAt()) == 0 {
+		t.Error("ProcessedAt timestamps not recorded")
+	}
+
+	// Verify timestamps are in chronological order
+	queuedTime := taskWrapper.QueuedAt()[0]
+	if len(taskWrapper.ProcessedAt()) > 0 {
+		processedTime := taskWrapper.ProcessedAt()[0]
+		if !queuedTime.Before(processedTime) {
+			t.Error("Task processed time is before queued time")
+		}
+	}
+
+	pool.Shutdown()
 }
