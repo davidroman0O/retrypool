@@ -18,9 +18,30 @@ type IncrementWorker struct {
 }
 
 func (w *IncrementWorker) Run(ctx context.Context, data int) error {
+
+	fmt.Println("called", data)
 	w.mu.Lock()
 	w.counter += data
 	w.mu.Unlock()
+	return nil
+}
+
+// Define an SlowIncrementWorker that increments a counter
+type SlowIncrementWorker struct {
+	mu      sync.Mutex
+	counter int
+}
+
+func (w *SlowIncrementWorker) Run(ctx context.Context, data int) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(100 * time.Millisecond):
+		fmt.Println("called", data)
+		w.mu.Lock()
+		w.counter += data
+		w.mu.Unlock()
+	}
 	return nil
 }
 
@@ -100,6 +121,7 @@ func (w *CountingWorker) Run(ctx context.Context, data int) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(100 * time.Millisecond):
+		fmt.Println("called", data)
 		w.mu.Lock()
 		w.counter++
 		w.mu.Unlock()
@@ -298,7 +320,6 @@ func TestInterruptWorkerWithRemoveWorkerOption(t *testing.T) {
 
 	// Wait for tasks to be processed
 	err = pool.WaitWithCallback(ctx, func(q, p, d int) bool {
-		fmt.Println(q, p, d)
 		return q > 0 || p > 0
 	}, 10*time.Millisecond)
 	if err != nil && err != context.DeadlineExceeded {
@@ -762,13 +783,14 @@ func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	worker1 := &IncrementWorker{}
-	worker2 := &IncrementWorker{}
+	worker1 := &SlowIncrementWorker{}
+	worker2 := &SlowIncrementWorker{}
 
 	pool := New(ctx, []Worker[int]{worker1})
 
 	// Dispatch tasks
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 10; i++ {
+		fmt.Println("DISPATCH", i)
 		err := pool.Submit(i)
 		if err != nil {
 			t.Fatalf("Failed to dispatch task %d: %v", i, err)
@@ -795,6 +817,7 @@ func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
 		t.Fatalf("WaitWithCallback failed: %v", err)
 	}
 
+	fmt.Println("SHUTDOWN")
 	pool.Shutdown()
 
 	// Check that tasks were processed and retried

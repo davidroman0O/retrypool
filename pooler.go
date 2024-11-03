@@ -251,7 +251,7 @@ func (p *Pool[T]) Shutdown() error {
 
 	// Wait for all workers to finish
 	err := p.errGroup.Wait()
-	if err != nil && err != context.Canceled {
+	if err != nil && err != context.Canceled && err != context.DeadlineExceeded {
 		logs.Error(context.Background(), "Error while waiting for workers to finish", "error", err)
 	}
 
@@ -482,8 +482,6 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 
 	defer func() {
 		p.mu.Lock()
-		defer p.mu.Unlock()
-
 		if state.removed {
 			// Remove worker from the pool when it exits
 			delete(p.workers, workerID)
@@ -491,6 +489,7 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 		} else {
 			logs.Debug(context.Background(), "Worker loop exited but not removed", "workerID", workerID)
 		}
+		p.mu.Unlock()
 	}()
 
 	if !exists {
@@ -506,10 +505,13 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 		default:
 		}
 
+		logs.Debug(context.Background(), "Worker is waiting for tasks", "workerID", workerID)
+
 		p.mu.Lock()
 		now := time.Now()
 		retries, idx, task, ok := p.getNextTask(workerID)
 		if !ok {
+			logs.Debug(context.Background(), "Worker hasn't found any tasks", "workerID", workerID)
 			// No immediate tasks; find the next scheduled task time
 			nextScheduledTime := time.Time{}
 			hasTask := false
@@ -534,7 +536,7 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 
 			if !hasTask {
 				// No tasks at all; wait for new tasks
-				logs.Debug(context.Background(), "Worker is waiting for tasks", "workerID", workerID)
+				logs.Debug(context.Background(), "Worker is waiting for tasks, waiting", "workerID", workerID)
 				p.cond.Wait()
 				p.mu.Unlock()
 				continue
@@ -1329,8 +1331,8 @@ func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize,
 func newDefaultConfig[T any]() Config[T] {
 	return Config[T]{
 		attempts:  10,
-		delay:     100 * time.Millisecond,
-		maxJitter: 100 * time.Millisecond,
+		delay:     5 * time.Millisecond,
+		maxJitter: 5 * time.Millisecond,
 		onRetry:   func(n int, err error, task *TaskWrapper[T]) {},
 		retryIf: func(err error) bool {
 			return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
