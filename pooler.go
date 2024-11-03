@@ -145,6 +145,7 @@ type workerState[T any] struct {
 	forcePanic  bool
 	currentTask *TaskWrapper[T] // Field to track the current task
 	interrupted bool            // Field to track if the worker has been interrupted
+	removed     bool            // Field to track if the worker has been removed
 }
 
 // Metrics struct holds atomic counters for pool metrics
@@ -404,6 +405,7 @@ func (p *Pool[T]) RestartWorker(workerID int) error {
 }
 
 // RemoveWorker removes a worker from the pool
+// RemoveWorker removes a worker from the pool
 func (p *Pool[T]) RemoveWorker(workerID int) error {
 	p.mu.Lock()
 
@@ -412,6 +414,9 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 		p.mu.Unlock()
 		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
 	}
+
+	// Set the removed flag
+	state.removed = true
 
 	// Cancel the worker's context
 	state.cancel()
@@ -458,18 +463,26 @@ func (p *Pool[T]) requeueTasksFromWorker(workerID int) {
 func (p *Pool[T]) workerLoop(workerID int) error {
 	logs.Debug(context.Background(), "Worker loop started", "workerID", workerID)
 
+	p.mu.Lock()
+	state, exists := p.workers[workerID]
+	p.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
+	}
+
 	defer func() {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 
-		// Remove worker from the pool when it exits
-		delete(p.workers, workerID)
-		logs.Debug(context.Background(), "Worker loop exited", "workerID", workerID)
+		if state.removed {
+			// Remove worker from the pool when it exits
+			delete(p.workers, workerID)
+			logs.Debug(context.Background(), "Worker loop exited and removed", "workerID", workerID)
+		} else {
+			logs.Debug(context.Background(), "Worker loop exited but not removed", "workerID", workerID)
+		}
 	}()
-
-	p.mu.Lock()
-	state, exists := p.workers[workerID]
-	p.mu.Unlock()
 
 	if !exists {
 		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
