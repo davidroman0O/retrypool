@@ -74,9 +74,9 @@ func main() {
 		}
 		var err error
 		if task.ImmediateRetry {
-			err = pool.Dispatch(task, retrypool.WithImmediateRetry[Task]())
+			err = pool.Submit(task, retrypool.WithImmediateRetry[Task]())
 		} else {
-			err = pool.Dispatch(task)
+			err = pool.Submit(task)
 		}
 		if err != nil {
 			log.Printf("Failed to dispatch task %d: %v", i, err)
@@ -93,7 +93,7 @@ func main() {
 		log.Printf("Error while waiting for tasks to complete: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	// Print results
 	for i, w := range workers {

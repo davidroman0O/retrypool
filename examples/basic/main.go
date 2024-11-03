@@ -24,13 +24,13 @@ func main() {
 
 	for i := 1; i <= 10; i++ {
 		whenProcessed := make(chan struct{})
-		err := pool.Dispatch(i*100, retrypool.WithBeingProcessed[int](whenProcessed))
+		err := pool.Submit(i*100, retrypool.WithBeingProcessed[int](whenProcessed))
 		if err != nil {
 			log.Printf("Dispatch error: %v", err)
 		}
 		<-whenProcessed
 	}
 
-	pool.Close()
+	pool.Shutdown()
 	fmt.Println("All tasks completed")
 }

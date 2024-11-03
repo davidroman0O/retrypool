@@ -35,11 +35,11 @@ func main() {
 	pool := retrypool.New[MyTask](ctx, []retrypool.Worker[MyTask]{&MyWorker{}})
 
 	// Dispatch a task with a max duration of 1 second per attempt.
-	err := pool.Dispatch(MyTask{ID: 2}, retrypool.WithMaxContextDuration[MyTask](1*time.Second))
+	err := pool.Submit(MyTask{ID: 2}, retrypool.WithMaxContextDuration[MyTask](1*time.Second))
 	if err != nil {
 		fmt.Printf("Failed to dispatch task: %v\n", err)
 	}
 
 	// Wait for all tasks to complete.
-	pool.Close()
+	pool.Shutdown()
 }

@@ -130,7 +130,7 @@ func main() {
 			Payload: map[string]interface{}{"key": fmt.Sprintf("value%d", i)},
 		}
 
-		err := pool.Dispatch(task)
+		err := pool.Submit(task)
 		if err != nil {
 			log.Printf("Failed to dispatch task: %v", err)
 		}

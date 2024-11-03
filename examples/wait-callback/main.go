@@ -31,7 +31,7 @@ func main() {
 
 	// Dispatch multiple tasks.
 	for i := 1; i <= 5; i++ {
-		err := pool.Dispatch(MyTask{ID: i})
+		err := pool.Submit(MyTask{ID: i})
 		if err != nil {
 			fmt.Printf("Failed to dispatch task %d: %v\n", i, err)
 		}
@@ -48,5 +48,5 @@ func main() {
 	}
 
 	// Close the pool after all tasks are done.
-	pool.Close()
+	pool.Shutdown()
 }

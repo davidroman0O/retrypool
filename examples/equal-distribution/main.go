@@ -39,9 +39,9 @@ func main() {
 		for i := 0; i < 20; i++ { // Increased to 20 tasks for better demonstration
 			var err error
 			// if useEqualDistribution {
-			err = pool.Dispatch(i)
+			err = pool.Submit(i)
 			// } else {
-			// 	err = pool.Dispatch(i)
+			// 	err = pool.Submit(i)
 			// }
 			if err != nil {
 				log.Printf("Error dispatching task %d: %v", i, err)
@@ -82,5 +82,5 @@ func main() {
 	}()
 
 	wg.Wait()
-	pool.Close()
+	pool.Shutdown()
 }

@@ -46,7 +46,7 @@ func main() {
 
 	// Dispatch tasks
 	for i := 1; i <= 10; i++ {
-		pool.Dispatch(i)
+		pool.Submit(i)
 	}
 
 	// Give some time for workers to start processing

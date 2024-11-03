@@ -35,11 +35,11 @@ func main() {
 	)
 
 	// Dispatch a task.
-	err := pool.Dispatch(MyTask{ID: 6})
+	err := pool.Submit(MyTask{ID: 6})
 	if err != nil {
 		fmt.Printf("Failed to dispatch task: %v\n", err)
 	}
 
 	// Wait for all tasks to complete.
-	pool.Close()
+	pool.Shutdown()
 }

@@ -51,7 +51,7 @@ func main() {
 		timeLimit := time.Duration(rand.Intn(5)+1) * time.Second
 
 		task := SimulatedTask{ID: i, Duration: taskDuration}
-		err := pool.Dispatch(task, retrypool.WithTimeLimit[SimulatedTask](timeLimit))
+		err := pool.Submit(task, retrypool.WithTimeLimit[SimulatedTask](timeLimit))
 		if err != nil {
 			log.Printf("Failed to dispatch task %d: %v", i, err)
 		} else {
@@ -69,7 +69,7 @@ func main() {
 		log.Printf("Error while waiting for tasks to complete: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	// Print dead tasks
 	deadTasks := pool.DeadTasks()

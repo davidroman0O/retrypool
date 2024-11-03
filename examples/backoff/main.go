@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/davidroman0O/retrypool"
+	"github.com/davidroman0O/retrypool/logs"
 
 	"math/rand"
 )
@@ -49,18 +50,25 @@ func main() {
 
 	// Initialize the retrypool with one worker and custom delayType.
 	pool := retrypool.New[MyTask](ctx, []retrypool.Worker[MyTask]{&MyWorker{}},
+		retrypool.WithAttempts[MyTask](2),
 		retrypool.WithDelay[MyTask](500*time.Millisecond),
 		retrypool.WithMaxDelay[MyTask](5*time.Second),
 		retrypool.WithMaxJitter[MyTask](500*time.Millisecond),
 		retrypool.WithDelayType[MyTask](delayType),
+		retrypool.WithLogLevel[MyTask](logs.LevelDebug),
 	)
 
 	// Dispatch a task.
-	err := pool.Dispatch(MyTask{ID: 3})
+	err := pool.Submit(MyTask{ID: 3})
 	if err != nil {
 		fmt.Printf("Failed to dispatch task: %v\n", err)
 	}
 
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
+		fmt.Printf("Queue size: %d, processing count: %d, dead task count: %d\n", queueSize, processingCount, deadTaskCount)
+		return queueSize > 0
+	}, time.Second)
+
 	// Wait for all tasks to complete.
-	pool.Close()
+	pool.Shutdown()
 }

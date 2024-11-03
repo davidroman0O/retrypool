@@ -39,7 +39,7 @@ func main() {
 	requestResponse := retrypool.NewRequestResponse[MyTask, MyResponse](MyTask{ID: 10})
 
 	// Dispatch the task.
-	err := pool.Dispatch(requestResponse)
+	err := pool.Submit(requestResponse)
 	if err != nil {
 		fmt.Printf("Failed to dispatch task: %v\n", err)
 	}
@@ -53,5 +53,5 @@ func main() {
 	}
 
 	// Close the pool.
-	pool.Close()
+	pool.Shutdown()
 }

@@ -55,13 +55,18 @@ func main() {
 	)
 
 	for i := 1; i <= 10; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Submit(i)
 		if err != nil {
 			log.Printf("Dispatch error: %v", err)
 		}
 	}
 
-	pool.Close()
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
+		fmt.Printf("Queue size: %d, processing count: %d, dead task count: %d\n", queueSize, processingCount, deadTaskCount)
+		return queueSize > 0
+	}, time.Second)
+
+	pool.Shutdown()
 	fmt.Println("All tasks completed")
 
 	deadTasks := pool.DeadTasks()
