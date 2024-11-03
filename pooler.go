@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	_ "go.uber.org/automaxprocs"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 
@@ -1330,9 +1331,9 @@ func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize,
 // newDefaultConfig initializes default retry configurations
 func newDefaultConfig[T any]() Config[T] {
 	return Config[T]{
-		attempts:  10,
-		delay:     5 * time.Millisecond,
-		maxJitter: 5 * time.Millisecond,
+		attempts:  1,
+		delay:     1 * time.Millisecond,
+		maxJitter: 1 * time.Millisecond,
 		onRetry:   func(n int, err error, task *TaskWrapper[T]) {},
 		retryIf: func(err error) bool {
 			return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
