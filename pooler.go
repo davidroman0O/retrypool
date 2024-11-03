@@ -181,6 +181,8 @@ type Pool[T any] struct {
 	limiter *rate.Limiter
 
 	errGroup *errgroup.Group
+
+	taskWrapperPool sync.Pool
 }
 
 // New initializes the Pool with given workers and options
@@ -200,6 +202,12 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 		ctx:             ctx,
 		cancel:          cancel,
 		errGroup:        errGroup,
+
+		taskWrapperPool: sync.Pool{
+			New: func() interface{} {
+				return &TaskWrapper[T]{}
+			},
+		},
 	}
 
 	for _, option := range options {
@@ -866,6 +874,10 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 
 // runWorkerWithFailsafe handles the execution of a task, including panic recovery and retries
 func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
+	defer func() {
+		p.taskWrapperPool.Put(task)
+	}()
+
 	// Create attempt-specific context
 	attemptCtx, attemptCancel := p.createAttemptContext(task)
 	if attemptCtx == nil {
@@ -1171,6 +1183,16 @@ func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	}
 }
 
+func (task *TaskWrapper[T]) reset() {
+	task.retries = 0
+	task.triedWorkers = make(map[int]bool)
+	task.errors = make([]error, 0)
+	task.durations = make([]time.Duration, 0)
+	task.immediateRetry = false
+	task.processedAt = []time.Time{}
+	task.queuedAt = []time.Time{}
+}
+
 // Submit adds a new task to the pool
 func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	if p.limiter != nil {
@@ -1194,18 +1216,12 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	atomic.AddInt64(&p.metrics.TasksSubmitted, 1)
 
 	taskCtx, cancel := context.WithCancel(p.ctx)
-	task := &TaskWrapper[T]{
-		data:           data,
-		retries:        0,
-		triedWorkers:   make(map[int]bool),
-		errors:         make([]error, 0),
-		durations:      make([]time.Duration, 0),
-		ctx:            taskCtx,
-		cancel:         cancel,
-		immediateRetry: false,
-		processedAt:    []time.Time{},
-		queuedAt:       []time.Time{},
-	}
+	task := p.taskWrapperPool.Get().(*TaskWrapper[T])
+	task.reset()
+	task.data = data
+	task.ctx = taskCtx
+	task.cancel = cancel
+
 	for _, opt := range options {
 		opt(task)
 	}
@@ -1332,8 +1348,8 @@ func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize,
 func newDefaultConfig[T any]() Config[T] {
 	return Config[T]{
 		attempts:  1,
-		delay:     1 * time.Millisecond,
-		maxJitter: 1 * time.Millisecond,
+		delay:     1 * time.Nanosecond,
+		maxJitter: 1 * time.Nanosecond,
 		onRetry:   func(n int, err error, task *TaskWrapper[T]) {},
 		retryIf: func(err error) bool {
 			return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
