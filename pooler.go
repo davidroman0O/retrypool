@@ -251,15 +251,20 @@ func (p *Pool[T]) Shutdown() error {
 
 	// Wait for all workers to finish
 	err := p.errGroup.Wait()
-	if err != nil {
-		if err != context.Canceled {
-			logs.Error(context.Background(), "Error while waiting for workers to finish", "error", err)
-		} else {
-			logs.Info(context.Background(), "Pool has been shut down")
-		}
-	} else {
-		logs.Info(context.Background(), "All workers have been shut down")
+	if err != nil && err != context.Canceled {
+		logs.Error(context.Background(), "Error while waiting for workers to finish", "error", err)
 	}
+
+	// Add unprocessed tasks to the dead tasks list
+	p.mu.Lock()
+	for retries, queue := range p.taskQueues {
+		for _, task := range queue.tasks {
+			p.addToDeadTasks(task, context.Canceled)
+		}
+		delete(p.taskQueues, retries) // Clear the queue after moving tasks
+	}
+	p.mu.Unlock()
+
 	return err
 }
 
@@ -825,6 +830,9 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 
 			logs.Debug(context.Background(), "Task reassigned due to interrupt", "workerID", workerID, "taskData", task.data)
 		}
+
+		// requeue the rest of the tasks
+		p.requeueTasksFromWorker(workerID)
 	}
 
 	if cfg.RemoveWorker {

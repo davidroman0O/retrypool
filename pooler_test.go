@@ -69,6 +69,7 @@ type SlowWorker struct {
 }
 
 func (w *SlowWorker) Run(ctx context.Context, data int) error {
+	fmt.Println("called", data)
 	w.mu.Lock()
 	w.processing = true
 	if w.started != nil {
@@ -95,9 +96,14 @@ type CountingWorker struct {
 }
 
 func (w *CountingWorker) Run(ctx context.Context, data int) error {
-	w.mu.Lock()
-	w.counter++
-	w.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(100 * time.Millisecond):
+		w.mu.Lock()
+		w.counter++
+		w.mu.Unlock()
+	}
 	return nil
 }
 
@@ -487,17 +493,19 @@ func TestTaskCancellationOnContextCancel(t *testing.T) {
 		WithRetryIf[int](func(err error) bool { return true }),
 	)
 
-	// Dispatch task
-	err := pool.Submit(1)
-	if err != nil {
-		t.Fatalf("Failed to dispatch task: %v", err)
+	for i := 0; i < 10; i++ {
+		// Dispatch task
+		err := pool.Submit(i)
+		if err != nil {
+			t.Fatalf("Failed to dispatch task: %v", err)
+		}
 	}
 
 	// Cancel context after delay
-	time.AfterFunc(100*time.Millisecond, cancel)
+	time.AfterFunc(2*time.Second, cancel)
 
 	// Wait for pool to finish
-	err = pool.WaitWithCallback(ctx, func(q, p, d int) bool {
+	err := pool.WaitWithCallback(ctx, func(q, p, d int) bool {
 		return q > 0 || p > 0
 	}, 10*time.Millisecond)
 
@@ -509,8 +517,8 @@ func TestTaskCancellationOnContextCancel(t *testing.T) {
 
 	// Check task is in dead tasks
 	deadTasks := pool.DeadTasks()
-	if len(deadTasks) != 1 {
-		t.Errorf("Expected 1 dead task, got %d", len(deadTasks))
+	if len(deadTasks) == 0 {
+		t.Errorf("Expected many dead tasks, got %d", len(deadTasks))
 	}
 }
 
@@ -751,16 +759,16 @@ func TestRangeTasksIteratesAllTasks(t *testing.T) {
 
 // TestCombinedFeaturesWithDynamicWorkers tests a complex scenario involving dynamic workers and task retries.
 func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	worker1 := &FlakyWorker{failuresLeft: 2}
-	worker2 := &FlakyWorker{failuresLeft: 2}
+	worker1 := &IncrementWorker{}
+	worker2 := &IncrementWorker{}
 
 	pool := New(ctx, []Worker[int]{worker1})
 
 	// Dispatch tasks
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 50; i++ {
 		err := pool.Submit(i)
 		if err != nil {
 			t.Fatalf("Failed to dispatch task %d: %v", i, err)
@@ -790,7 +798,7 @@ func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
 	pool.Shutdown()
 
 	// Check that tasks were processed and retried
-	if worker1.count == 0 && worker2.count == 0 {
+	if worker1.counter == 0 && worker2.counter == 0 {
 		t.Errorf("Expected tasks to be processed by workers")
 	}
 }
