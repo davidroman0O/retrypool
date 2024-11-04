@@ -360,20 +360,17 @@ func (p *Pool[T]) ListWorkers() []WorkerItem[T] {
 // AddWorker adds a new worker to the pool dynamically
 func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 	p.mu.Lock()
-
 	workerID := p.nextWorkerID
 	p.nextWorkerID++
-	p.mu.Unlock()
 
+	// Create worker state
 	var workerCtx context.Context
 	var workerCancel context.CancelFunc
-	p.mu.Lock()
 	if p.config.contextFunc != nil {
 		workerCtx = p.config.contextFunc()
 	} else {
 		workerCtx, workerCancel = context.WithCancel(p.ctx)
 	}
-	p.mu.Unlock()
 	state := &workerState[T]{
 		worker:   worker,
 		stopChan: make(chan struct{}),
@@ -382,16 +379,39 @@ func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 		ctx:      workerCtx,
 	}
 
-	p.mu.Lock()
 	p.workers[workerID] = state
-	// Start the worker goroutine using errgroup
+
+	// Redistribute existing tasks among all workers
+	if len(p.taskQueues) > 0 {
+		allTasks := make([]*TaskWrapper[T], 0)
+		// Collect all tasks
+		for _, queue := range p.taskQueues {
+			allTasks = append(allTasks, queue.Tasks()...)
+		}
+		// Clear existing queues
+		p.taskQueues = make(map[int]TaskQueue[T])
+
+		// Redistribute tasks round-robin
+		for i, task := range allTasks {
+			targetWorkerID := i % len(p.workers)
+			q := p.taskQueues[targetWorkerID]
+			if q == nil {
+				q = &taskQueue[T]{}
+				p.taskQueues[targetWorkerID] = q
+			}
+			q.Enqueue(task)
+		}
+	}
+
+	// Start worker
 	p.errGroup.Go(func() error {
 		return p.workerLoop(workerID)
 	})
+
+	p.cond.Broadcast()
 	p.mu.Unlock()
 
 	logs.Info(context.Background(), "Added new worker", "workerID", workerID)
-
 	return workerID
 }
 

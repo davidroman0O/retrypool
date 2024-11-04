@@ -200,8 +200,21 @@ func TestAddWorkerDynamically(t *testing.T) {
 	// Create initial worker
 	initialWorker := &RecordingWorker{}
 
+	var worker1Tasks, worker2Tasks []int
+	var taskMu sync.Mutex
+
 	// Create pool with initial worker
-	pool := New(ctx, []Worker[int]{initialWorker})
+	pool := New(ctx, []Worker[int]{initialWorker},
+		WithOnTaskSuccess[int](func(_ WorkerController[int], workerID int, _ Worker[int], task *TaskWrapper[int]) {
+			taskMu.Lock()
+			if workerID == 0 {
+				worker1Tasks = append(worker1Tasks, task.Data())
+			} else {
+				worker2Tasks = append(worker2Tasks, task.Data())
+			}
+			taskMu.Unlock()
+		}),
+	)
 
 	// Dispatch tasks
 	for i := 0; i < 10; i++ {
@@ -243,6 +256,13 @@ func TestAddWorkerDynamically(t *testing.T) {
 
 	if newWorkerTaskCount == 0 {
 		t.Errorf("Expected new worker to process tasks")
+	}
+
+	t.Logf("Worker1 tasks: %v", worker1Tasks)
+	t.Logf("Worker2 tasks: %v", worker2Tasks)
+
+	if len(worker2Tasks) == 0 {
+		t.Error("Second worker didn't process any tasks")
 	}
 }
 
