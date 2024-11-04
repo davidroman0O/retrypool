@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
 	"sync/atomic"
 	"time"
 
 	"github.com/davidroman0O/retrypool"
-	_ "go.uber.org/automaxprocs"
 )
 
 // Task represents a simple work unit
@@ -34,7 +34,7 @@ func main() {
 	defer cancel()
 
 	// Increase the number of workers based on available CPU cores to improve parallelism
-	numWorkers := 8
+	numWorkers := runtime.GOMAXPROCS(0)
 	workers := make([]retrypool.Worker[Task], numWorkers)
 	workerStats := make([]*BenchmarkWorker, numWorkers)
 

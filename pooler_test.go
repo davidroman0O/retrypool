@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -784,51 +786,135 @@ func TestRangeTasksIteratesAllTasks(t *testing.T) {
 	pool.Shutdown()
 }
 
+// Define at package level
+type TestSlowIncrementWorker struct {
+	*IncrementWorker
+}
+
+func NewTestSlowIncrementWorker() *TestSlowIncrementWorker {
+	return &TestSlowIncrementWorker{
+		IncrementWorker: &IncrementWorker{},
+	}
+}
+
+func (w *TestSlowIncrementWorker) Run(ctx context.Context, data int) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(50 * time.Millisecond):
+	}
+	return w.IncrementWorker.Run(ctx, data)
+}
+
 // TestCombinedFeaturesWithDynamicWorkers tests a complex scenario involving dynamic workers and task retries.
 func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	worker1 := &SlowIncrementWorker{}
-	worker2 := &SlowIncrementWorker{}
+	worker1 := NewTestSlowIncrementWorker()
+	worker2 := NewTestSlowIncrementWorker()
 
-	pool := New(ctx, []Worker[int]{worker1})
+	// Track task completion order and worker assignment
+	type taskResult struct {
+		workerID  int
+		timestamp time.Time
+	}
+	var completedTasks sync.Map
+	var taskCount int32
 
-	// Dispatch tasks
-	for i := 0; i < 10; i++ {
-		fmt.Println("DISPATCH", i)
-		err := pool.Submit(i)
-		if err != nil {
+	pool := New(ctx, []Worker[int]{worker1},
+		WithLogLevel[int](logs.LevelDebug),
+		WithAttempts[int](1), // No retries to keep things simple
+		WithOnTaskSuccess[int](func(_ WorkerController[int], workerID int, _ Worker[int], task *TaskWrapper[int]) {
+			completedTasks.Store(task.Data(), taskResult{
+				workerID:  workerID,
+				timestamp: time.Now(),
+			})
+			atomic.AddInt32(&taskCount, 1)
+		}),
+	)
+
+	// Submit first batch
+	for i := 0; i < 5; i++ {
+		if err := pool.Submit(i); err != nil {
 			t.Fatalf("Failed to dispatch task %d: %v", i, err)
 		}
 	}
 
-	// Add a new worker dynamically
-	newWorkerID := pool.AddWorker(worker2)
-	if newWorkerID <= 0 {
-		t.Errorf("Expected new worker ID to be greater than 0, got %d", newWorkerID)
+	// Let some first batch tasks complete
+	time.Sleep(150 * time.Millisecond)
+
+	// Add second worker
+	worker2ID := pool.AddWorker(worker2)
+	if worker2ID != 1 {
+		t.Errorf("Expected worker2 ID to be 1, got %d", worker2ID)
 	}
 
-	// Interrupt worker1 and reassign its task
+	// Submit second batch
+	for i := 5; i < 10; i++ {
+		if err := pool.Submit(i); err != nil {
+			t.Fatalf("Failed to dispatch task %d: %v", i, err)
+		}
+	}
+
+	// Wait for at least one second batch task to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Interrupt first worker
 	err := pool.InterruptWorker(0, WithReassignTask())
 	if err != nil {
 		t.Fatalf("Failed to interrupt worker: %v", err)
 	}
 
-	// Wait for tasks to be processed
-	err = pool.WaitWithCallback(ctx, func(q, p, d int) bool {
-		return q > 0 || p > 0
-	}, 50*time.Millisecond)
-	if err != nil && err != context.DeadlineExceeded {
-		t.Fatalf("WaitWithCallback failed: %v", err)
+	// Wait for completion with timeout
+	timeout := time.NewTimer(3 * time.Second)
+	defer timeout.Stop()
+
+	completed := make(map[int]taskResult)
+	for len(completed) < 10 {
+		select {
+		case <-timeout.C:
+			t.Fatalf("Timeout waiting for tasks. Completed %d/10: %v", len(completed), completed)
+		case <-time.After(50 * time.Millisecond):
+			completedTasks.Range(func(k, v interface{}) bool {
+				completed[k.(int)] = v.(taskResult)
+				return true
+			})
+		}
 	}
 
-	fmt.Println("SHUTDOWN")
+	// Let any final operations complete
+	time.Sleep(100 * time.Millisecond)
+
 	pool.Shutdown()
 
-	// Check that tasks were processed and retried
-	if worker1.counter == 0 && worker2.counter == 0 {
-		t.Errorf("Expected tasks to be processed by workers")
+	// Analyze results
+	byWorker := make(map[int][]int)
+	for taskID, result := range completed {
+		byWorker[result.workerID] = append(byWorker[result.workerID], taskID)
+	}
+
+	// Sort tasks for consistent output
+	for _, tasks := range byWorker {
+		sort.Ints(tasks)
+	}
+
+	t.Logf("Tasks by worker0: %v", byWorker[0])
+	t.Logf("Tasks by worker1: %v", byWorker[1])
+
+	// Verify distribution
+	if len(byWorker[0]) == 0 || len(byWorker[1]) == 0 {
+		t.Error("Expected both workers to process tasks")
+	}
+
+	if len(byWorker[1]) < 3 {
+		t.Errorf("Expected worker1 to process at least 3 tasks, got %d", len(byWorker[1]))
+	}
+
+	// Check for dead tasks
+	deadTasks := pool.DeadTasks()
+	if len(deadTasks) > 0 {
+		t.Errorf("Got unexpected dead tasks: %+v", deadTasks)
 	}
 }
 
