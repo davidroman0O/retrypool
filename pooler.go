@@ -55,18 +55,17 @@ type DeadTask[T any] struct {
 
 // TaskWrapper includes scheduledTime, triedWorkers, errors, durations, and panicOnTimeout
 type TaskWrapper[T any] struct {
-	mu             sync.Mutex
-	data           T
-	retries        int
-	totalDuration  time.Duration
-	timeLimit      time.Duration   // Zero means no overall limit
-	maxDuration    time.Duration   // Max duration per attempt
-	scheduledTime  time.Time       // For delay between retries
-	triedWorkers   map[int]bool    // Track workers that have tried this task
-	errors         []error         // Track errors for each attempt
-	durations      []time.Duration // Track duration for each attempt
-	ctx            context.Context
-	cancel         context.CancelFunc
+	mu            sync.Mutex
+	data          T
+	retries       int
+	totalDuration time.Duration
+	timeLimit     time.Duration   // Zero means no overall limit
+	maxDuration   time.Duration   // Max duration per attempt
+	scheduledTime time.Time       // For delay between retries
+	triedWorkers  map[int]bool    // Track workers that have tried this task
+	errors        []error         // Track errors for each attempt
+	durations     []time.Duration // Track duration for each attempt
+
 	immediateRetry bool
 
 	beingProcessed processedNotification // optional
@@ -179,8 +178,6 @@ type Config[T any] struct {
 	onTaskSuccess OnTaskSuccessFunc[T] // Callback when a task succeeds
 	onTaskFailure OnTaskFailureFunc[T] // Callback when a task fails
 	onNewDeadTask OnNewDeadTaskFunc[T]
-
-	contextFunc ContextFunc
 
 	panicHandler PanicHandlerFunc[T]
 	panicWorker  PanicWorker
@@ -358,7 +355,7 @@ func (p *Pool[T]) ListWorkers() []WorkerItem[T] {
 }
 
 // AddWorker adds a new worker to the pool dynamically
-func (p *Pool[T]) AddWorker(worker Worker[T]) int {
+func (p *Pool[T]) AddWorker(worker Worker[T], options ...WorkerOption[T]) int {
 	p.mu.Lock()
 	workerID := p.nextWorkerID
 	p.nextWorkerID++
@@ -366,17 +363,20 @@ func (p *Pool[T]) AddWorker(worker Worker[T]) int {
 	// Create worker state
 	var workerCtx context.Context
 	var workerCancel context.CancelFunc
-	if p.config.contextFunc != nil {
-		workerCtx = p.config.contextFunc()
-	} else {
-		workerCtx, workerCancel = context.WithCancel(p.ctx)
-	}
+
+	// Create base cancellable context from pool
+	workerCtx, workerCancel = context.WithCancel(p.ctx)
+
 	state := &workerState[T]{
 		worker:   worker,
 		stopChan: make(chan struct{}),
 		doneChan: make(chan struct{}),
 		cancel:   workerCancel,
 		ctx:      workerCtx,
+	}
+
+	for _, opt := range options {
+		opt(state)
 	}
 
 	p.workers[workerID] = state
@@ -455,7 +455,7 @@ func (p *Pool[T]) RemovalWorker(workerID int) {
 
 // WorkerController interface provides methods to control workers
 type WorkerController[T any] interface {
-	AddWorker(worker Worker[T]) int
+	AddWorker(worker Worker[T], options ...WorkerOption[T]) int
 	RemovalWorker(workerID int)
 	RestartWorker(workerID int) error
 	InterruptWorker(workerID int, options ...WorkerInterruptOption) error
@@ -638,9 +638,6 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 			for _, task := range tasks {
 				task.mu.Lock()
 				// Reset task state
-				taskCtx, cancel := context.WithCancel(p.ctx)
-				task.ctx = taskCtx
-				task.cancel = cancel
 				task.triedWorkers = make(map[int]bool)
 				task.scheduledTime = time.Now()
 				task.mu.Unlock()
@@ -985,8 +982,12 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		p.taskWrapperPool.Put(task)
 	}()
 
-	// Create attempt-specific context
-	attemptCtx, attemptCancel := p.createAttemptContext(task)
+	p.mu.Lock()
+	state := p.workers[workerID]
+	p.mu.Unlock()
+
+	// Create attempt-specific context, but use worker's context as parent
+	attemptCtx, attemptCancel := p.createAttemptContext(task, state.ctx)
 	if attemptCtx == nil {
 		err := fmt.Errorf("%w: %v", ErrTaskExceedsTimeLimit, task.timeLimit)
 		p.addToDeadTasks(task, err)
@@ -1124,15 +1125,15 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 }
 
 // createAttemptContext creates the context for an attempt, considering maxDuration and timeLimit
-func (p *Pool[T]) createAttemptContext(task *TaskWrapper[T]) (context.Context, context.CancelFunc) {
+func (p *Pool[T]) createAttemptContext(task *TaskWrapper[T], workerCtx context.Context) (context.Context, context.CancelFunc) {
 	task.mu.Lock()
 	defer task.mu.Unlock()
 
 	var attemptCtx context.Context
 	var attemptCancel context.CancelFunc
 
-	// Create base context first
-	baseCtx := task.ctx
+	// Use worker's context as base instead of task.ctx
+	baseCtx := workerCtx
 	if baseCtx == nil {
 		baseCtx = context.Background()
 	}
@@ -1360,12 +1361,9 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	// Increment tasks submitted metric
 	atomic.AddInt64(&p.metrics.TasksSubmitted, 1)
 
-	taskCtx, cancel := context.WithCancel(p.ctx)
 	task := p.taskWrapperPool.Get().(*TaskWrapper[T])
 	task.reset()
 	task.data = data
-	task.ctx = taskCtx
-	task.cancel = cancel
 
 	for _, opt := range options {
 		opt(task)
@@ -1537,13 +1535,6 @@ func WithAttempts[T any](attempts int) Option[T] {
 	}
 }
 
-// WithWorkerContext creates a specific context for each worker
-func WithWorkerContext[T any](fn ContextFunc) Option[T] {
-	return func(p *Pool[T]) {
-		p.config.contextFunc = fn
-	}
-}
-
 // WithDelay sets the delay between retries
 func WithDelay[T any](delay time.Duration) Option[T] {
 	return func(p *Pool[T]) {
@@ -1651,6 +1642,18 @@ func WithImmediateRetry[T any]() TaskOption[T] {
 	}
 }
 
+// Worker context option
+type WorkerOption[T any] func(*workerState[T])
+
+// WithWorkerContext allows setting custom context values for a specific worker
+func WithWorkerContext[T any](fn ContextFunc) WorkerOption[T] {
+	return func(ws *workerState[T]) {
+		if fn != nil {
+			ws.ctx = fn(ws.ctx)
+		}
+	}
+}
+
 type processedNotification chan struct{}
 
 func NewProcessedNotification() processedNotification {
@@ -1699,7 +1702,7 @@ type OnNewDeadTaskFunc[T any] func(task *DeadTask[T])
 type RetryIfFunc func(error) bool
 
 // ContextFunc signature
-type ContextFunc func() context.Context
+type ContextFunc func(context.Context) context.Context
 
 // DelayType functions
 

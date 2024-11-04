@@ -3,6 +3,7 @@ package retrypool
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -221,4 +222,137 @@ func TestWorkerContextFeatures(t *testing.T) {
 
 		pool.Shutdown()
 	})
+}
+
+type contextKey string
+
+const testWorkerValueKey = contextKey("worker-value")
+
+type contextTestWorker struct {
+	id     string
+	mu     sync.Mutex
+	values []string
+}
+
+func (w *contextTestWorker) Run(ctx context.Context, data int) error {
+	time.Sleep(50 * time.Millisecond)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Debug: print context chain
+	fmt.Printf("Worker %s executing with context...\n", w.id)
+	fmt.Printf("Context value for worker %s: %v\n", w.id, ctx.Value(testWorkerValueKey))
+
+	if value, ok := ctx.Value(testWorkerValueKey).(string); ok {
+		fmt.Printf("Worker %s got value: %s\n", w.id, value)
+		w.values = append(w.values, value)
+	} else {
+		fmt.Printf("Worker %s got no value\n", w.id)
+		w.values = append(w.values, "no-value")
+	}
+	return nil
+}
+
+func TestWorkerSpecificContext(t *testing.T) {
+	ctx := context.Background()
+
+	worker1 := &contextTestWorker{id: "1"}
+	worker2 := &contextTestWorker{id: "2"}
+	worker3 := &contextTestWorker{id: "3"}
+
+	pool := New[int](ctx, nil)
+
+	// Add workers and verify their contexts immediately
+	w1Ctx := context.WithValue(ctx, testWorkerValueKey, "worker1")
+	pool.AddWorker(worker1, WithWorkerContext[int](func(ctx context.Context) context.Context {
+		return w1Ctx
+	}))
+
+	// Verify worker1's context is stored correctly
+	if v := pool.workers[0].ctx.Value(testWorkerValueKey); v != "worker1" {
+		t.Errorf("Worker1 context not set correctly, got %v", v)
+	}
+
+	w2Ctx := context.WithValue(ctx, testWorkerValueKey, "worker2")
+	pool.AddWorker(worker2, WithWorkerContext[int](func(ctx context.Context) context.Context {
+		return w2Ctx
+	}))
+
+	// Verify worker2's context is stored correctly
+	if v := pool.workers[1].ctx.Value(testWorkerValueKey); v != "worker2" {
+		t.Errorf("Worker2 context not set correctly, got %v", v)
+	}
+
+	pool.AddWorker(worker3)
+
+	// Let's also verify contexts right before submitting tasks
+	t.Log("Verifying contexts before task submission:")
+	for id, ws := range pool.workers {
+		t.Logf("Worker %d context value: %v", id, ws.ctx.Value(testWorkerValueKey))
+	}
+
+	// Submit tasks
+	for i := 0; i < 6; i++ {
+		err := pool.Submit(i)
+		if err != nil {
+			t.Fatalf("Failed to submit task %d: %v", i, err)
+		}
+	}
+
+	// Wait for tasks to complete
+	err := pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
+		return queueSize > 0 || processingCount > 0
+	}, 100*time.Millisecond)
+
+	if err != nil {
+		t.Fatalf("Error waiting for tasks: %v", err)
+	}
+
+	pool.Shutdown()
+
+	// Collect all unique values seen by all workers
+	allValues := make(map[string]bool)
+
+	worker1.mu.Lock()
+	for _, v := range worker1.values {
+		allValues[v] = true
+	}
+	worker1.mu.Unlock()
+
+	worker2.mu.Lock()
+	for _, v := range worker2.values {
+		allValues[v] = true
+	}
+	worker2.mu.Unlock()
+
+	worker3.mu.Lock()
+	for _, v := range worker3.values {
+		allValues[v] = true
+	}
+	worker3.mu.Unlock()
+
+	// Convert to slice for sorting
+	var results []string
+	for v := range allValues {
+		results = append(results, v)
+	}
+	sort.Strings(results)
+
+	// Verify we saw all expected values
+	expected := []string{"no-value", "worker1", "worker2"}
+	if len(results) != 3 {
+		t.Errorf("Expected 3 different context values, got %d: %v", len(results), results)
+	}
+
+	for i, exp := range expected {
+		if i >= len(results) || results[i] != exp {
+			t.Errorf("Expected value %s at position %d, got %v", exp, i, results)
+		}
+	}
+
+	// Additional verification
+	t.Logf("Worker1 values: %v", worker1.values)
+	t.Logf("Worker2 values: %v", worker2.values)
+	t.Logf("Worker3 values: %v", worker3.values)
 }
