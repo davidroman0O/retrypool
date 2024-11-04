@@ -786,7 +786,7 @@ func TestRangeTasksIteratesAllTasks(t *testing.T) {
 
 	var queuedTasks, processingTasks int
 
-	pool.RangeTasks(func(data TaskWrapper[int], workerID int, status TaskStatus) bool {
+	pool.RangeTasks(func(data *TaskWrapper[int], workerID int, status TaskStatus) bool {
 		if status == TaskStatusQueued {
 			queuedTasks++
 		} else if status == TaskStatusProcessing {
@@ -1145,8 +1145,8 @@ func TestTaskTimingMetrics(t *testing.T) {
 
 	// Get the task and check its timing info
 	found := false
-	pool.RangeTasks(func(data TaskWrapper[int], workerID int, status TaskStatus) bool {
-		taskWrapper = &data
+	pool.RangeTasks(func(data *TaskWrapper[int], workerID int, status TaskStatus) bool {
+		taskWrapper = data
 		found = true
 		return false
 	})
