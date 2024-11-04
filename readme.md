@@ -1,7 +1,3 @@
-This previous README offers a thorough foundation for the `retrypool` documentation. Here’s how I'll integrate the key elements from the old README into a more detailed, real-world usage guide, with a structured layout for ease of understanding and quick reference:
-
----
-
 # retrypool
 
 [![GoDoc](https://godoc.org/github.com/davidroman0O/retrypool?status.svg)](https://godoc.org/github.com/davidroman0O/retrypool)  
