@@ -1174,3 +1174,192 @@ func TestTaskTimingMetrics(t *testing.T) {
 
 	pool.Shutdown()
 }
+
+func TestWorkerContextValues(t *testing.T) {
+	type contextKey string
+	const testKey = contextKey("test-key")
+	const testValue = "test-value"
+
+	// Create context with value
+	parentCtx := context.WithValue(context.Background(), testKey, testValue)
+
+	var valueReceived string
+	var valueMu sync.Mutex
+
+	// Create a worker that checks context value
+	worker := &SimpleWorker{
+		RunFunc: func(ctx context.Context, data int) error {
+			// Get value from context
+			if val, ok := ctx.Value(testKey).(string); ok {
+				valueMu.Lock()
+				valueReceived = val
+				valueMu.Unlock()
+			} else {
+				t.Error("Expected context value not found or wrong type")
+			}
+			return nil
+		},
+	}
+
+	// Create pool with context
+	pool := New(parentCtx, []Worker[int]{worker})
+
+	// Submit a task
+	err := pool.Submit(1)
+	if err != nil {
+		t.Fatalf("Failed to submit task: %v", err)
+	}
+
+	// Wait for task completion
+	err = pool.WaitWithCallback(parentCtx, func(queueSize, processingCount, deadTaskCount int) bool {
+		return queueSize > 0 || processingCount > 0
+	}, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitWithCallback failed: %v", err)
+	}
+
+	pool.Shutdown()
+
+	// Verify context value was received
+	valueMu.Lock()
+	if valueReceived != testValue {
+		t.Errorf("Expected context value %q, got %q", testValue, valueReceived)
+	}
+	valueMu.Unlock()
+}
+
+// Helper worker type for testing
+type SimpleWorker struct {
+	RunFunc func(context.Context, int) error
+}
+
+func (w *SimpleWorker) Run(ctx context.Context, data int) error {
+	if w.RunFunc != nil {
+		return w.RunFunc(ctx, data)
+	}
+	return nil
+}
+
+func TestWorkerContextFeatures(t *testing.T) {
+	t.Run("Cancellation propagation", func(t *testing.T) {
+		parentCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		var cancelReceived bool
+		var cancelMu sync.Mutex
+
+		worker := &SimpleWorker{
+			RunFunc: func(ctx context.Context, data int) error {
+				// Signal that we're running
+				defer wg.Done()
+
+				select {
+				case <-ctx.Done():
+					cancelMu.Lock()
+					cancelReceived = true
+					cancelMu.Unlock()
+					return ctx.Err()
+				case <-time.After(5 * time.Second): // Timeout just in case
+					t.Error("Timeout waiting for cancellation")
+					return nil
+				}
+			},
+		}
+
+		pool := New(parentCtx, []Worker[int]{worker})
+
+		// Submit task and wait for worker to start
+		err := pool.Submit(1)
+		if err != nil {
+			t.Fatalf("Failed to submit task: %v", err)
+		}
+
+		// Give time for worker to start
+		time.Sleep(100 * time.Millisecond)
+
+		// Cancel parent context
+		cancel()
+
+		// Wait for worker to complete
+		wg.Wait()
+
+		// Verify worker received cancellation
+		cancelMu.Lock()
+		if !cancelReceived {
+			t.Error("Worker did not receive context cancellation")
+		}
+		cancelMu.Unlock()
+
+		pool.Shutdown()
+	})
+
+	t.Run("Deadline propagation", func(t *testing.T) {
+		deadline := time.Now().Add(100 * time.Millisecond)
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+
+		var deadlineReceived time.Time
+		var deadlineMu sync.Mutex
+
+		worker := &SimpleWorker{
+			RunFunc: func(ctx context.Context, data int) error {
+				if d, ok := ctx.Deadline(); ok {
+					deadlineMu.Lock()
+					deadlineReceived = d
+					deadlineMu.Unlock()
+				}
+				return nil
+			},
+		}
+
+		pool := New(ctx, []Worker[int]{worker})
+		pool.Submit(1)
+
+		pool.WaitWithCallback(ctx, func(q, p, d int) bool {
+			return q > 0 || p > 0
+		}, 10*time.Millisecond)
+
+		deadlineMu.Lock()
+		if !deadlineReceived.Equal(deadline) {
+			t.Errorf("Expected deadline %v, got %v", deadline, deadlineReceived)
+		}
+		deadlineMu.Unlock()
+	})
+
+	t.Run("Multiple context values", func(t *testing.T) {
+		type key1 string
+		type key2 int
+
+		ctx := context.Background()
+		ctx = context.WithValue(ctx, key1("string"), "value1")
+		ctx = context.WithValue(ctx, key2(42), "value2")
+
+		var values []string
+		var valuesMu sync.Mutex
+
+		worker := &SimpleWorker{
+			RunFunc: func(ctx context.Context, data int) error {
+				valuesMu.Lock()
+				values = append(values,
+					ctx.Value(key1("string")).(string),
+					ctx.Value(key2(42)).(string))
+				valuesMu.Unlock()
+				return nil
+			},
+		}
+
+		pool := New(ctx, []Worker[int]{worker})
+		pool.Submit(1)
+		pool.WaitWithCallback(ctx, func(q, p, d int) bool {
+			return q > 0 || p > 0
+		}, 10*time.Millisecond)
+
+		valuesMu.Lock()
+		if len(values) != 2 || values[0] != "value1" || values[1] != "value2" {
+			t.Errorf("Expected values [value1 value2], got %v", values)
+		}
+		valuesMu.Unlock()
+	})
+}
