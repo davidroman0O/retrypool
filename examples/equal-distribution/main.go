@@ -17,7 +17,6 @@ type SimpleWorker struct {
 
 func (w *SimpleWorker) Run(ctx context.Context, data int) error {
 	log.Printf("Worker %d processing task: %d", w.ID, data)
-	time.Sleep(time.Second) // Simulate work
 	return nil
 }
 
@@ -37,12 +36,7 @@ func main() {
 	dispatchAndPrint := func(useEqualDistribution bool) {
 		fmt.Printf("\nDispatching with equal distribution: %v\n", useEqualDistribution)
 		for i := 0; i < 20; i++ { // Increased to 20 tasks for better demonstration
-			var err error
-			// if useEqualDistribution {
-			err = pool.Submit(i)
-			// } else {
-			// 	err = pool.Submit(i)
-			// }
+			err := pool.Submit(i)
 			if err != nil {
 				log.Printf("Error dispatching task %d: %v", i, err)
 			}
