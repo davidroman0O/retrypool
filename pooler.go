@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "go.uber.org/automaxprocs"
+	"go.uber.org/automaxprocs/maxprocs"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
 
@@ -20,6 +20,8 @@ import (
 )
 
 func init() {
+	maxprocs.Set()
+
 	deadlock.Opts.DeadlockTimeout = time.Second * 2 // Time to wait before reporting a potential deadlock
 	deadlock.Opts.OnPotentialDeadlock = func() {
 		// You can customize the behavior when a potential deadlock is detected
