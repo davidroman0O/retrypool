@@ -695,8 +695,8 @@ func TestPoolContinuesAfterPanic(t *testing.T) {
 	}
 
 	deadTasks := pool.DeadTasks()
-	if len(deadTasks) != 0 {
-		t.Errorf("Expected 0 dead tasks, got %d", len(deadTasks))
+	if len(deadTasks) != 1 {
+		t.Errorf("Expected 1 dead tasks, got %d", len(deadTasks))
 	}
 }
 
