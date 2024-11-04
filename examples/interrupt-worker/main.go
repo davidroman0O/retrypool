@@ -46,14 +46,14 @@ func main() {
 
 	// Dispatch tasks
 	for i := 1; i <= 10; i++ {
-		pool.Dispatch(i)
+		pool.Submit(i)
 	}
 
 	// Give some time for workers to start processing
 	time.Sleep(1 * time.Second)
 
 	// List current tasks
-	pool.RangeTasks(func(data retrypool.TaskWrapper[int], workerID int, status retrypool.TaskStatus) bool {
+	pool.RangeTasks(func(data *retrypool.TaskWrapper[int], workerID int, status retrypool.TaskStatus) bool {
 		switch status {
 		case retrypool.TaskStatusProcessing:
 			log.Printf("Worker %d is processing task: %d\n", workerID, data)
@@ -74,7 +74,7 @@ func main() {
 	<-time.After(2 * time.Second)
 
 	// List current tasks again
-	pool.RangeTasks(func(data retrypool.TaskWrapper[int], workerID int, status retrypool.TaskStatus) bool {
+	pool.RangeTasks(func(data *retrypool.TaskWrapper[int], workerID int, status retrypool.TaskStatus) bool {
 		switch status {
 		case retrypool.TaskStatusProcessing:
 			log.Printf("Worker %d is processing task: %d\n", workerID, data)

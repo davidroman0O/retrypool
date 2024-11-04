@@ -59,19 +59,19 @@ type APIWorker struct {
 	BearerToken string
 }
 
-type TaskData struct {
+type Data struct {
 	URL     string
 	Payload interface{}
 }
 
-func (w *APIWorker) Run(ctx context.Context, data TaskData) error {
+func (w *APIWorker) Run(ctx context.Context, data *retrypool.RequestResponse[Data, error]) error {
 	client := &http.Client{}
-	payload, err := json.Marshal(data.Payload)
+	payload, err := json.Marshal(data.Request.Payload)
 	if err != nil {
 		return fmt.Errorf("error marshaling payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", data.URL, bytes.NewBuffer(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", data.Request.URL, bytes.NewBuffer(payload))
 	if err != nil {
 		return fmt.Errorf("error creating request: %w", err)
 	}
@@ -108,29 +108,30 @@ func main() {
 	// Client code
 	ctx := context.Background()
 
-	workers := []retrypool.Worker[TaskData]{
+	workers := []retrypool.Worker[*retrypool.RequestResponse[Data, error]]{
 		&APIWorker{ID: 1, BearerToken: "token1"},
 		&APIWorker{ID: 2, BearerToken: "token2"},
 		&APIWorker{ID: 3, BearerToken: "token3"},
 	}
 
 	pool := retrypool.New(ctx, workers,
-		retrypool.WithAttempts[TaskData](3),
-		retrypool.WithDelay[TaskData](time.Second),
-		retrypool.WithMaxDelay[TaskData](5*time.Second),
-		retrypool.WithMaxJitter[TaskData](500*time.Millisecond),
-		retrypool.WithOnRetry[TaskData](func(attempt int, err error, task *retrypool.TaskWrapper[TaskData]) {
-			log.Printf("Retrying task (URL: %s) after attempt %d: %v", task.Data().URL, attempt, err)
+		retrypool.WithAttempts[*retrypool.RequestResponse[Data, error]](3),
+		retrypool.WithDelay[*retrypool.RequestResponse[Data, error]](time.Second),
+		retrypool.WithMaxDelay[*retrypool.RequestResponse[Data, error]](5*time.Second),
+		retrypool.WithMaxJitter[*retrypool.RequestResponse[Data, error]](500*time.Millisecond),
+		retrypool.WithOnRetry[*retrypool.RequestResponse[Data, error]](func(attempt int, err error, task *retrypool.TaskWrapper[*retrypool.RequestResponse[Data, error]]) {
+			log.Printf("Retrying task (URL: %s) after attempt %d: %v", task.Data().Request.URL, attempt, err)
 		}),
 	)
 
 	for i := 0; i < 20; i++ {
-		task := TaskData{
+
+		task := retrypool.NewRequestResponse[Data, error](Data{
 			URL:     "http://localhost:8080/api",
 			Payload: map[string]interface{}{"key": fmt.Sprintf("value%d", i)},
-		}
+		})
 
-		err := pool.Dispatch(task)
+		err := pool.Submit(task)
 		if err != nil {
 			log.Printf("Failed to dispatch task: %v", err)
 		}
@@ -147,5 +148,5 @@ func main() {
 		fmt.Printf("Dead task: %+v\n", task)
 	}
 
-	fmt.Println("All tasks completed")
+	fmt.Println("All tasks completed", pool.Metrics())
 }

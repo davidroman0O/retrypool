@@ -41,7 +41,7 @@ func main() {
 
 	// Dispatch initial tasks
 	for i := 0; i < 10; i++ {
-		pool.Dispatch(i)
+		pool.Submit(i)
 	}
 
 	// Pause worker 1
@@ -49,7 +49,7 @@ func main() {
 
 	// Dispatch more tasks
 	for i := 10; i < 20; i++ {
-		pool.Dispatch(i)
+		pool.Submit(i)
 	}
 
 	// Wait for a while
@@ -57,7 +57,7 @@ func main() {
 
 	// Dispatch more tasks
 	for i := 20; i < 30; i++ {
-		pool.Dispatch(i)
+		pool.Submit(i)
 	}
 
 	// Wait for tasks to complete
@@ -65,5 +65,5 @@ func main() {
 		log.Printf("Queue size: %d, Processing count: %d\n", queueSize, processingCount)
 		return queueSize == 0 && processingCount == 0
 	}, 1*time.Second)
-	pool.Close()
+	pool.Shutdown()
 }

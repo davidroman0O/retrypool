@@ -24,7 +24,7 @@ func (w *MyWorker) Run(ctx context.Context, data MyTask) error {
 		fmt.Printf("Task %d completed successfully.\n", data.ID)
 		return nil
 	case <-ctx.Done():
-		fmt.Printf("Task %d attempt canceled due to max duration.\n", data.ID)
+		fmt.Printf("Task %d canceled due to timeout.\n", data.ID)
 		return ctx.Err()
 	}
 }
@@ -33,14 +33,10 @@ func main() {
 	ctx := context.Background()
 
 	// Initialize the retrypool with one worker.
-	pool := retrypool.New[MyTask](ctx, []retrypool.Worker[MyTask]{&MyWorker{}}, retrypool.WithAttempts[MyTask](3))
+	pool := retrypool.New[MyTask](ctx, []retrypool.Worker[MyTask]{&MyWorker{}})
 
-	// Dispatch a task with a max duration of 1 second per attempt.
-	err := pool.Submit(
-		MyTask{ID: 2},
-		retrypool.WithMaxContextDuration[MyTask](1*time.Second), // doesn't works
-		// retrypool.WithMaxContextDuration[MyTask](4*time.Second), // works
-	)
+	// Dispatch a task with a time limit of 2 seconds.
+	err := pool.Submit(MyTask{ID: 1}, retrypool.WithTimeLimit[MyTask](2*time.Second))
 	if err != nil {
 		fmt.Printf("Failed to dispatch task: %v\n", err)
 	}
@@ -52,7 +48,4 @@ func main() {
 
 	// Wait for all tasks to complete.
 	pool.Shutdown()
-
-	fmt.Println("Dead tasks", pool.DeadTasks())
-
 }

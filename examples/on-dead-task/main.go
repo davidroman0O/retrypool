@@ -62,7 +62,7 @@ func main() {
 	// Increase number of tasks to 20
 	for i := 0; i < 20; i++ {
 		task := &MyTask{ID: i, Data: fmt.Sprintf("Task data %d", i)}
-		err := pool.Dispatch(task)
+		err := pool.Submit(task)
 		if err != nil {
 			log.Printf("Error dispatching task: %v", err)
 		}
@@ -96,5 +96,5 @@ func main() {
 
 	fmt.Printf("Total dead tasks processed: %d\n", deadTaskCount)
 
-	pool.Close()
+	pool.Shutdown()
 }

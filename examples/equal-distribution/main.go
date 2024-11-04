@@ -17,7 +17,6 @@ type SimpleWorker struct {
 
 func (w *SimpleWorker) Run(ctx context.Context, data int) error {
 	log.Printf("Worker %d processing task: %d", w.ID, data)
-	time.Sleep(time.Second) // Simulate work
 	return nil
 }
 
@@ -37,12 +36,7 @@ func main() {
 	dispatchAndPrint := func(useEqualDistribution bool) {
 		fmt.Printf("\nDispatching with equal distribution: %v\n", useEqualDistribution)
 		for i := 0; i < 20; i++ { // Increased to 20 tasks for better demonstration
-			var err error
-			// if useEqualDistribution {
-			err = pool.Dispatch(i)
-			// } else {
-			// 	err = pool.Dispatch(i)
-			// }
+			err := pool.Submit(i)
 			if err != nil {
 				log.Printf("Error dispatching task %d: %v", i, err)
 			}
@@ -50,7 +44,7 @@ func main() {
 
 		// Print queue sizes and tasks
 		workerQueues := make(map[int][]int)
-		pool.RangeTasks(func(data retrypool.TaskWrapper[int], workerID int, status retrypool.TaskStatus) bool {
+		pool.RangeTasks(func(data *retrypool.TaskWrapper[int], workerID int, status retrypool.TaskStatus) bool {
 			if status == retrypool.TaskStatusQueued {
 				workerQueues[workerID] = append(workerQueues[workerID], data.Data())
 			}
@@ -82,5 +76,5 @@ func main() {
 	}()
 
 	wg.Wait()
-	pool.Close()
+	pool.Shutdown()
 }

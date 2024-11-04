@@ -54,9 +54,6 @@ func main() {
 	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[Task](retrypool.UnlimitedAttempts),
 		retrypool.WithDelay[Task](50*time.Millisecond),
-		retrypool.WithDelayType[Task](retrypool.CombineDelay[Task](
-			retrypool.FixedDelay[Task],
-		)),
 		retrypool.WithOnRetry[Task](func(attempt int, err error, task *retrypool.TaskWrapper[Task]) {
 			workers := task.TriedWorkers()
 			tried := []int{}
@@ -77,9 +74,9 @@ func main() {
 		}
 		var err error
 		if task.ImmediateRetry {
-			err = pool.Dispatch(task, retrypool.WithImmediateRetry[Task]())
+			err = pool.Submit(task, retrypool.WithImmediateRetry[Task]())
 		} else {
-			err = pool.Dispatch(task)
+			err = pool.Submit(task)
 		}
 		if err != nil {
 			log.Printf("Failed to dispatch task %d: %v", i, err)
@@ -96,7 +93,7 @@ func main() {
 		log.Printf("Error while waiting for tasks to complete: %v", err)
 	}
 
-	pool.Close()
+	pool.Shutdown()
 
 	// Print results
 	for i, w := range workers {

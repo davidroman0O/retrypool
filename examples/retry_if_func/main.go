@@ -51,13 +51,13 @@ func main() {
 	)
 
 	for i := 1; i <= 10; i++ {
-		err := pool.Dispatch(i)
+		err := pool.Submit(i)
 		if err != nil {
 			log.Printf("Dispatch error: %v", err)
 		}
 	}
 
-	pool.Close()
+	pool.Shutdown()
 	fmt.Println("All tasks completed")
 
 	deadTasks := pool.DeadTasks()
