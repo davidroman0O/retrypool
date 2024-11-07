@@ -297,6 +297,16 @@ func (p *Pool[T]) Close() error {
 	return nil
 }
 
+// Knowing the amount of workers minus the amount of tasks being processed, we can determine the amount of available slots for new tasks.
+func (p *Pool[T]) AvailableWorkers() int {
+	workerIDs := p.GetWorkerIDs()
+	availableSlots := len(workerIDs) - p.ProcessingCount()
+	if availableSlots <= 0 {
+		return 0
+	}
+	return availableSlots
+}
+
 // Shutdown stops the pool and waits for all workers to finish
 func (p *Pool[T]) Shutdown() error {
 	p.mu.Lock()
