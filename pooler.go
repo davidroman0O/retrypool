@@ -185,6 +185,8 @@ type Config[T any] struct {
 	panicWorker  PanicWorker
 
 	logLevel logs.Level
+
+	roundRobinDistribution bool // Distribute tasks round-robin among workers
 }
 
 // workerState holds all per-worker data
@@ -234,6 +236,8 @@ type Pool[T any] struct {
 	errGroup *errgroup.Group
 
 	taskWrapperPool sync.Pool
+
+	nextRoundRobinWorkerIndex int
 }
 
 // New initializes the Pool with given workers and options
@@ -1381,18 +1385,27 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 		return ErrNoWorkersAvailable
 	}
 
-	// Find the worker with the smallest queue
-	minQueueSize := int(^uint(0) >> 1) // Max int
 	var selectedWorkerID int
-	for _, workerID := range workerIDs {
-		q := p.taskQueues[workerID]
-		queueSize := 0
-		if q != nil {
-			queueSize = q.Length()
-		}
-		if queueSize < minQueueSize {
-			minQueueSize = queueSize
-			selectedWorkerID = workerID
+	if p.config.roundRobinDistribution {
+		// Ensure nextWorkerIndex is within bounds
+		safeIndex := p.nextRoundRobinWorkerIndex + 1
+		safeIndex = safeIndex % len(p.workers)
+		selectedWorkerID = safeIndex
+		safeIndex = (safeIndex + 1) % len(p.workers)
+		p.nextRoundRobinWorkerIndex = safeIndex - 1
+	} else {
+		// Find the worker with the smallest queue
+		minQueueSize := int(^uint(0) >> 1) // Max int
+		for _, workerID := range workerIDs {
+			q := p.taskQueues[workerID]
+			queueSize := 0
+			if q != nil {
+				queueSize = q.Length()
+			}
+			if queueSize < minQueueSize {
+				minQueueSize = queueSize
+				selectedWorkerID = workerID
+			}
 		}
 	}
 
@@ -1515,6 +1528,12 @@ func newDefaultConfig[T any]() Config[T] {
 }
 
 // Option functions for configuring the Pool
+
+func WithRoundRobinAssignment[T any]() Option[T] {
+	return func(p *Pool[T]) {
+		p.config.roundRobinDistribution = true
+	}
+}
 
 // WithPanicHandler sets a custom panic handler for the pool.
 func WithPanicHandler[T any](handler PanicHandlerFunc[T]) Option[T] {
