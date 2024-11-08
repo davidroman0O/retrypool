@@ -512,6 +512,8 @@ func (p *Pool[T]) RestartWorker(workerID int) error {
 	return nil
 }
 
+var ErrAlreadyRemovingWorker = errors.New("worker is already being removed")
+
 // RemoveWorker removes a worker from the pool
 func (p *Pool[T]) RemoveWorker(workerID int) error {
 	p.mu.Lock()
@@ -520,6 +522,12 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 	if !exists {
 		p.mu.Unlock()
 		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
+	}
+
+	// Check if the worker is already removed
+	if state.removed {
+		p.mu.Unlock()
+		return ErrAlreadyRemovingWorker
 	}
 
 	// Set the removed flag
