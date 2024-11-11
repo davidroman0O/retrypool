@@ -1831,8 +1831,10 @@ func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
 			rr.err = ctx.Err()
 			rr.isCompleted = true
 			close(rr.done)
+			return zero, rr.err
+		} else {
+			return rr.response, nil
 		}
-		return zero, rr.err
 	}
 }
 
