@@ -71,6 +71,7 @@ type TaskWrapper[T any] struct {
 	immediateRetry bool
 
 	beingProcessed processedNotification // optional
+	beingQueued    queuedNotification    // optional
 
 	queuedAt    []time.Time
 	processedAt []time.Time
@@ -1108,6 +1109,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			if task.beingProcessed != nil {
 				task.beingProcessed.Close()
 			}
+			if task.beingQueued != nil {
+				task.beingQueued.Close()
+			}
 			p.addToDeadTasks(task, err)
 		case DeadTaskActionRetry:
 			if err != context.Canceled && err != context.DeadlineExceeded && p.config.retryIf(err) && task.retries < p.config.attempts {
@@ -1117,6 +1121,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			} else {
 				if task.beingProcessed != nil {
 					task.beingProcessed.Close()
+				}
+				if task.beingQueued != nil {
+					task.beingQueued.Close()
 				}
 				p.addToDeadTasks(task, err)
 			}
@@ -1144,6 +1151,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 
 		if task.beingProcessed != nil {
 			task.beingProcessed.Close()
+		}
+		if task.beingQueued != nil {
+			task.beingQueued.Close()
 		}
 	}
 }
@@ -1436,6 +1446,10 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	}
 	q.Enqueue(task)
 
+	if task.beingQueued != nil {
+		task.beingQueued <- struct{}{}
+	}
+
 	logs.Debug(context.Background(), "Task submitted", "workerID", selectedWorkerID, "taskData", task.data)
 
 	// Signal all waiting workers that there's a new task
@@ -1705,10 +1719,29 @@ func (p processedNotification) Close() {
 	}
 }
 
+type queuedNotification chan struct{}
+
+func NewQueuedNotification() queuedNotification {
+	return make(chan struct{}, 1)
+}
+
+func (p queuedNotification) Close() {
+	if p != nil {
+		close(p)
+	}
+}
+
 // WithBeingProcessed sets a channel to indicate that a task is being processed after dispatch
 func WithBeingProcessed[T any](chn processedNotification) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.beingProcessed = chn
+	}
+}
+
+// WithQueued sets a channel to indicate that a task is being processed after dispatch
+func WithQueued[T any](chn queuedNotification) TaskOption[T] {
+	return func(t *TaskWrapper[T]) {
+		t.beingQueued = chn
 	}
 }
 
