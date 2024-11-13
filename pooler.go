@@ -124,6 +124,11 @@ type TaskQueue[T any] interface {
 	RemoveAt(index int) (*TaskWrapper[T], error)
 	Length() int
 	Tasks() []*TaskWrapper[T]
+	Clear()
+}
+
+func (q *taskQueue[T]) Clear() {
+	q.tasks = nil
 }
 
 // taskQueue implements TaskQueue interface
@@ -430,6 +435,117 @@ func (p *Pool[T]) AddWorker(worker Worker[T], options ...WorkerOption[T]) int {
 
 	logs.Info(context.Background(), "Added new worker", "workerID", workerID)
 	return workerID
+}
+
+func (p *Pool[T]) RedistributeTasks() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Get all worker IDs
+	workerIDs := make([]int, 0, len(p.workers))
+	for workerID := range p.workers {
+		workerIDs = append(workerIDs, workerID)
+	}
+
+	// Collect worker data
+	workerProcessingTasks := make(map[int]int) // 1 if processing a task, 0 otherwise
+	workerQueueLengths := make(map[int]int)
+	totalTasks := 0
+
+	for _, workerID := range workerIDs {
+		queue, exists := p.taskQueues[workerID]
+		if !exists {
+			// Ensure every worker has a queue
+			queue = &taskQueue[T]{}
+			p.taskQueues[workerID] = queue
+		}
+		length := queue.Length()
+		workerQueueLengths[workerID] = length
+
+		// Check if the worker is processing a task
+		if state, exists := p.workers[workerID]; exists && state.currentTask != nil {
+			workerProcessingTasks[workerID] = 1
+		} else {
+			workerProcessingTasks[workerID] = 0
+		}
+
+		totalTasks += length + workerProcessingTasks[workerID]
+	}
+
+	numWorkers := len(workerIDs)
+	if numWorkers == 0 || totalTasks == 0 {
+		return
+	}
+
+	// Calculate desired total tasks per worker
+	baseTasksPerWorker := totalTasks / numWorkers
+	extraTasks := totalTasks % numWorkers
+
+	desiredTotalTasksPerWorker := make(map[int]int)
+	for _, workerID := range workerIDs {
+		desiredTotalTasksPerWorker[workerID] = baseTasksPerWorker
+		if extraTasks > 0 {
+			desiredTotalTasksPerWorker[workerID]++
+			extraTasks--
+		}
+	}
+
+	// Calculate desired queue lengths per worker
+	desiredQueueLengths := make(map[int]int)
+	for _, workerID := range workerIDs {
+		desiredQueueLengths[workerID] = desiredTotalTasksPerWorker[workerID] - workerProcessingTasks[workerID]
+		if desiredQueueLengths[workerID] < 0 {
+			desiredQueueLengths[workerID] = 0
+		}
+	}
+
+	// Initialize overfull and underfull workers lists
+	overfullWorkers := []int{}
+	underfullWorkers := []int{}
+
+	for _, workerID := range workerIDs {
+		length := workerQueueLengths[workerID]
+		desiredLength := desiredQueueLengths[workerID]
+		if length > desiredLength {
+			overfullWorkers = append(overfullWorkers, workerID)
+		} else if length < desiredLength {
+			underfullWorkers = append(underfullWorkers, workerID)
+		}
+	}
+
+	// Continue moving tasks until overfullWorkers and underfullWorkers are balanced
+	for len(overfullWorkers) > 0 && len(underfullWorkers) > 0 {
+		fromWorkerID := overfullWorkers[0]
+		fromQueue := p.taskQueues[fromWorkerID]
+		desiredFromLength := desiredQueueLengths[fromWorkerID]
+
+		toWorkerID := underfullWorkers[0]
+		toQueue := p.taskQueues[toWorkerID]
+		desiredToLength := desiredQueueLengths[toWorkerID]
+
+		// Move a task from fromWorkerID to toWorkerID
+		task, err := fromQueue.RemoveAt(0)
+		if err == nil {
+			toQueue.Enqueue(task)
+			workerQueueLengths[fromWorkerID]--
+			workerQueueLengths[toWorkerID]++
+
+			// Update overfull and underfull worker counts
+			if workerQueueLengths[fromWorkerID] <= desiredFromLength {
+				overfullWorkers = overfullWorkers[1:]
+			}
+
+			if workerQueueLengths[toWorkerID] >= desiredToLength {
+				underfullWorkers = underfullWorkers[1:]
+			}
+		} else {
+			// Cannot remove task, skip to next overfull worker
+			overfullWorkers = overfullWorkers[1:]
+		}
+	}
+
+	// Notify all workers in case they're waiting for tasks
+	p.cond.Broadcast()
 }
 
 func (p *Pool[T]) GetRandomWorkerID() int {
@@ -921,6 +1037,16 @@ const (
 	TaskStatusQueued TaskStatus = iota
 	TaskStatusProcessing
 )
+
+func (s TaskStatus) String() string {
+	switch s {
+	case TaskStatusQueued:
+		return "queued"
+	case TaskStatusProcessing:
+		return "processing"
+	}
+	return "unknown"
+}
 
 func (p *Pool[T]) RangeTasks(cb func(data *TaskWrapper[T], workerID int, status TaskStatus) bool) bool {
 	p.mu.Lock()
