@@ -313,6 +313,18 @@ func (p *Pool[T]) AvailableWorkers() int {
 	return availableSlots
 }
 
+// Range on workers through callback
+func (p *Pool[T]) RangeWorkers(callback func(workerID int, worker Worker[T]) bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for workerID, workerState := range p.workers {
+		if !callback(workerID, workerState.worker) {
+			break
+		}
+	}
+}
+
 // Shutdown stops the pool and waits for all workers to finish
 func (p *Pool[T]) Shutdown() error {
 	p.mu.Lock()
