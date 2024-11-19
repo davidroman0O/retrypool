@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,11 @@ func init() {
 		log.Printf("Goroutine stack dump:\n%s", buf)
 	}
 }
+
+// Define a public context key for the worker ID
+type workerIDKeyType struct{}
+
+var WorkerIDKey = workerIDKeyType{}
 
 // Predefined errors
 var (
@@ -827,6 +833,25 @@ func (p *Pool[T]) InterruptWorker(workerID int, options ...WorkerInterruptOption
 	return nil
 }
 
+func setWorkerIDFieldIfExists[T any](worker Worker[T], id int) {
+	rv := reflect.ValueOf(worker)
+	if rv.Kind() == reflect.Ptr {
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		// Not a struct; cannot set field
+		return
+	}
+	field := rv.FieldByName("ID")
+	if !field.IsValid() || !field.CanSet() {
+		// Field does not exist or cannot be set
+		return
+	}
+	if field.Kind() == reflect.Int {
+		field.SetInt(int64(id))
+	}
+}
+
 // workerLoop handles the lifecycle of a worker
 func (p *Pool[T]) workerLoop(workerID int) error {
 	logs.Debug(context.Background(), "Worker loop started", "workerID", workerID)
@@ -854,6 +879,9 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 	if !exists {
 		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
 	}
+
+	// Set the worker's ID field if it exists
+	setWorkerIDFieldIfExists(state.worker, workerID)
 
 	for {
 		select {
@@ -1157,6 +1185,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		return
 	}
 	defer attemptCancel()
+
+	// Set context ID key/value
+	attemptCtx = context.WithValue(attemptCtx, WorkerIDKey, workerID)
 
 	// Reset attempt-specific duration tracking
 	start := time.Now()
