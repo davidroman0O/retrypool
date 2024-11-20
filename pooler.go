@@ -994,7 +994,7 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 			return p.ctx.Err()
 		}
 
-		logs.Debug(context.Background(), "Worker is processing task", "workerID", workerID, "taskData", task.data)
+		logs.Debug(context.Background(), "Worker is processing task", "workerID", workerID)
 
 		p.runWorkerWithFailsafe(workerID, task)
 
@@ -1532,7 +1532,7 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error, forceRetry bool) 
 	task.scheduledTime = time.Now().Add(delay)
 	task.mu.Unlock()
 
-	logs.Debug(context.Background(), "Requeuing task", "taskData", task.data, "retries", task.retries, "delay", delay)
+	logs.Debug(context.Background(), "Requeuing task", "delay", delay)
 
 	if !immediateRetry {
 		// Randomly select a worker that hasn't tried this task
@@ -1652,7 +1652,7 @@ func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	idx := len(p.deadTasks)
 	p.deadTasks = append(p.deadTasks, deadTask)
 
-	logs.Warn(context.Background(), "Task added to dead tasks", "taskData", task.data, "retries", task.retries, "errors", errors)
+	logs.Warn(context.Background(), "Task added to dead tasks", "errors", errors)
 
 	// Increment dead tasks metric
 	atomic.AddInt64(&p.metrics.DeadTasks, 1)
