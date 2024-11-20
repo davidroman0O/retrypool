@@ -446,11 +446,15 @@ func (p *Pool[T]) AddWorker(worker Worker[T], options ...WorkerOption[T]) int {
 		}
 	}
 
+	group := p.errGroup
+	p.mu.Unlock()
+
 	// Start worker
-	p.errGroup.Go(func() error {
+	group.Go(func() error {
 		return p.workerLoop(workerID)
 	})
 
+	p.mu.Lock()
 	p.cond.Broadcast()
 	p.mu.Unlock()
 
@@ -1271,6 +1275,22 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	task.mu.Unlock()
 	p.mu.Unlock()
 
+	p.mu.Lock()
+	task.mu.Lock()
+	var data T = task.data
+	var retries int = task.retries
+	var totalDuration time.Duration = task.totalDuration
+	var timeLimit time.Duration = task.timeLimit
+	var maxDuration time.Duration = task.maxDuration
+	var scheduledTime time.Time = task.scheduledTime
+	var triedWorkers map[int]bool = task.triedWorkers
+	var taskErrors []error = task.errors
+	var durations []time.Duration = task.durations
+	var queuedAt []time.Time = task.queuedAt
+	var processedAt []time.Time = task.processedAt
+	task.mu.Unlock()
+	p.mu.Unlock()
+
 	if err != nil {
 		p.mu.Lock()
 		task.errors = append(task.errors, err)
@@ -1300,9 +1320,25 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		if p.config.onTaskFailure != nil {
 			p.mu.Lock()
 			state, exists := p.workers[workerID]
+			worker := state.worker
 			p.mu.Unlock()
 			if exists {
-				action = p.config.onTaskFailure(p, workerID, state.worker, task, err)
+				action = p.config.onTaskFailure(
+					p,
+					workerID,
+					worker,
+					data,
+					retries,
+					totalDuration,
+					timeLimit,
+					maxDuration,
+					scheduledTime,
+					triedWorkers,
+					taskErrors,
+					durations,
+					queuedAt,
+					processedAt,
+					err)
 			}
 		}
 
@@ -1320,7 +1356,24 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		case DeadTaskActionRetry:
 			if err != context.Canceled && err != context.DeadlineExceeded && p.config.retryIf(err) && task.retries < p.config.attempts {
 				logs.Debug(context.Background(), "Retrying task", "workerID", workerID, "attempt", task.retries, "error", err)
-				p.config.onRetry(task.retries, err, task)
+
+				p.mu.Lock()
+				p.config.onRetry(
+					err,
+					data,
+					retries,
+					totalDuration,
+					timeLimit,
+					maxDuration,
+					scheduledTime,
+					triedWorkers,
+					taskErrors,
+					durations,
+					queuedAt,
+					processedAt,
+				)
+				p.mu.Unlock()
+
 				p.requeueTask(task, err, false)
 			} else {
 				if task.beingProcessed != nil {
@@ -1335,7 +1388,24 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			}
 		case DeadTaskActionForceRetry:
 			logs.Debug(context.Background(), "Force retrying task", "workerID", workerID, "attempt", task.retries, "error", err)
-			p.config.onRetry(task.retries, err, task)
+
+			p.mu.Lock()
+			p.config.onRetry(
+				err,
+				data,
+				retries,
+				totalDuration,
+				timeLimit,
+				maxDuration,
+				scheduledTime,
+				triedWorkers,
+				taskErrors,
+				durations,
+				queuedAt,
+				processedAt,
+			)
+			p.mu.Unlock()
+
 			p.requeueTask(task, err, true)
 		case DeadTaskActionDoNothing:
 			// Do nothing, as requested
@@ -1347,13 +1417,34 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		if p.config.onTaskSuccess != nil {
 			p.mu.Lock()
 			state, exists := p.workers[workerID]
-			p.mu.Unlock()
+			worker := state.worker
 			if exists {
-				p.config.onTaskSuccess(p, workerID, state.worker, task)
+				p.config.onTaskSuccess(
+					p,
+					workerID,
+					worker,
+					data,
+					retries,
+					totalDuration,
+					timeLimit,
+					maxDuration,
+					scheduledTime,
+					triedWorkers,
+					taskErrors,
+					durations,
+					queuedAt,
+					processedAt,
+				)
 			}
+			p.mu.Unlock()
 		}
 
-		logs.Debug(context.Background(), "Task completed successfully", "workerID", workerID, "taskData", task.data)
+		p.mu.Lock()
+		task.mu.Lock()
+		copyData := task.data
+		task.mu.Unlock()
+		p.mu.Unlock()
+		logs.Debug(context.Background(), "Task completed successfully", "workerID", workerID, "taskData", copyData)
 
 		if task.beingProcessed != nil {
 			task.beingProcessed.Close()
@@ -1674,7 +1765,11 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 		task.beingQueued.Notify()
 	}
 
-	logs.Debug(context.Background(), "Task submitted", "workerID", selectedWorkerID, "taskData", task.data)
+	task.mu.Lock()
+	dataCopy := task.data // Make a copy if necessary
+	task.mu.Unlock()
+
+	logs.Debug(context.Background(), "Task submitted", "workerID", selectedWorkerID, "taskData", dataCopy)
 
 	// Signal all waiting workers that there's a new task
 	p.cond.Broadcast()
@@ -1769,7 +1864,8 @@ func newDefaultConfig[T any]() Config[T] {
 		attempts:  1,
 		delay:     1 * time.Nanosecond,
 		maxJitter: 1 * time.Nanosecond,
-		onRetry:   func(n int, err error, task *TaskWrapper[T]) {},
+		onRetry: func(err error, data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time) {
+		},
 		retryIf: func(err error) bool {
 			return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 		},
@@ -2016,7 +2112,7 @@ func WithQueued[T any](chn *queuedNotification) TaskOption[T] {
 type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duration
 
 // OnRetryFunc signature
-type OnRetryFunc[T any] func(attempt int, err error, task *TaskWrapper[T])
+type OnRetryFunc[T any] func(err error, data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time)
 
 // DeadTaskAction represents the action to take for a failed task
 type DeadTaskAction int
@@ -2029,10 +2125,10 @@ const (
 )
 
 // OnTaskSuccessFunc is the type of function called when a task succeeds
-type OnTaskSuccessFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T])
+type OnTaskSuccessFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time)
 
 // OnTaskFailureFunc is the type of function called when a task fails
-type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T], err error) DeadTaskAction
+type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time, err error) DeadTaskAction
 
 // OnNewDeadTaskFunc is a new type for handling new dead tasks
 type OnNewDeadTaskFunc[T any] func(task *DeadTask[T], idx int)

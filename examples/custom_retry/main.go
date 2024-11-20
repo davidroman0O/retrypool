@@ -25,8 +25,8 @@ func main() {
 	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[int](3),
 		retrypool.WithDelay[int](time.Second),
-		retrypool.WithOnRetry[int](func(attempt int, err error, task *retrypool.TaskWrapper[int]) {
-			log.Printf("Retrying task %d, attempt %d: %v", task, attempt, err)
+		retrypool.WithOnRetry[int](func(err error, data int, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time) {
+			log.Printf("Retrying task %d, attempt %d: %v", data, retries, err)
 		}),
 	)
 

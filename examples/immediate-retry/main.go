@@ -54,15 +54,15 @@ func main() {
 	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[Task](retrypool.UnlimitedAttempts),
 		retrypool.WithDelay[Task](50*time.Millisecond),
-		retrypool.WithOnRetry[Task](func(attempt int, err error, task *retrypool.TaskWrapper[Task]) {
-			workers := task.TriedWorkers()
+		retrypool.WithOnRetry[Task](func(err error, data Task, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time) {
+			workers := triedWorkers
 			tried := []int{}
 			for k, v := range workers {
 				if v {
 					tried = append(tried, k)
 				}
 			}
-			log.Printf("Retrying task %d (attempt %d - %v): %v", task.Data().ID, attempt, tried, err)
+			log.Printf("Retrying task %d (attempt %d - %v): %v", data.ID, retries, tried, err)
 		}),
 	)
 

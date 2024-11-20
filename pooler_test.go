@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -205,12 +206,12 @@ func TestAddWorkerDynamically(t *testing.T) {
 
 	// Create pool with initial worker
 	pool := New(ctx, []Worker[int]{initialWorker},
-		WithOnTaskSuccess[int](func(_ WorkerController[int], workerID int, _ Worker[int], task *TaskWrapper[int]) {
+		WithOnTaskSuccess[int](func(_ WorkerController[int], workerID int, _ Worker[int], data int, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time) {
 			taskMu.Lock()
 			if workerID == 0 {
-				worker1Tasks = append(worker1Tasks, task.Data())
+				worker1Tasks = append(worker1Tasks, data)
 			} else {
-				worker2Tasks = append(worker2Tasks, task.Data())
+				worker2Tasks = append(worker2Tasks, data)
 			}
 			taskMu.Unlock()
 		}),
@@ -588,12 +589,12 @@ func TestCallbacksAreInvoked(t *testing.T) {
 	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](2),
 		WithRetryIf[int](func(err error) bool { return true }),
-		WithOnTaskSuccess[int](func(c WorkerController[int], id int, w Worker[int], t *TaskWrapper[int]) {
+		WithOnTaskSuccess[int](func(c WorkerController[int], id int, w Worker[int], data int, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time) {
 			mu.Lock()
 			successCalled = true
 			mu.Unlock()
 		}),
-		WithOnTaskFailure[int](func(c WorkerController[int], id int, w Worker[int], t *TaskWrapper[int], e error) DeadTaskAction {
+		WithOnTaskFailure[int](func(c WorkerController[int], id int, w Worker[int], data int, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time, err error) DeadTaskAction {
 			mu.Lock()
 			failureCalled = true
 			mu.Unlock()
@@ -736,7 +737,7 @@ func TestOnTaskFailureDeadTaskAction(t *testing.T) {
 	pool := New(ctx, []Worker[int]{worker},
 		WithAttempts[int](5),
 		WithRetryIf[int](func(err error) bool { return true }),
-		WithOnTaskFailure[int](func(c WorkerController[int], id int, w Worker[int], t *TaskWrapper[int], e error) DeadTaskAction {
+		WithOnTaskFailure[int](func(c WorkerController[int], id int, w Worker[int], data int, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time, err error) DeadTaskAction {
 			action := actionSequence[actionIndex]
 			actionIndex++
 			return action
@@ -845,8 +846,8 @@ func TestCombinedFeaturesWithDynamicWorkers(t *testing.T) {
 	pool := New(ctx, []Worker[int]{worker1},
 		WithLogLevel[int](logs.LevelDebug),
 		WithAttempts[int](1), // No retries to keep things simple
-		WithOnTaskSuccess[int](func(_ WorkerController[int], workerID int, _ Worker[int], task *TaskWrapper[int]) {
-			completedTasks.Store(task.Data(), taskResult{
+		WithOnTaskSuccess[int](func(_ WorkerController[int], workerID int, _ Worker[int], data int, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time) {
+			completedTasks.Store(data, taskResult{
 				workerID:  workerID,
 				timestamp: time.Now(),
 			})
@@ -1173,4 +1174,51 @@ func TestTaskTimingMetrics(t *testing.T) {
 	}
 
 	pool.Shutdown()
+}
+
+type simpleTestWorker struct{}
+
+func (w *simpleTestWorker) Run(ctx context.Context, data int) error {
+	time.Sleep(time.Duration(data) * time.Millisecond)
+	fmt.Printf("Processed: %d\n", data)
+	return nil
+}
+
+func TestProcessedNotification(t *testing.T) {
+
+	ctx := context.Background()
+	workers := []Worker[int]{&simpleTestWorker{}, &simpleTestWorker{}}
+	pool := New(ctx, workers)
+
+	whenQueued := NewQueuedNotification()
+	err := pool.Submit(1, WithQueued[int](whenQueued))
+	if err != nil {
+		log.Printf("Dispatch error: %v", err)
+	}
+	<-whenQueued.Done()
+
+	whenProcessed := NewProcessedNotification()
+	err = pool.Submit(2, WithBeingProcessed[int](whenProcessed))
+	if err != nil {
+		log.Printf("Dispatch error: %v", err)
+	}
+	<-whenProcessed.Done()
+
+	whenProcessed2 := NewProcessedNotification()
+	whenQueued2 := NewQueuedNotification()
+	err = pool.Submit(3, WithQueued[int](whenQueued2), WithBeingProcessed[int](whenProcessed2))
+	if err != nil {
+		log.Printf("Dispatch error: %v", err)
+	}
+	<-whenQueued2.Done()
+	<-whenProcessed2.Done()
+
+	err = pool.Submit(4)
+	if err != nil {
+		log.Printf("Dispatch error: %v", err)
+	}
+
+	pool.Shutdown()
+	fmt.Println("All tasks completed")
+
 }

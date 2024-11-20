@@ -44,11 +44,11 @@ func main() {
 	var pool *retrypool.Pool[*MyTask]
 	pool = retrypool.New(ctx, workers,
 		retrypool.WithAttempts[*MyTask](5),
-		retrypool.WithOnTaskFailure[*MyTask](func(controller retrypool.WorkerController[*MyTask], workerID int, worker retrypool.Worker[*MyTask], task *retrypool.TaskWrapper[*MyTask], err error) retrypool.DeadTaskAction {
-			myTask := task.Data()
-			fmt.Printf("Task %d failed (attempt %d): %v\n", myTask.ID, task.Retries()+1, err)
+		retrypool.WithOnTaskFailure[*MyTask](func(controller retrypool.WorkerController[*MyTask], workerID int, worker retrypool.Worker[*MyTask], data *MyTask, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time, err error) retrypool.DeadTaskAction {
+			myTask := data
+			fmt.Printf("Task %d failed (attempt %d): %v\n", myTask.ID, retries+1, err)
 
-			if task.Retries() >= 2 {
+			if retries >= 2 {
 				fmt.Printf("Task %d has failed too many times, adding to dead tasks\n", myTask.ID)
 				return retrypool.DeadTaskActionAddToDeadTasks
 			}

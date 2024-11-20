@@ -119,8 +119,8 @@ func main() {
 		retrypool.WithDelay[*retrypool.RequestResponse[Data, error]](time.Second),
 		retrypool.WithMaxDelay[*retrypool.RequestResponse[Data, error]](5*time.Second),
 		retrypool.WithMaxJitter[*retrypool.RequestResponse[Data, error]](500*time.Millisecond),
-		retrypool.WithOnRetry[*retrypool.RequestResponse[Data, error]](func(attempt int, err error, task *retrypool.TaskWrapper[*retrypool.RequestResponse[Data, error]]) {
-			log.Printf("Retrying task (URL: %s) after attempt %d: %v", task.Data().Request.URL, attempt, err)
+		retrypool.WithOnRetry[*retrypool.RequestResponse[Data, error]](func(err error, data *retrypool.RequestResponse[Data, error], retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time) {
+			log.Printf("Retrying task (URL: %s) after attempt %d: %v", data.Request.URL, retries, err)
 		}),
 	)
 

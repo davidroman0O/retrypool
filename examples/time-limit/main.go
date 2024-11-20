@@ -36,11 +36,11 @@ func main() {
 
 	pool := retrypool.New(ctx, workers,
 		retrypool.WithAttempts[SimulatedTask](1), // No retries for this example
-		retrypool.WithOnTaskSuccess[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask]) {
-			fmt.Printf("Task %d succeeded\n", task.Data().ID)
+		retrypool.WithOnTaskSuccess[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], data SimulatedTask, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time) {
+			fmt.Printf("Task %d succeeded\n", data.ID)
 		}),
-		retrypool.WithOnTaskFailure[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], task *retrypool.TaskWrapper[SimulatedTask], err error) retrypool.DeadTaskAction {
-			fmt.Printf("Task %d failed: %v\n", task.Data().ID, err)
+		retrypool.WithOnTaskFailure[SimulatedTask](func(_ retrypool.WorkerController[SimulatedTask], _ int, _ retrypool.Worker[SimulatedTask], data SimulatedTask, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time, err error) retrypool.DeadTaskAction {
+			fmt.Printf("Task %d failed: %v\n", data.ID, err)
 			return retrypool.DeadTaskActionRetry
 		}),
 	)

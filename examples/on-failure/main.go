@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/davidroman0O/retrypool"
 )
@@ -29,12 +30,12 @@ func main() {
 	ctx := context.Background()
 
 	// Define custom OnTaskFailure to control retry behavior.
-	onTaskFailure := func(controller retrypool.WorkerController[MyTask], workerID int, worker retrypool.Worker[MyTask], task *retrypool.TaskWrapper[MyTask], err error) retrypool.DeadTaskAction {
-		if task.Retries() >= 3 {
-			fmt.Printf("Task %d failed after %d retries. Not retrying further.\n", task.Data().ID, task.Retries())
+	onTaskFailure := func(controller retrypool.WorkerController[MyTask], workerID int, worker retrypool.Worker[MyTask], data MyTask, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time, err error) retrypool.DeadTaskAction {
+		if retries >= 3 {
+			fmt.Printf("Task %d failed after %d retries. Not retrying further.\n", data.ID, retries)
 			return retrypool.DeadTaskActionAddToDeadTasks
 		}
-		fmt.Printf("Retrying task %d (retry %d)\n", task.Data().ID, task.Retries())
+		fmt.Printf("Retrying task %d (retry %d)\n", data.ID, retries)
 		return retrypool.DeadTaskActionRetry
 	}
 
