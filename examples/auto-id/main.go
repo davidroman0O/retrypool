@@ -19,6 +19,10 @@ func (w *SimpleWorker) Run(ctx context.Context, data int) error {
 	return nil
 }
 
+func (w *SimpleWorker) OnStart(ctx context.Context) {
+	fmt.Println("starting worker", w.ID)
+}
+
 func main() {
 	ctx := context.Background()
 	workers := []retrypool.Worker[int]{&SimpleWorker{}, &SimpleWorker{}}

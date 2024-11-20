@@ -340,7 +340,7 @@ func (p *Pool[T]) Shutdown() error {
 	}
 	p.closed = true
 	p.stopped = true
-	p.cancel()
+	p.cancel() // TODO: maybe we shouldn't cancel the context here
 	p.mu.Unlock()
 
 	logs.Info(context.Background(), "Pool is shutting down")
@@ -850,6 +850,20 @@ func setWorkerIDFieldIfExists[T any](worker Worker[T], id int) {
 	if field.Kind() == reflect.Int {
 		field.SetInt(int64(id))
 	}
+
+	// Check if worker has OnStart method and call it
+	method := rv.MethodByName("OnStart")
+	if !method.IsValid() {
+		// Try pointer receiver
+		method = rv.Addr().MethodByName("OnStart")
+		if !method.IsValid() {
+			// OnStart method not found
+			return
+		}
+	}
+
+	ctx := context.Background()
+	method.Call([]reflect.Value{reflect.ValueOf(ctx)})
 }
 
 // workerLoop handles the lifecycle of a worker
