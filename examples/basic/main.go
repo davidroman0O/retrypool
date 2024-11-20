@@ -27,14 +27,14 @@ func main() {
 	if err != nil {
 		log.Printf("Dispatch error: %v", err)
 	}
-	<-whenQueued
+	<-whenQueued.Done()
 
 	whenProcessed := retrypool.NewProcessedNotification()
 	err = pool.Submit(2, retrypool.WithBeingProcessed[int](whenProcessed))
 	if err != nil {
 		log.Printf("Dispatch error: %v", err)
 	}
-	<-whenProcessed
+	<-whenProcessed.Done()
 
 	whenProcessed2 := retrypool.NewProcessedNotification()
 	whenQueued2 := retrypool.NewQueuedNotification()
@@ -42,8 +42,8 @@ func main() {
 	if err != nil {
 		log.Printf("Dispatch error: %v", err)
 	}
-	<-whenQueued2
-	<-whenProcessed2
+	<-whenQueued2.Done()
+	<-whenProcessed2.Done()
 
 	err = pool.Submit(4)
 	if err != nil {

@@ -76,8 +76,8 @@ type TaskWrapper[T any] struct {
 
 	immediateRetry bool
 
-	beingProcessed processedNotification // optional
-	beingQueued    queuedNotification    // optional
+	beingProcessed *processedNotification // optional
+	beingQueued    *queuedNotification    // optional
 
 	queuedAt    []time.Time
 	processedAt []time.Time
@@ -199,6 +199,8 @@ type Config[T any] struct {
 	logLevel logs.Level
 
 	roundRobinDistribution bool // Distribute tasks round-robin among workers
+
+	maxQueueSize int // Maximum size of the task queue
 }
 
 // workerState holds all per-worker data
@@ -340,7 +342,6 @@ func (p *Pool[T]) Shutdown() error {
 	}
 	p.closed = true
 	p.stopped = true
-	p.cancel() // TODO: maybe we shouldn't cancel the context here
 	p.mu.Unlock()
 
 	logs.Info(context.Background(), "Pool is shutting down")
@@ -363,6 +364,8 @@ func (p *Pool[T]) Shutdown() error {
 		delete(p.taskQueues, workerID) // Clear the queue after moving tasks
 	}
 	p.mu.Unlock()
+
+	p.cancel() // TODO: maybe we shouldn't cancel the context here
 
 	return err
 }
@@ -895,7 +898,9 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 	}
 
 	// Set the worker's ID field if it exists
+	p.mu.Lock()
 	setWorkerIDFieldIfExists(state.worker, workerID)
+	p.mu.Unlock()
 
 	for {
 		select {
@@ -1210,7 +1215,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 
 	// Notify the task that it's being processed
 	if task.beingProcessed != nil {
-		task.beingProcessed <- struct{}{}
+		task.beingProcessed.Notify()
 	}
 
 	// Collect when the task was processed
@@ -1246,25 +1251,30 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		// Attempt to run the worker
 		p.mu.Lock()
 		state, exists := p.workers[workerID]
-		p.mu.Unlock()
 		if !exists {
+			p.mu.Unlock()
 			err = fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
 			return
 		}
-		err = state.worker.Run(attemptCtx, task.data)
+		worker := state.worker
+		p.mu.Unlock()
+		err = worker.Run(attemptCtx, task.data)
 	}()
 
 	duration := time.Since(start)
 
 	// Safely update shared fields
 	p.mu.Lock()
+	task.mu.Lock()
 	task.totalDuration += duration
 	task.durations = append(task.durations, duration)
+	task.mu.Unlock()
 	p.mu.Unlock()
 
 	if err != nil {
 		p.mu.Lock()
 		task.errors = append(task.errors, err)
+		interrupted := p.workers[workerID].interrupted
 		p.mu.Unlock()
 
 		// Increment tasks failed metric
@@ -1274,6 +1284,13 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			// Exceeded maxDuration or time limit
 			logs.Warn(context.Background(), "Task exceeded time limit or was canceled", "workerID", workerID, "error", err)
+
+			if errors.Is(err, context.Canceled) && interrupted {
+				// Worker was interrupted; do not requeue the task here since InterruptWorker already did
+				logs.Debug(context.Background(), "Worker was interrupted, not requeuing task", "workerID", workerID, "taskData", task.data)
+				return
+			}
+
 			p.requeueTask(task, err, false)
 			return
 		}
@@ -1293,9 +1310,11 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		case DeadTaskActionAddToDeadTasks:
 			if task.beingProcessed != nil {
 				task.beingProcessed.Close()
+				task.beingProcessed = nil
 			}
 			if task.beingQueued != nil {
 				task.beingQueued.Close()
+				task.beingQueued = nil
 			}
 			p.addToDeadTasks(task, err)
 		case DeadTaskActionRetry:
@@ -1306,9 +1325,11 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			} else {
 				if task.beingProcessed != nil {
 					task.beingProcessed.Close()
+					task.beingProcessed = nil
 				}
 				if task.beingQueued != nil {
 					task.beingQueued.Close()
+					task.beingQueued = nil
 				}
 				p.addToDeadTasks(task, err)
 			}
@@ -1336,9 +1357,11 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 
 		if task.beingProcessed != nil {
 			task.beingProcessed.Close()
+			task.beingProcessed = nil
 		}
 		if task.beingQueued != nil {
 			task.beingQueued.Close()
+			task.beingQueued = nil
 		}
 	}
 }
@@ -1388,6 +1411,9 @@ func (p *Pool[T]) createAttemptContext(task *TaskWrapper[T], workerCtx context.C
 
 // requeueTask updated to handle delays and keep triedWorkers intact
 func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error, forceRetry bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	// First take task lock
 	task.mu.Lock()
 	task.retries++
@@ -1403,8 +1429,6 @@ func (p *Pool[T]) requeueTask(task *TaskWrapper[T], err error, forceRetry bool) 
 	}
 
 	// Now take pool lock for queue operations
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if !forceRetry && p.config.attempts != UnlimitedAttempts && maxAttempts {
 		p.addToDeadTasks(task, err)
@@ -1518,10 +1542,13 @@ func (p *Pool[T]) calculateDelay(n int, err error) time.Duration {
 func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	p.deadTasksMutex.Lock()
 
+	task.mu.Lock()
 	totalDuration := task.totalDuration
 	for _, duration := range task.durations {
 		totalDuration += duration
 	}
+	task.mu.Unlock()
+
 	errors := make([]error, len(task.errors))
 	copy(errors, task.errors)
 	if finalError != nil && (len(errors) == 0 || finalError.Error() != errors[len(errors)-1].Error()) {
@@ -1560,8 +1587,18 @@ func (task *TaskWrapper[T]) reset() {
 	task.queuedAt = []time.Time{}
 }
 
+var ErrMaxQueueSizeExceeded = errors.New("max queue size exceeded")
+
 // Submit adds a new task to the pool
+// TODO: add a limit
 func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
+
+	if p.config.maxQueueSize > 0 {
+		if p.QueueSize() >= p.config.maxQueueSize {
+			return ErrMaxQueueSizeExceeded
+		}
+	}
+
 	if p.limiter != nil {
 		// Wait for rate limiter
 		if err := p.limiter.Wait(p.ctx); err != nil {
@@ -1634,7 +1671,7 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	q.Enqueue(task)
 
 	if task.beingQueued != nil {
-		task.beingQueued <- struct{}{}
+		task.beingQueued.Notify()
 	}
 
 	logs.Debug(context.Background(), "Task submitted", "workerID", selectedWorkerID, "taskData", task.data)
@@ -1743,6 +1780,8 @@ func newDefaultConfig[T any]() Config[T] {
 		onTaskFailure: nil, // Default is nil; can be set via options
 
 		logLevel: logs.LevelError,
+
+		maxQueueSize: -1,
 	}
 }
 
@@ -1859,6 +1898,13 @@ func WithRateLimit[T any](rps float64) Option[T] {
 	}
 }
 
+// WithMaxQueueSize sets the maximum queue size for the pool
+func WithMaxQueueSize[T any](size int) Option[T] {
+	return func(p *Pool[T]) {
+		p.config.maxQueueSize = size
+	}
+}
+
 // TaskOption functions for configuring individual tasks
 
 // WithMaxContextDuration TaskOption to set per-attempt max duration
@@ -1894,39 +1940,73 @@ func WithWorkerContext[T any](fn ContextFunc) WorkerOption[T] {
 	}
 }
 
-type processedNotification chan struct{}
-
-func NewProcessedNotification() processedNotification {
-	return make(chan struct{}, 1)
+type processedNotification struct {
+	once   sync.Once
+	ch     chan struct{}
+	closed bool
 }
 
-func (p processedNotification) Close() {
-	if p != nil {
-		close(p)
+func NewProcessedNotification() *processedNotification {
+	return &processedNotification{
+		ch: make(chan struct{}, 1),
 	}
 }
 
-type queuedNotification chan struct{}
-
-func NewQueuedNotification() queuedNotification {
-	return make(chan struct{}, 1)
+func (p *processedNotification) Notify() {
+	if !p.closed {
+		p.ch <- struct{}{}
+	}
 }
 
-func (p queuedNotification) Close() {
-	if p != nil {
-		close(p)
+func (p *processedNotification) Close() {
+	p.once.Do(func() {
+		close(p.ch)
+		p.closed = true
+	})
+}
+
+func (p *processedNotification) Done() <-chan struct{} {
+	return p.ch
+}
+
+type queuedNotification struct {
+	once   sync.Once
+	ch     chan struct{}
+	closed bool
+}
+
+func NewQueuedNotification() *queuedNotification {
+	return &queuedNotification{
+		ch: make(chan struct{}, 1),
 	}
+}
+
+func (p *queuedNotification) Notify() {
+	if !p.closed {
+		p.ch <- struct{}{}
+	}
+}
+
+func (p *queuedNotification) Close() {
+	p.once.Do(func() {
+		close(p.ch)
+		p.closed = true
+	})
+}
+
+func (p *queuedNotification) Done() <-chan struct{} {
+	return p.ch
 }
 
 // WithBeingProcessed sets a channel to indicate that a task is being processed after dispatch
-func WithBeingProcessed[T any](chn processedNotification) TaskOption[T] {
+func WithBeingProcessed[T any](chn *processedNotification) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.beingProcessed = chn
 	}
 }
 
 // WithQueued sets a channel to indicate that a task is being processed after dispatch
-func WithQueued[T any](chn queuedNotification) TaskOption[T] {
+func WithQueued[T any](chn *queuedNotification) TaskOption[T] {
 	return func(t *TaskWrapper[T]) {
 		t.beingQueued = chn
 	}
