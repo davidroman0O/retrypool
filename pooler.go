@@ -1230,8 +1230,24 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	// Increment tasks processed metric
 	atomic.AddInt64(&p.metrics.TasksProcessed, 1)
 
+	p.mu.Lock()
+	task.mu.Lock()
+	var data T = task.data
+	var retries int = task.retries
+	var totalDuration time.Duration = task.totalDuration
+	var timeLimit time.Duration = task.timeLimit
+	var maxDuration time.Duration = task.maxDuration
+	var scheduledTime time.Time = task.scheduledTime
+	var triedWorkers map[int]bool = task.triedWorkers
+	var taskErrors []error = task.errors
+	var durations []time.Duration = task.durations
+	var queuedAt []time.Time = task.queuedAt
+	var processedAt []time.Time = task.processedAt
+	task.mu.Unlock()
+	p.mu.Unlock()
+
 	// Attempt to run the worker within a panic-catching function
-	func() {
+	func(taskData T) {
 		defer func() {
 			if r := recover(); r != nil {
 				// Capture the stack trace
@@ -1244,7 +1260,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 
 				if p.config.panicHandler != nil {
 					// Call the panic handler with the task, panic error, and stack trace
-					p.config.panicHandler(task.Data(), r, stackTrace)
+					p.config.panicHandler(taskData, r, stackTrace)
 				}
 
 				// Log the panic
@@ -1262,8 +1278,9 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 		}
 		worker := state.worker
 		p.mu.Unlock()
-		err = worker.Run(attemptCtx, task.data)
-	}()
+
+		err = worker.Run(attemptCtx, taskData)
+	}(data)
 
 	duration := time.Since(start)
 
@@ -1272,22 +1289,6 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 	task.mu.Lock()
 	task.totalDuration += duration
 	task.durations = append(task.durations, duration)
-	task.mu.Unlock()
-	p.mu.Unlock()
-
-	p.mu.Lock()
-	task.mu.Lock()
-	var data T = task.data
-	var retries int = task.retries
-	var totalDuration time.Duration = task.totalDuration
-	var timeLimit time.Duration = task.timeLimit
-	var maxDuration time.Duration = task.maxDuration
-	var scheduledTime time.Time = task.scheduledTime
-	var triedWorkers map[int]bool = task.triedWorkers
-	var taskErrors []error = task.errors
-	var durations []time.Duration = task.durations
-	var queuedAt []time.Time = task.queuedAt
-	var processedAt []time.Time = task.processedAt
 	task.mu.Unlock()
 	p.mu.Unlock()
 
@@ -1307,7 +1308,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 
 			if errors.Is(err, context.Canceled) && interrupted {
 				// Worker was interrupted; do not requeue the task here since InterruptWorker already did
-				logs.Debug(context.Background(), "Worker was interrupted, not requeuing task", "workerID", workerID, "taskData", task.data)
+				logs.Debug(context.Background(), "Worker was interrupted, not requeuing task", "workerID", workerID)
 				return
 			}
 
@@ -1354,8 +1355,8 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			}
 			p.addToDeadTasks(task, err)
 		case DeadTaskActionRetry:
-			if err != context.Canceled && err != context.DeadlineExceeded && p.config.retryIf(err) && task.retries < p.config.attempts {
-				logs.Debug(context.Background(), "Retrying task", "workerID", workerID, "attempt", task.retries, "error", err)
+			if err != context.Canceled && err != context.DeadlineExceeded && p.config.retryIf(err) && retries < p.config.attempts {
+				logs.Debug(context.Background(), "Retrying task", "workerID", workerID, "attempt", retries, "error", err)
 
 				p.mu.Lock()
 				p.config.onRetry(
@@ -1387,7 +1388,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 				p.addToDeadTasks(task, err)
 			}
 		case DeadTaskActionForceRetry:
-			logs.Debug(context.Background(), "Force retrying task", "workerID", workerID, "attempt", task.retries, "error", err)
+			logs.Debug(context.Background(), "Force retrying task", "workerID", workerID, "attempt", retries, "error", err)
 
 			p.mu.Lock()
 			p.config.onRetry(
@@ -1439,12 +1440,7 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			p.mu.Unlock()
 		}
 
-		p.mu.Lock()
-		task.mu.Lock()
-		copyData := task.data
-		task.mu.Unlock()
-		p.mu.Unlock()
-		logs.Debug(context.Background(), "Task completed successfully", "workerID", workerID, "taskData", copyData)
+		logs.Debug(context.Background(), "Task completed successfully", "workerID", workerID)
 
 		if task.beingProcessed != nil {
 			task.beingProcessed.Close()
