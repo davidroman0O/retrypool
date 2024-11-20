@@ -1009,6 +1009,8 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 		p.processing--
 		p.cond.Signal()
 		p.mu.Unlock()
+
+		runtime.Gosched() // just give room for other goroutines
 	}
 }
 
