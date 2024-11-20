@@ -2112,7 +2112,7 @@ func WithQueued[T any](chn *queuedNotification) TaskOption[T] {
 type DelayTypeFunc[T any] func(n int, err error, config *Config[T]) time.Duration
 
 // OnRetryFunc signature
-type OnRetryFunc[T any] func(err error, data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time)
+type OnRetryFunc[T any] func(err error, data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, taskErrors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time)
 
 // DeadTaskAction represents the action to take for a failed task
 type DeadTaskAction int
@@ -2125,10 +2125,10 @@ const (
 )
 
 // OnTaskSuccessFunc is the type of function called when a task succeeds
-type OnTaskSuccessFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time)
+type OnTaskSuccessFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, taskErrors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time)
 
 // OnTaskFailureFunc is the type of function called when a task fails
-type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, errors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time, err error) DeadTaskAction
+type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], data T, retries int, totalDuration time.Duration, timeLimit time.Duration, maxDuration time.Duration, scheduledTime time.Time, triedWorkers map[int]bool, taskErrors []error, durations []time.Duration, queuedAt []time.Time, processedAt []time.Time, err error) DeadTaskAction
 
 // OnNewDeadTaskFunc is a new type for handling new dead tasks
 type OnNewDeadTaskFunc[T any] func(task *DeadTask[T], idx int)
