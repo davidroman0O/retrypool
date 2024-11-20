@@ -599,7 +599,7 @@ func TestCallbacksAreInvoked(t *testing.T) {
 			mu.Unlock()
 			return DeadTaskActionRetry
 		}),
-		WithOnNewDeadTask[int](func(t *DeadTask[int]) {
+		WithOnNewDeadTask[int](func(t *DeadTask[int], idx int) {
 			mu.Lock()
 			newDeadTaskCalled = true
 			mu.Unlock()

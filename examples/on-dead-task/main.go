@@ -41,7 +41,8 @@ func main() {
 		&MyWorker{},
 	}
 
-	pool := retrypool.New(ctx, workers,
+	var pool *retrypool.Pool[*MyTask]
+	pool = retrypool.New(ctx, workers,
 		retrypool.WithAttempts[*MyTask](5),
 		retrypool.WithOnTaskFailure[*MyTask](func(controller retrypool.WorkerController[*MyTask], workerID int, worker retrypool.Worker[*MyTask], task *retrypool.TaskWrapper[*MyTask], err error) retrypool.DeadTaskAction {
 			myTask := task.Data()
@@ -53,9 +54,15 @@ func main() {
 			}
 			return retrypool.DeadTaskActionRetry
 		}),
-		retrypool.WithOnNewDeadTask[*MyTask](func(deadTask *retrypool.DeadTask[*MyTask]) {
-			fmt.Printf("New dead task: ID %d, Retries %d, Total Duration %v\n",
-				deadTask.Data.ID, deadTask.Retries, deadTask.TotalDuration)
+		retrypool.WithOnNewDeadTask[*MyTask](func(deadTask *retrypool.DeadTask[*MyTask], idx int) {
+			fmt.Printf("New dead task: ID %d - index %d, Retries %d, Total Duration %v\n",
+				deadTask.Data.ID, idx, deadTask.Retries, deadTask.TotalDuration)
+			deadTask, err := pool.PullDeadTask(idx) // we systemically pull the dead task, so there won't be dead tasks in the pool
+			if err != nil {
+				fmt.Printf("Error pulling dead task: %v\n", err)
+			}
+			fmt.Printf("Pulled dead task: ID %d, Retries %d, Errors: %v\n", deadTask.Data.ID, deadTask.Retries, deadTask.Errors)
+			fmt.Printf("Dead tasks in pool: %d\n", pool.DeadTaskCount())
 		}),
 	)
 

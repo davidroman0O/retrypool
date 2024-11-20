@@ -237,7 +237,7 @@ type Pool[T any] struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	deadTasks       []DeadTask[T]
-	deadTasksMutex  deadlock.Mutex
+	deadTasksMutex  deadlock.RWMutex
 
 	config Config[T]
 
@@ -1501,7 +1501,6 @@ func (p *Pool[T]) calculateDelay(n int, err error) time.Duration {
 // addToDeadTasks adds task to dead tasks list
 func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	p.deadTasksMutex.Lock()
-	defer p.deadTasksMutex.Unlock()
 
 	totalDuration := task.totalDuration
 	for _, duration := range task.durations {
@@ -1520,6 +1519,7 @@ func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 		Errors:        errors,
 	}
 
+	idx := len(p.deadTasks)
 	p.deadTasks = append(p.deadTasks, deadTask)
 
 	logs.Warn(context.Background(), "Task added to dead tasks", "taskData", task.data, "retries", task.retries, "errors", errors)
@@ -1527,8 +1527,10 @@ func (p *Pool[T]) addToDeadTasks(task *TaskWrapper[T], finalError error) {
 	// Increment dead tasks metric
 	atomic.AddInt64(&p.metrics.DeadTasks, 1)
 
+	p.deadTasksMutex.Unlock()
+
 	if p.config.onNewDeadTask != nil {
-		p.config.onNewDeadTask(&deadTask)
+		p.config.onNewDeadTask(&deadTask, idx)
 	}
 }
 
@@ -1644,8 +1646,8 @@ func (p *Pool[T]) PullDeadTask(idx int) (*DeadTask[T], error) {
 
 // DeadTasks returns a copy of the dead tasks list
 func (p *Pool[T]) DeadTasks() []DeadTask[T] {
-	p.deadTasksMutex.Lock()
-	defer p.deadTasksMutex.Unlock()
+	p.deadTasksMutex.RLock()
+	defer p.deadTasksMutex.RUnlock()
 	return append([]DeadTask[T](nil), p.deadTasks...)
 }
 
@@ -1937,7 +1939,7 @@ type OnTaskSuccessFunc[T any] func(controller WorkerController[T], workerID int,
 type OnTaskFailureFunc[T any] func(controller WorkerController[T], workerID int, worker Worker[T], task *TaskWrapper[T], err error) DeadTaskAction
 
 // OnNewDeadTaskFunc is a new type for handling new dead tasks
-type OnNewDeadTaskFunc[T any] func(task *DeadTask[T])
+type OnNewDeadTaskFunc[T any] func(task *DeadTask[T], idx int)
 
 // RetryIfFunc signature
 type RetryIfFunc func(error) bool
