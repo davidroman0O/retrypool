@@ -2020,6 +2020,13 @@ func (rr *RequestResponse[T, R]) Done() <-chan struct{} {
 	return rr.done
 }
 
+// Err returns any error that occurred during the request
+func (rr *RequestResponse[T, R]) Err() error {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	return rr.err
+}
+
 // Wait waits for the request to complete and returns the response and any error
 func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
 	select {
