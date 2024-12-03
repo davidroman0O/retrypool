@@ -304,6 +304,9 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 func (p *Pool[T]) Close() error {
 	logs.Debug(context.Background(), "Closing the pool")
 	if err := p.Shutdown(); err != nil {
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return nil
+		}
 		logs.Error(context.Background(), "Failed to shutdown pool", "error", err)
 		return fmt.Errorf("failed to shutdown pool: %w", err)
 	}
