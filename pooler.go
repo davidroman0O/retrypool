@@ -252,6 +252,10 @@ type Pool[T any] struct {
 	taskWrapperPool sync.Pool
 
 	nextRoundRobinWorkerIndex int
+
+	autoscaler  *autoscaler[T]
+	onScaleUp   OnScaleUpFunc[T]
+	onScaleDown OnScaleDownFunc[T]
 }
 
 // New initializes the Pool with given workers and options
@@ -411,7 +415,7 @@ func (p *Pool[T]) AddWorker(worker Worker[T], options ...WorkerOption[T]) int {
 	var workerCancel context.CancelFunc
 
 	// Create base cancellable context from pool
-	workerCtx, workerCancel = context.WithCancel(p.ctx)
+	workerCtx, workerCancel = context.WithCancel(context.Background())
 
 	state := &workerState[T]{
 		worker:   worker,
@@ -677,6 +681,18 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 
 	// Set the removed flag
 	state.removed = true
+	state.interrupted = true
+
+	logs.Debug(context.Background(), "Canceling worker context", "workerID", workerID)
+
+	// And in workerLoop, right after the select statement:
+	if state.ctx.Err() != nil {
+		logs.Debug(context.Background(), "Worker context check failed",
+			"workerID", workerID,
+			"error", state.ctx.Err(),
+			"interrupted", state.interrupted,
+			"removed", state.removed)
+	}
 
 	// Cancel the worker's context
 	state.cancel()
@@ -684,12 +700,24 @@ func (p *Pool[T]) RemoveWorker(workerID int) error {
 	// Close the worker's stop channel
 	close(state.stopChan)
 
+	// Get the queue for this worker
+	queue := p.taskQueues[workerID]
+	delete(p.taskQueues, workerID) // Remove the queue immediately
+
 	logs.Info(context.Background(), "Removing worker", "workerID", workerID)
 
 	// Signal the worker to wake up if it's waiting
 	p.cond.Broadcast()
 
 	p.mu.Unlock() // Release lock while waiting
+
+	// Handle remaining tasks outside the lock
+	if queue != nil {
+		tasks := queue.Tasks()
+		for _, task := range tasks {
+			p.addToDeadTasks(task, context.Canceled)
+		}
+	}
 
 	// Requeue any tasks assigned to this worker
 	p.requeueTasksFromWorker(workerID)
@@ -956,13 +984,32 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 		case <-p.ctx.Done():
 			return p.ctx.Err()
 		case <-state.ctx.Done():
+			logs.Debug(context.Background(), "Worker exiting due to worker context", "workerID", workerID, "error", state.ctx.Err())
 			return state.ctx.Err()
 		default:
+			logs.Debug(context.Background(), "Worker state before potential exit",
+				"workerID", workerID,
+				"hasQueue", p.taskQueues[workerID] != nil,
+				"queueLength", func() int {
+					if q := p.taskQueues[workerID]; q != nil {
+						return q.Length()
+					}
+					return 0
+				}(),
+				"interrupted", state.interrupted,
+				"removed", state.removed)
 		}
 
 		logs.Debug(context.Background(), "Worker is waiting for tasks", "workerID", workerID)
 
 		p.mu.Lock()
+		if state.interrupted {
+			logs.Debug(context.Background(), "Worker exiting due to interruption", "workerID", workerID)
+			p.processing--
+			p.mu.Unlock()
+			return nil // Exit the loop if the worker was interrupted
+		}
+
 		now := time.Now()
 		_, idx, task, ok := p.getNextTask(workerID)
 		if !ok {
@@ -1033,6 +1080,7 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 
 		// Check if context is canceled before processing the task
 		if p.ctx.Err() != nil {
+			logs.Debug(context.Background(), "Worker exiting due to pool context", "workerID", workerID, "error", p.ctx.Err())
 			p.mu.Lock()
 			p.processing--
 			p.mu.Unlock()
@@ -1053,12 +1101,6 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 
 		// Unset the current task
 		state.currentTask = nil
-
-		if state.interrupted {
-			p.processing--
-			p.mu.Unlock()
-			return nil // Exit the loop if the worker was interrupted
-		}
 
 		p.processing--
 		p.cond.Signal()
@@ -1354,10 +1396,16 @@ func (p *Pool[T]) runWorkerWithFailsafe(workerID int, task *TaskWrapper[T]) {
 			if errors.Is(err, context.Canceled) && interrupted {
 				// Worker was interrupted; do not requeue the task here since InterruptWorker already did
 				logs.Debug(context.Background(), "Worker was interrupted, not requeuing task", "workerID", workerID)
+				p.addToDeadTasks(task, err)
 				return
 			}
 
-			p.requeueTask(task, err, false)
+			// Only requeue if not canceled due to worker removal
+			if !interrupted {
+				p.requeueTask(task, err, false)
+			} else {
+				p.addToDeadTasks(task, err)
+			}
 			return
 		}
 
@@ -1719,12 +1767,23 @@ func (task *TaskWrapper[T]) reset() {
 	task.queuedAt = []time.Time{}
 }
 
+func (p *Pool[T]) hasAvailableWorkers() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, state := range p.workers {
+		if !state.removed && !state.interrupted {
+			return true
+		}
+	}
+	return false
+}
+
 var ErrMaxQueueSizeExceeded = errors.New("max queue size exceeded")
 
 // Submit adds a new task to the pool
 // TODO: add a limit
 func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
-
 	if p.config.maxQueueSize > 0 {
 		if p.QueueSize() >= p.config.maxQueueSize {
 			return ErrMaxQueueSizeExceeded
@@ -1744,8 +1803,24 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	logs.Debug(context.Background(), "Starting task submission",
+		"activeWorkers", len(p.workers),
+		"queueSizes", fmt.Sprintf("%+v", p.taskQueues))
+
 	if p.stopped {
 		return ErrPoolClosed
+	}
+
+	// Check for available workers
+	availableWorkers := make([]int, 0, len(p.workers))
+	for workerID, state := range p.workers {
+		if !state.removed && !state.interrupted {
+			availableWorkers = append(availableWorkers, workerID)
+		}
+	}
+
+	if len(availableWorkers) == 0 {
+		return ErrNoWorkersAvailable
 	}
 
 	// Increment tasks submitted metric
@@ -1760,27 +1835,18 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	}
 	task.scheduledTime = time.Now()
 
-	workerIDs := make([]int, 0, len(p.workers))
-	for workerID := range p.workers {
-		workerIDs = append(workerIDs, workerID)
-	}
-
-	if len(workerIDs) == 0 {
-		return ErrNoWorkersAvailable
-	}
-
 	var selectedWorkerID int
 	if p.config.roundRobinDistribution {
-		// Ensure nextWorkerIndex is within bounds
+		// Modify round-robin to only consider available workers
 		safeIndex := p.nextRoundRobinWorkerIndex + 1
-		safeIndex = safeIndex % len(p.workers)
-		selectedWorkerID = safeIndex
-		safeIndex = (safeIndex + 1) % len(p.workers)
+		safeIndex = safeIndex % len(availableWorkers)
+		selectedWorkerID = availableWorkers[safeIndex]
+		safeIndex = (safeIndex + 1) % len(availableWorkers)
 		p.nextRoundRobinWorkerIndex = safeIndex - 1
 	} else {
-		// Find the worker with the smallest queue
+		// Find the worker with the smallest queue among available workers
 		minQueueSize := int(^uint(0) >> 1) // Max int
-		for _, workerID := range workerIDs {
+		for _, workerID := range availableWorkers {
 			q := p.taskQueues[workerID]
 			queueSize := 0
 			if q != nil {
@@ -1794,6 +1860,10 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	}
 
 	task.queuedAt = append(task.queuedAt, time.Now())
+
+	logs.Debug(context.Background(), "Selected worker for task",
+		"workerID", selectedWorkerID,
+		"workerState", fmt.Sprintf("%+v", p.workers[selectedWorkerID]))
 
 	q := p.taskQueues[selectedWorkerID]
 	if q == nil {
