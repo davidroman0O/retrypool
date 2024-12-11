@@ -849,31 +849,77 @@ func setWorkerIDFieldIfExists[T any](worker Worker[T], id int) {
 		rv = rv.Elem()
 	}
 	if rv.Kind() != reflect.Struct {
-		// Not a struct; cannot set field
 		return
 	}
 	field := rv.FieldByName("ID")
 	if !field.IsValid() || !field.CanSet() {
-		// Field does not exist or cannot be set
 		return
 	}
 	if field.Kind() == reflect.Int {
 		field.SetInt(int64(id))
 	}
+}
 
-	// Check if worker has OnStart method and call it
-	method := rv.MethodByName("OnStart")
-	if !method.IsValid() {
-		// Try pointer receiver
-		method = rv.Addr().MethodByName("OnStart")
-		if !method.IsValid() {
-			// OnStart method not found
-			return
+// safeMethodCall safely attempts to call a method on a worker without panicking
+func safeMethodCall[T any](worker Worker[T], methodName string) {
+	// Recover from any reflection panics
+	defer func() {
+		if r := recover(); r != nil {
+			logs.Debug(context.Background(), "Recovered from reflection panic",
+				"method", methodName,
+				"error", r)
+		}
+	}()
+
+	rv := reflect.ValueOf(worker)
+	var method reflect.Value
+
+	// Try getting method from pointer receiver
+	if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+		method = rv.MethodByName(methodName)
+	}
+
+	// If not found and we have a valid pointer, try the struct
+	if !method.IsValid() && rv.Kind() == reflect.Ptr && !rv.IsNil() {
+		structVal := rv.Elem()
+		if structVal.Kind() == reflect.Struct {
+			method = structVal.MethodByName(methodName)
 		}
 	}
 
-	ctx := context.Background()
-	method.Call([]reflect.Value{reflect.ValueOf(ctx)})
+	// If still not found, return silently
+	if !method.IsValid() {
+		return
+	}
+
+	// Safely check method signature
+	methodType := method.Type()
+	if !methodType.IsVariadic() && methodType.NumIn() == 0 {
+		method.Call(nil)
+		return
+	}
+
+	if methodType.NumIn() == 1 {
+		firstArg := methodType.In(0)
+		if firstArg == reflect.TypeOf((*context.Context)(nil)).Elem() {
+			ctx := context.Background()
+			method.Call([]reflect.Value{reflect.ValueOf(ctx)})
+			return
+		}
+	}
+}
+
+// Replace the existing functions with wrappers around safeMethodCall
+func callOnStartIfExists[T any](worker Worker[T]) {
+	safeMethodCall(worker, "OnStart")
+}
+
+func callOnStopIfExists[T any](worker Worker[T]) {
+	safeMethodCall(worker, "OnStop")
+}
+
+func callOnRemoveIfExists[T any](worker Worker[T]) {
+	safeMethodCall(worker, "OnRemove")
 }
 
 // workerLoop handles the lifecycle of a worker
@@ -882,32 +928,28 @@ func (p *Pool[T]) workerLoop(workerID int) error {
 
 	p.mu.Lock()
 	state, exists := p.workers[workerID]
-	p.mu.Unlock()
-
 	if !exists {
+		p.mu.Unlock()
 		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
 	}
+	// Set the worker's ID field if it exists
+	setWorkerIDFieldIfExists(state.worker, workerID)
+	callOnStartIfExists(state.worker)
+	p.mu.Unlock()
 
 	defer func() {
 		p.mu.Lock()
 		if state.removed {
 			// Remove worker from the pool when it exits
 			delete(p.workers, workerID)
+			callOnRemoveIfExists(state.worker)
 			logs.Debug(context.Background(), "Worker loop exited and removed", "workerID", workerID)
 		} else {
+			callOnStopIfExists(state.worker)
 			logs.Debug(context.Background(), "Worker loop exited but not removed", "workerID", workerID)
 		}
 		p.mu.Unlock()
 	}()
-
-	if !exists {
-		return fmt.Errorf("%w: worker %d does not exist", ErrInvalidWorkerID, workerID)
-	}
-
-	// Set the worker's ID field if it exists
-	p.mu.Lock()
-	setWorkerIDFieldIfExists(state.worker, workerID)
-	p.mu.Unlock()
 
 	for {
 		select {

@@ -11,6 +11,19 @@ import (
 
 type SimpleWorker struct{}
 
+func (w SimpleWorker) OnStart() {
+	fmt.Println("Worker started")
+}
+
+// Notice that you can either use a pointer receiver or a value receiver
+func (w *SimpleWorker) OnStop() {
+	fmt.Println("Worker stopped")
+}
+
+func (w SimpleWorker) OnRemove() {
+	fmt.Println("Worker removed")
+}
+
 func (w *SimpleWorker) Run(ctx context.Context, data int) error {
 	time.Sleep(time.Duration(data) * time.Millisecond)
 	fmt.Printf("Processed: %d\n", data)
@@ -49,6 +62,11 @@ func main() {
 	if err != nil {
 		log.Printf("Dispatch error: %v", err)
 	}
+
+	if err := pool.RemoveWorker(0); err != nil {
+		log.Printf("Remove error: %v", err)
+	}
+	<-time.After(1 * time.Second)
 
 	pool.Shutdown()
 	fmt.Println("All tasks completed")
