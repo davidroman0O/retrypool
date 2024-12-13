@@ -1114,7 +1114,7 @@ func NewSliceTaskQueue[T any](logger Logger) *sliceTaskQueue[T] {
 func (q *sliceTaskQueue[T]) Enqueue(task *Task[T]) {
 	q.mu.Lock()
 	q.tasks = append(q.tasks, task)
-	q.logger.Debug(context.Background(), "Task enqueued in sliceTaskQueue", "queue_length", len(q.tasks))
+	// q.logger.Debug(context.Background(), "Task enqueued in sliceTaskQueue", "queue_length", len(q.tasks))
 	q.mu.Unlock()
 }
 
@@ -1137,7 +1137,7 @@ func (q *sliceTaskQueue[T]) PriorityEnqueue(task *Task[T]) error {
 	copy(q.tasks[insertIdx+1:], q.tasks[insertIdx:])
 	q.tasks[insertIdx] = task
 
-	q.logger.Debug(context.Background(), "Priority task enqueued", "queue_length", len(q.tasks), "insert_position", insertIdx)
+	// q.logger.Debug(context.Background(), "Priority task enqueued", "queue_length", len(q.tasks), "insert_position", insertIdx)
 
 	return nil
 }
@@ -1146,37 +1146,37 @@ func (q *sliceTaskQueue[T]) Dequeue() (*Task[T], bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.logger.Debug(context.Background(), "Attempting to dequeue from sliceTaskQueue", "queue_length", len(q.tasks))
+	// q.logger.Debug(context.Background(), "Attempting to dequeue from sliceTaskQueue", "queue_length", len(q.tasks))
 
 	if len(q.tasks) == 0 {
-		q.logger.Debug(context.Background(), "Dequeue called on empty sliceTaskQueue")
+		// q.logger.Debug(context.Background(), "Dequeue called on empty sliceTaskQueue")
 		return nil, false
 	}
 
 	// Log first task in queue
-	firstTask := q.tasks[0]
-	firstTask.mu.Lock()
-	q.logger.Debug(context.Background(), "First task in queue", "task_data", firstTask.data, "task_state", firstTask.state, "retries", firstTask.retries)
-	firstTask.mu.Unlock()
+	// firstTask := q.tasks[0]
+	// firstTask.mu.Lock()
+	// q.logger.Debug(context.Background(), "First task in queue", "task_data", firstTask.data, "task_state", firstTask.state, "retries", firstTask.retries)
+	// firstTask.mu.Unlock()
 
 	task := q.tasks[0]
 	q.tasks = q.tasks[1:]
 
-	q.logger.Debug(context.Background(), "Task dequeued from sliceTaskQueue", "queue_length", len(q.tasks))
+	// q.logger.Debug(context.Background(), "Task dequeued from sliceTaskQueue", "queue_length", len(q.tasks))
 	return task, true
 }
 func (q *sliceTaskQueue[T]) Length() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	length := len(q.tasks)
-	q.logger.Debug(context.Background(), "sliceTaskQueue length fetched", "queue_length", length)
+	// q.logger.Debug(context.Background(), "sliceTaskQueue length fetched", "queue_length", length)
 	return length
 }
 
 func (q *sliceTaskQueue[T]) Clear() {
 	q.mu.Lock()
 	q.tasks = nil
-	q.logger.Debug(context.Background(), "sliceTaskQueue cleared")
+	// q.logger.Debug(context.Background(), "sliceTaskQueue cleared")
 	q.mu.Unlock()
 }
 
@@ -1184,7 +1184,7 @@ func (q *sliceTaskQueue[T]) Drain() []*Task[T] {
 	q.mu.Lock()
 	tasks := q.tasks
 	q.tasks = nil
-	q.logger.Debug(context.Background(), "sliceTaskQueue drained", "tasks_drained", len(tasks))
+	// q.logger.Debug(context.Background(), "sliceTaskQueue drained", "tasks_drained", len(tasks))
 	q.mu.Unlock()
 	return tasks
 }
@@ -1215,7 +1215,7 @@ func (q *linkedListQueue[T]) Enqueue(task *Task[T]) {
 		q.tail = n
 	}
 	q.size++
-	q.logger.Debug(context.Background(), "Task enqueued in linkedListQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Task enqueued in linkedListQueue", "queue_length", q.size)
 }
 
 func (q *linkedListQueue[T]) PriorityEnqueue(task *Task[T]) error {
@@ -1229,12 +1229,12 @@ func (q *linkedListQueue[T]) PriorityEnqueue(task *Task[T]) error {
 		// Empty queue
 		q.head = n
 		q.tail = n
-		q.logger.Debug(context.Background(), "Priority task enqueued in empty linkedListQueue", "queue_length", q.size+1)
+		// q.logger.Debug(context.Background(), "Priority task enqueued in empty linkedListQueue", "queue_length", q.size+1)
 	} else {
 		// Insert at head
 		n.next = q.head
 		q.head = n
-		q.logger.Debug(context.Background(), "Priority task enqueued at head in linkedListQueue", "queue_length", q.size+1)
+		// q.logger.Debug(context.Background(), "Priority task enqueued at head in linkedListQueue", "queue_length", q.size+1)
 	}
 	q.size++
 	return nil
@@ -1244,7 +1244,7 @@ func (q *linkedListQueue[T]) Dequeue() (*Task[T], bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.head == nil {
-		q.logger.Debug(context.Background(), "Dequeue called on empty linkedListQueue")
+		// q.logger.Debug(context.Background(), "Dequeue called on empty linkedListQueue")
 		return nil, false
 	}
 	task := q.head.value
@@ -1253,7 +1253,7 @@ func (q *linkedListQueue[T]) Dequeue() (*Task[T], bool) {
 		q.tail = nil
 	}
 	q.size--
-	q.logger.Debug(context.Background(), "Task dequeued from linkedListQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Task dequeued from linkedListQueue", "queue_length", q.size)
 	return task, true
 }
 
@@ -1261,7 +1261,7 @@ func (q *linkedListQueue[T]) Length() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	length := q.size
-	q.logger.Debug(context.Background(), "linkedListQueue length fetched", "queue_length", length)
+	// q.logger.Debug(context.Background(), "linkedListQueue length fetched", "queue_length", length)
 	return length
 }
 
@@ -1270,7 +1270,7 @@ func (q *linkedListQueue[T]) Clear() {
 	q.head = nil
 	q.tail = nil
 	q.size = 0
-	q.logger.Debug(context.Background(), "linkedListQueue cleared")
+	// q.logger.Debug(context.Background(), "linkedListQueue cleared")
 	q.mu.Unlock()
 }
 
@@ -1286,7 +1286,7 @@ func (q *linkedListQueue[T]) Drain() []*Task[T] {
 	q.head = nil
 	q.tail = nil
 	q.size = 0
-	q.logger.Debug(context.Background(), "linkedListQueue drained", "tasks_drained", len(tasks))
+	// q.logger.Debug(context.Background(), "linkedListQueue drained", "tasks_drained", len(tasks))
 	return tasks
 }
 
@@ -1310,13 +1310,13 @@ func (q *RingBufferQueue[T]) Enqueue(task *Task[T]) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.size == q.cap {
-		q.logger.Error(context.Background(), "RingBufferQueue is full")
+		// q.logger.Error(context.Background(), "RingBufferQueue is full")
 		panic("RingBufferQueue is full")
 	}
 	q.buffer[q.tail] = task
 	q.tail = (q.tail + 1) % q.cap
 	q.size++
-	q.logger.Debug(context.Background(), "Task enqueued in RingBufferQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Task enqueued in RingBufferQueue", "queue_length", q.size)
 }
 
 func (q *RingBufferQueue[T]) PriorityEnqueue(task *Task[T]) error {
@@ -1324,7 +1324,7 @@ func (q *RingBufferQueue[T]) PriorityEnqueue(task *Task[T]) error {
 	defer q.mu.Unlock()
 
 	if q.size == q.cap {
-		q.logger.Error(context.Background(), "RingBufferQueue is full during PriorityEnqueue")
+		// q.logger.Error(context.Background(), "RingBufferQueue is full during PriorityEnqueue")
 		return errors.New("RingBufferQueue is full")
 	}
 
@@ -1333,11 +1333,11 @@ func (q *RingBufferQueue[T]) PriorityEnqueue(task *Task[T]) error {
 		newHead := (q.head - 1 + q.cap) % q.cap
 		q.buffer[newHead] = task
 		q.head = newHead
-		q.logger.Debug(context.Background(), "Priority task enqueued in RingBufferQueue", "queue_length", q.size+1)
+		// q.logger.Debug(context.Background(), "Priority task enqueued in RingBufferQueue", "queue_length", q.size+1)
 	} else {
 		// If queue is empty, just add normally
 		q.buffer[q.head] = task
-		q.logger.Debug(context.Background(), "Priority task enqueued in empty RingBufferQueue", "queue_length", 1)
+		// q.logger.Debug(context.Background(), "Priority task enqueued in empty RingBufferQueue", "queue_length", 1)
 	}
 	q.size++
 	return nil
@@ -1347,14 +1347,14 @@ func (q *RingBufferQueue[T]) Dequeue() (*Task[T], bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.size == 0 {
-		q.logger.Debug(context.Background(), "Dequeue called on empty RingBufferQueue")
+		// q.logger.Debug(context.Background(), "Dequeue called on empty RingBufferQueue")
 		return nil, false
 	}
 	task := q.buffer[q.head]
 	q.buffer[q.head] = nil
 	q.head = (q.head + 1) % q.cap
 	q.size--
-	q.logger.Debug(context.Background(), "Task dequeued from RingBufferQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Task dequeued from RingBufferQueue", "queue_length", q.size)
 	return task, true
 }
 
@@ -1362,7 +1362,7 @@ func (q *RingBufferQueue[T]) Length() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	length := q.size
-	q.logger.Debug(context.Background(), "RingBufferQueue length fetched", "queue_length", length)
+	// q.logger.Debug(context.Background(), "RingBufferQueue length fetched", "queue_length", length)
 	return length
 }
 
@@ -1374,7 +1374,7 @@ func (q *RingBufferQueue[T]) Clear() {
 	q.head = 0
 	q.tail = 0
 	q.size = 0
-	q.logger.Debug(context.Background(), "RingBufferQueue cleared")
+	// q.logger.Debug(context.Background(), "RingBufferQueue cleared")
 	q.mu.Unlock()
 }
 
@@ -1391,7 +1391,7 @@ func (q *RingBufferQueue[T]) Drain() []*Task[T] {
 	}
 	q.head = 0
 	q.tail = 0
-	q.logger.Debug(context.Background(), "RingBufferQueue drained", "tasks_drained", len(tasks))
+	// q.logger.Debug(context.Background(), "RingBufferQueue drained", "tasks_drained", len(tasks))
 	return tasks
 }
 
@@ -1419,18 +1419,18 @@ func (q *GrowingRingBufferQueue[T]) Enqueue(task *Task[T]) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.size == q.cap {
-		q.logger.Debug(context.Background(), "GrowingRingBufferQueue is full, growing capacity", "current_capacity", q.cap)
+		// q.logger.Debug(context.Background(), "GrowingRingBufferQueue is full, growing capacity", "current_capacity", q.cap)
 		q.grow()
 	}
 	q.buffer[q.tail] = task
 	q.tail = (q.tail + 1) % q.cap
 	q.size++
-	q.logger.Debug(context.Background(), "Task enqueued in GrowingRingBufferQueue", "queue_length", q.size, "capacity", q.cap)
+	// q.logger.Debug(context.Background(), "Task enqueued in GrowingRingBufferQueue", "queue_length", q.size, "capacity", q.cap)
 }
 
 func (q *GrowingRingBufferQueue[T]) grow() {
 	newCap := q.cap * 2
-	q.logger.Debug(context.Background(), "GrowingRingBufferQueue increasing capacity", "old_capacity", q.cap, "new_capacity", newCap)
+	// q.logger.Debug(context.Background(), "GrowingRingBufferQueue increasing capacity", "old_capacity", q.cap, "new_capacity", newCap)
 	newBuffer := make([]*Task[T], newCap)
 	if q.head < q.tail {
 		copy(newBuffer, q.buffer[q.head:q.tail])
@@ -1450,7 +1450,7 @@ func (q *GrowingRingBufferQueue[T]) PriorityEnqueue(task *Task[T]) error {
 
 	// If queue is full, grow it
 	if q.size == q.cap {
-		q.logger.Debug(context.Background(), "GrowingRingBufferQueue is full during PriorityEnqueue, growing capacity", "current_capacity", q.cap)
+		// q.logger.Debug(context.Background(), "GrowingRingBufferQueue is full during PriorityEnqueue, growing capacity", "current_capacity", q.cap)
 		q.grow()
 	}
 
@@ -1459,11 +1459,11 @@ func (q *GrowingRingBufferQueue[T]) PriorityEnqueue(task *Task[T]) error {
 		newHead := (q.head - 1 + q.cap) % q.cap
 		q.buffer[newHead] = task
 		q.head = newHead
-		q.logger.Debug(context.Background(), "Priority task enqueued in GrowingRingBufferQueue", "queue_length", q.size+1, "capacity", q.cap)
+		// q.logger.Debug(context.Background(), "Priority task enqueued in GrowingRingBufferQueue", "queue_length", q.size+1, "capacity", q.cap)
 	} else {
 		// If queue is empty, just add normally
 		q.buffer[q.head] = task
-		q.logger.Debug(context.Background(), "Priority task enqueued in empty GrowingRingBufferQueue", "queue_length", 1, "capacity", q.cap)
+		// q.logger.Debug(context.Background(), "Priority task enqueued in empty GrowingRingBufferQueue", "queue_length", 1, "capacity", q.cap)
 	}
 	q.size++
 	return nil
@@ -1473,14 +1473,14 @@ func (q *GrowingRingBufferQueue[T]) Dequeue() (*Task[T], bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.size == 0 {
-		q.logger.Debug(context.Background(), "Dequeue called on empty GrowingRingBufferQueue")
+		// q.logger.Debug(context.Background(), "Dequeue called on empty GrowingRingBufferQueue")
 		return nil, false
 	}
 	task := q.buffer[q.head]
 	q.buffer[q.head] = nil
 	q.head = (q.head + 1) % q.cap
 	q.size--
-	q.logger.Debug(context.Background(), "Task dequeued from GrowingRingBufferQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Task dequeued from GrowingRingBufferQueue", "queue_length", q.size)
 	return task, true
 }
 
@@ -1488,7 +1488,7 @@ func (q *GrowingRingBufferQueue[T]) Length() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	length := q.size
-	q.logger.Debug(context.Background(), "GrowingRingBufferQueue length fetched", "queue_length", length)
+	// q.logger.Debug(context.Background(), "GrowingRingBufferQueue length fetched", "queue_length", length)
 	return length
 }
 
@@ -1500,7 +1500,7 @@ func (q *GrowingRingBufferQueue[T]) Clear() {
 	q.head = 0
 	q.tail = 0
 	q.size = 0
-	q.logger.Debug(context.Background(), "GrowingRingBufferQueue cleared")
+	// q.logger.Debug(context.Background(), "GrowingRingBufferQueue cleared")
 	q.mu.Unlock()
 }
 
@@ -1517,7 +1517,7 @@ func (q *GrowingRingBufferQueue[T]) Drain() []*Task[T] {
 	}
 	q.head = 0
 	q.tail = 0
-	q.logger.Debug(context.Background(), "GrowingRingBufferQueue drained", "tasks_drained", len(tasks))
+	// q.logger.Debug(context.Background(), "GrowingRingBufferQueue drained", "tasks_drained", len(tasks))
 	return tasks
 }
 
@@ -1545,13 +1545,13 @@ func (q *CircularQueue[T]) Enqueue(task *Task[T]) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.size == q.cap {
-		q.logger.Error(context.Background(), "CircularQueue is full")
+		// q.logger.Error(context.Background(), "CircularQueue is full")
 		panic("CircularQueue is full")
 	}
 	q.buffer[q.tail] = task
 	q.tail = (q.tail + 1) % q.cap
 	q.size++
-	q.logger.Debug(context.Background(), "Task enqueued in CircularQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Task enqueued in CircularQueue", "queue_length", q.size)
 }
 
 func (q *CircularQueue[T]) PriorityEnqueue(task *Task[T]) error {
@@ -1559,7 +1559,7 @@ func (q *CircularQueue[T]) PriorityEnqueue(task *Task[T]) error {
 	defer q.mu.Unlock()
 
 	if q.size == q.cap {
-		q.logger.Error(context.Background(), "CircularQueue is full")
+		// q.logger.Error(context.Background(), "CircularQueue is full")
 		return errors.New("CircularQueue is full")
 	}
 
@@ -1573,7 +1573,7 @@ func (q *CircularQueue[T]) PriorityEnqueue(task *Task[T]) error {
 		q.buffer[q.head] = task
 	}
 	q.size++
-	q.logger.Debug(context.Background(), "Priority task enqueued in CircularQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Priority task enqueued in CircularQueue", "queue_length", q.size)
 	return nil
 }
 
@@ -1581,14 +1581,14 @@ func (q *CircularQueue[T]) Dequeue() (*Task[T], bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.size == 0 {
-		q.logger.Debug(context.Background(), "Dequeue called on empty CircularQueue")
+		// q.logger.Debug(context.Background(), "Dequeue called on empty CircularQueue")
 		return nil, false
 	}
 	task := q.buffer[q.head]
 	q.buffer[q.head] = nil
 	q.head = (q.head + 1) % q.cap
 	q.size--
-	q.logger.Debug(context.Background(), "Task dequeued from CircularQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Task dequeued from CircularQueue", "queue_length", q.size)
 	return task, true
 }
 
@@ -1596,7 +1596,7 @@ func (q *CircularQueue[T]) Length() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	length := q.size
-	q.logger.Debug(context.Background(), "CircularQueue length fetched", "queue_length", length)
+	// q.logger.Debug(context.Background(), "CircularQueue length fetched", "queue_length", length)
 	return length
 }
 
@@ -1608,7 +1608,7 @@ func (q *CircularQueue[T]) Clear() {
 	q.head = 0
 	q.tail = 0
 	q.size = 0
-	q.logger.Debug(context.Background(), "CircularQueue cleared")
+	// q.logger.Debug(context.Background(), "CircularQueue cleared")
 	q.mu.Unlock()
 }
 
@@ -1625,7 +1625,7 @@ func (q *CircularQueue[T]) Drain() []*Task[T] {
 	}
 	q.head = 0
 	q.tail = 0
-	q.logger.Debug(context.Background(), "CircularQueue drained", "tasks_drained", len(tasks))
+	// q.logger.Debug(context.Background(), "CircularQueue drained", "tasks_drained", len(tasks))
 	return tasks
 }
 
@@ -1653,13 +1653,13 @@ func (q *GrowingCircularQueue[T]) Enqueue(task *Task[T]) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.size == q.cap {
-		q.logger.Debug(context.Background(), "GrowingCircularQueue is full, growing capacity", "current_capacity", q.cap)
+		// q.logger.Debug(context.Background(), "GrowingCircularQueue is full, growing capacity", "current_capacity", q.cap)
 		q.grow()
 	}
 	q.buffer[q.tail] = task
 	q.tail = (q.tail + 1) % q.cap
 	q.size++
-	q.logger.Debug(context.Background(), "Task enqueued in GrowingCircularQueue", "queue_length", q.size, "capacity", q.cap)
+	// q.logger.Debug(context.Background(), "Task enqueued in GrowingCircularQueue", "queue_length", q.size, "capacity", q.cap)
 }
 
 func (q *GrowingCircularQueue[T]) PriorityEnqueue(task *Task[T]) error {
@@ -1668,7 +1668,7 @@ func (q *GrowingCircularQueue[T]) PriorityEnqueue(task *Task[T]) error {
 
 	// If queue is full, grow it
 	if q.size == q.cap {
-		q.logger.Debug(context.Background(), "GrowingCircularQueue is full during PriorityEnqueue, growing capacity", "current_capacity", q.cap)
+		// q.logger.Debug(context.Background(), "GrowingCircularQueue is full during PriorityEnqueue, growing capacity", "current_capacity", q.cap)
 		q.grow()
 	}
 
@@ -1677,11 +1677,11 @@ func (q *GrowingCircularQueue[T]) PriorityEnqueue(task *Task[T]) error {
 		newHead := (q.head - 1 + q.cap) % q.cap
 		q.buffer[newHead] = task
 		q.head = newHead
-		q.logger.Debug(context.Background(), "Priority task enqueued in GrowingCircularQueue", "queue_length", q.size+1, "capacity", q.cap)
+		// q.logger.Debug(context.Background(), "Priority task enqueued in GrowingCircularQueue", "queue_length", q.size+1, "capacity", q.cap)
 	} else {
 		// If queue is empty, just add normally
 		q.buffer[q.head] = task
-		q.logger.Debug(context.Background(), "Priority task enqueued in empty GrowingCircularQueue", "queue_length", 1, "capacity", q.cap)
+		// q.logger.Debug(context.Background(), "Priority task enqueued in empty GrowingCircularQueue", "queue_length", 1, "capacity", q.cap)
 	}
 	q.size++
 	return nil
@@ -1689,7 +1689,7 @@ func (q *GrowingCircularQueue[T]) PriorityEnqueue(task *Task[T]) error {
 
 func (q *GrowingCircularQueue[T]) grow() {
 	newCap := q.cap * 2
-	q.logger.Debug(context.Background(), "GrowingCircularQueue increasing capacity", "old_capacity", q.cap, "new_capacity", newCap)
+	// q.logger.Debug(context.Background(), "GrowingCircularQueue increasing capacity", "old_capacity", q.cap, "new_capacity", newCap)
 	newBuffer := make([]*Task[T], newCap)
 	if q.head < q.tail {
 		copy(newBuffer, q.buffer[q.head:q.tail])
@@ -1707,14 +1707,14 @@ func (q *GrowingCircularQueue[T]) Dequeue() (*Task[T], bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.size == 0 {
-		q.logger.Debug(context.Background(), "Dequeue called on empty GrowingCircularQueue")
+		// q.logger.Debug(context.Background(), "Dequeue called on empty GrowingCircularQueue")
 		return nil, false
 	}
 	task := q.buffer[q.head]
 	q.buffer[q.head] = nil
 	q.head = (q.head + 1) % q.cap
 	q.size--
-	q.logger.Debug(context.Background(), "Task dequeued from GrowingCircularQueue", "queue_length", q.size)
+	// q.logger.Debug(context.Background(), "Task dequeued from GrowingCircularQueue", "queue_length", q.size)
 	return task, true
 }
 
@@ -1722,7 +1722,7 @@ func (q *GrowingCircularQueue[T]) Length() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	length := q.size
-	q.logger.Debug(context.Background(), "GrowingCircularQueue length fetched", "queue_length", length)
+	// q.logger.Debug(context.Background(), "GrowingCircularQueue length fetched", "queue_length", length)
 	return length
 }
 
@@ -1734,7 +1734,7 @@ func (q *GrowingCircularQueue[T]) Clear() {
 	q.head = 0
 	q.tail = 0
 	q.size = 0
-	q.logger.Debug(context.Background(), "GrowingCircularQueue cleared")
+	// q.logger.Debug(context.Background(), "GrowingCircularQueue cleared")
 	q.mu.Unlock()
 }
 
@@ -1751,7 +1751,7 @@ func (q *GrowingCircularQueue[T]) Drain() []*Task[T] {
 	}
 	q.head = 0
 	q.tail = 0
-	q.logger.Debug(context.Background(), "GrowingCircularQueue drained", "tasks_drained", len(tasks))
+	// q.logger.Debug(context.Background(), "GrowingCircularQueue drained", "tasks_drained", len(tasks))
 	return tasks
 }
 
