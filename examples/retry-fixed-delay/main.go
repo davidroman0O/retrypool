@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,12 +16,20 @@ type MyTask struct {
 
 // MyWorker implements the retrypool.Worker interface.
 type MyWorker struct {
-	ID int // this is automatically set by the pool
+	ID int
 }
 
 // Run processes a task.
+// It simulates failure for even numbers by returning an error.
 func (w *MyWorker) Run(ctx context.Context, task MyTask) error {
-	fmt.Printf("Worker %d processing task with value %d\n", w.ID, task.Value)
+	if task.Value%2 == 0 {
+		// Simulate a failure for even numbers.
+		fmt.Printf("Worker %d failed to process task with value %d\n", w.ID, task.Value)
+		return errors.New("simulated failure")
+	}
+	fmt.Printf("Worker %d successfully processed task with value %d\n", w.ID, task.Value)
+	// Simulate some work.
+	time.Sleep(300 * time.Millisecond)
 	return nil
 }
 
@@ -29,12 +38,20 @@ func main() {
 
 	// Create workers.
 	workers := []retrypool.Worker[MyTask]{}
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 4; i++ {
 		workers = append(workers, &MyWorker{})
 	}
 
-	// Create the pool.
-	pool := retrypool.New(ctx, workers)
+	// Configure the pool with a fixed delay retry policy.
+	pool := retrypool.New(ctx, workers,
+		// Limit the number of retry attempts to 3.
+		retrypool.WithAttempts[MyTask](3),
+		// Set a fixed delay of 1 second between retries.
+		retrypool.WithRetryPolicy[MyTask](retrypool.FixedDelayRetryPolicy[MyTask]{
+			Delay:     1 * time.Second,
+			MaxJitter: 0,
+		}),
+	)
 	defer pool.Close()
 
 	// Submit tasks.
