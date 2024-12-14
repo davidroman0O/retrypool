@@ -1084,17 +1084,17 @@ type TaskQueue[T any] interface {
 func (p *Pool[T]) NewTaskQueue(queueType TaskQueueType) TaskQueue[T] {
 	switch queueType {
 	case TaskQueueTypeSlice:
-		return NewSliceTaskQueue[T](p.logger)
+		return newSliceTaskQueue[T](p.logger)
 	case TaskQueueTypeRingBuffer:
-		return NewRingBufferQueue[T](1024, p.logger)
+		return newRingBufferQueue[T](1024, p.logger)
 	case TaskQueueTypeCircularQueue:
-		return NewCircularQueue[T](1024, p.logger)
+		return newCircularQueue[T](1024, p.logger)
 	case TaskQueueTypeLinkedList:
 		return &linkedListQueue[T]{logger: p.logger}
 	case TaskQueueTypeGrowingRingBuffer:
-		return NewGrowingRingBufferQueue[T](1024, p.logger)
+		return newGrowingRingBufferQueue[T](1024, p.logger)
 	case TaskQueueTypeGrowingCircularQueue:
-		return NewGrowingCircularQueue[T](1024, p.logger)
+		return newGrowingCircularQueue[T](1024, p.logger)
 	default:
 		return &sliceTaskQueue[T]{logger: p.logger}
 	}
@@ -1107,7 +1107,7 @@ type sliceTaskQueue[T any] struct {
 	logger Logger
 }
 
-func NewSliceTaskQueue[T any](logger Logger) *sliceTaskQueue[T] {
+func newSliceTaskQueue[T any](logger Logger) *sliceTaskQueue[T] {
 	return &sliceTaskQueue[T]{logger: logger}
 }
 
@@ -1301,8 +1301,8 @@ type RingBufferQueue[T any] struct {
 	logger Logger
 }
 
-// NewRingBufferQueue creates a new RingBufferQueue with the given capacity
-func NewRingBufferQueue[T any](capacity int, logger Logger) *RingBufferQueue[T] {
+// newRingBufferQueue creates a new RingBufferQueue with the given capacity
+func newRingBufferQueue[T any](capacity int, logger Logger) *RingBufferQueue[T] {
 	return &RingBufferQueue[T]{buffer: make([]*Task[T], capacity), cap: capacity, logger: logger}
 }
 
@@ -1406,8 +1406,8 @@ type GrowingRingBufferQueue[T any] struct {
 	logger Logger
 }
 
-// NewGrowingRingBufferQueue creates a new GrowingRingBufferQueue with the given initial capacity
-func NewGrowingRingBufferQueue[T any](initialCapacity int, logger Logger) *GrowingRingBufferQueue[T] {
+// newGrowingRingBufferQueue creates a new GrowingRingBufferQueue with the given initial capacity
+func newGrowingRingBufferQueue[T any](initialCapacity int, logger Logger) *GrowingRingBufferQueue[T] {
 	return &GrowingRingBufferQueue[T]{
 		buffer: make([]*Task[T], initialCapacity),
 		cap:    initialCapacity,
@@ -1532,8 +1532,8 @@ type CircularQueue[T any] struct {
 	logger Logger
 }
 
-// NewCircularQueue creates a new CircularQueue with the given capacity
-func NewCircularQueue[T any](capacity int, logger Logger) *CircularQueue[T] {
+// newCircularQueue creates a new CircularQueue with the given capacity
+func newCircularQueue[T any](capacity int, logger Logger) *CircularQueue[T] {
 	return &CircularQueue[T]{
 		buffer: make([]*Task[T], capacity),
 		cap:    capacity,
@@ -1640,8 +1640,8 @@ type GrowingCircularQueue[T any] struct {
 	logger Logger
 }
 
-// NewGrowingCircularQueue creates a new GrowingCircularQueue with the given initial capacity
-func NewGrowingCircularQueue[T any](initialCapacity int, logger Logger) *GrowingCircularQueue[T] {
+// newGrowingCircularQueue creates a new GrowingCircularQueue with the given initial capacity
+func newGrowingCircularQueue[T any](initialCapacity int, logger Logger) *GrowingCircularQueue[T] {
 	return &GrowingCircularQueue[T]{
 		buffer: make([]*Task[T], initialCapacity),
 		cap:    initialCapacity,
