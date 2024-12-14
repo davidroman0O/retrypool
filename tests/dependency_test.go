@@ -164,7 +164,6 @@ func TestDependencyPool_TaskFailureHandling(t *testing.T) {
 			dependencyFailureCalled = true
 			return retrypool.TaskActionAddToDeadTasks
 		},
-
 		OnGroupCompleted: func(groupID interface{}) {
 			fmt.Printf("OnGroupCompleted called for group: %v\n", groupID)
 		},

@@ -79,6 +79,12 @@ func NewDependencyPool[T any](pool *Pool[T], config *DependencyConfig[T]) *Depen
 		if prevOnTaskFailure != nil {
 			action = prevOnTaskFailure(data, err)
 		}
+		if dp.config.OnDependencyFailure != nil {
+			dependentTask, ok := any(data).(DependentTask)
+			if ok {
+				dp.config.OnDependencyFailure(dependentTask.GetGroupID(), dependentTask.GetTaskID(), dependentTask.GetDependencies(), err.Error())
+			}
+		}
 		dp.HandlePoolTaskFailure(data, err)
 		return action
 	})
