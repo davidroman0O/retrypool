@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"reflect"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -970,6 +971,8 @@ func (p *Pool[T]) selectWorkerForTask(task *Task[T]) int {
 		// p.logger.Debug(p.ctx, "No available workers found for task", "task_data", task.data)
 		return -1
 	}
+
+	sort.Ints(availableWorkers)
 
 	if task.immediateRetry && !task.bounceRetry {
 		// Try to use the last worker if available
