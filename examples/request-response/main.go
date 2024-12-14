@@ -8,23 +8,35 @@ import (
 	"github.com/davidroman0O/retrypool"
 )
 
-// MyTask represents the request data.
-type MyTask struct {
+// Define the input and output types
+type RequestData struct {
 	ID int
 }
 
-// MyResponse represents the response data.
-type MyResponse struct {
+type ResponseData struct {
 	Result string
 }
 
-// MyWorker implements the retrypool.Worker interface.
-type MyWorker struct{}
+// Implement the Worker interface
+type ResponseWorker struct{}
 
-// Run processes the task and uses RequestResponse to return the result.
-func (w *MyWorker) Run(ctx context.Context, data *retrypool.RequestResponse[MyTask, MyResponse]) error {
-	time.Sleep(1 * time.Second) // Simulate processing time
-	response := MyResponse{Result: fmt.Sprintf("Processed task %d", data.Request.ID)}
+func (w *ResponseWorker) Run(ctx context.Context, data *retrypool.RequestResponse[RequestData, ResponseData]) error {
+	// Simulate processing time
+	time.Sleep(time.Millisecond * 200)
+
+	// Simulate an error for a specific ID
+	if data.Request.ID == 3 {
+		err := fmt.Errorf("failed to process request ID: %d", data.Request.ID)
+		data.CompleteWithError(err)
+		return nil // Return nil to avoid retrying
+	}
+
+	// Create a response
+	response := ResponseData{
+		Result: fmt.Sprintf("Processed request ID: %d", data.Request.ID),
+	}
+
+	// Complete the request with the response
 	data.Complete(response)
 	return nil
 }
@@ -32,26 +44,52 @@ func (w *MyWorker) Run(ctx context.Context, data *retrypool.RequestResponse[MyTa
 func main() {
 	ctx := context.Background()
 
-	// Initialize the retrypool with one worker.
-	pool := retrypool.New[*retrypool.RequestResponse[MyTask, MyResponse]](ctx, []retrypool.Worker[*retrypool.RequestResponse[MyTask, MyResponse]]{&MyWorker{}})
+	// Create a pool with the ResponseWorker
+	pool := retrypool.New[*retrypool.RequestResponse[RequestData, ResponseData]](
+		ctx,
+		[]retrypool.Worker[*retrypool.RequestResponse[RequestData, ResponseData]]{&ResponseWorker{}},
+		retrypool.WithAttempts[*retrypool.RequestResponse[RequestData, ResponseData]](3),
+	)
 
-	// Create a new RequestResponse instance.
-	requestResponse := retrypool.NewRequestResponse[MyTask, MyResponse](MyTask{ID: 10})
+	// Number of requests to submit
+	numRequests := 5
 
-	// Dispatch the task.
-	err := pool.Submit(requestResponse)
-	if err != nil {
-		fmt.Printf("Failed to dispatch task: %v\n", err)
+	// Slice to hold references to the requests
+	requests := make([]*retrypool.RequestResponse[RequestData, ResponseData], numRequests)
+
+	for i := 1; i <= numRequests; i++ {
+		// Create a new RequestResponse instance
+		req := retrypool.NewRequestResponse[RequestData, ResponseData](RequestData{ID: i})
+		requests[i-1] = req
+
+		// Submit the request to the pool
+		err := pool.Submit(req)
+		if err != nil {
+			fmt.Printf("Error submitting request ID %d: %v\n", req.Request.ID, err)
+			continue
+		}
 	}
 
-	// Wait for the task to complete and retrieve the response.
-	response, err := requestResponse.Wait(ctx)
-	if err != nil {
-		fmt.Printf("Task failed: %v\n", err)
-	} else {
-		fmt.Printf("Received response: %s\n", response.Result)
+	// Wait for all requests to complete and collect responses
+	for _, req := range requests {
+		go func(r *retrypool.RequestResponse[RequestData, ResponseData]) {
+			// Wait with a timeout
+			ctx, cancel := context.WithTimeout(ctx, time.Second*2)
+			defer cancel()
+
+			resp, err := r.Wait(ctx)
+			if err != nil {
+				fmt.Printf("Request ID %d failed: %v\n", r.Request.ID, err)
+			} else {
+				fmt.Printf("Request ID %d succeeded: %s\n", r.Request.ID, resp.Result)
+			}
+		}(req)
 	}
 
-	// Close the pool.
-	pool.Shutdown()
+	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
+		return queueSize > 0 || processingCount > 0
+	}, time.Second)
+
+	// Close the pool
+	pool.Close()
 }
