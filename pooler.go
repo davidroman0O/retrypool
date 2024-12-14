@@ -2860,6 +2860,11 @@ func (n *ProcessedNotification) Wait() {
 	<-n.ch
 }
 
+// Done returns the channel that's closed when the task is processed
+func (n *ProcessedNotification) Done() <-chan struct{} {
+	return n.ch
+}
+
 // QueuedNotification is used to notify when a task is queued
 type QueuedNotification struct {
 	ch     chan struct{}
@@ -2883,6 +2888,11 @@ func (n *QueuedNotification) Notify() {
 // Wait waits for the notification
 func (n *QueuedNotification) Wait() {
 	<-n.ch
+}
+
+// Done returns the channel that's closed when the task is queued
+func (n *QueuedNotification) Done() <-chan struct{} {
+	return n.ch
 }
 
 // RequestResponse manages the lifecycle of a task request and its response
