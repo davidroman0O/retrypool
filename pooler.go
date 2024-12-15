@@ -629,6 +629,8 @@ type Task[T any] struct {
 	attemptTimeout    time.Duration
 	notifiedProcessed *ProcessedNotification
 	notifiedQueued    *QueuedNotification
+	queuedCb          func()
+	processedCb       func()
 	immediateRetry    bool
 	bounceRetry       bool
 	attemptedWorkers  map[int]struct{} // Track workers that attempted this task
@@ -775,6 +777,20 @@ func WithProcessedNotification[T any](n *ProcessedNotification) TaskOption[T] {
 func WithQueuedNotification[T any](n *QueuedNotification) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.notifiedQueued = n
+	}
+}
+
+// WithQueuedCb sets a callback for when a task is queued
+func WithQueuedCb[T any](cb func()) TaskOption[T] {
+	return func(t *Task[T]) {
+		t.queuedCb = cb
+	}
+}
+
+// WithProcessedCb sets a callback for when a task is processed
+func WithProcessedCb[T any](cb func()) TaskOption[T] {
+	return func(t *Task[T]) {
+		t.processedCb = cb
 	}
 }
 
@@ -940,6 +956,9 @@ func (p *Pool[T]) submitTask(task *Task[T]) error {
 
 	if task.notifiedQueued != nil {
 		task.notifiedQueued.Notify()
+	}
+	if task.queuedCb != nil {
+		task.queuedCb()
 	}
 
 	if err := p.TransitionTaskState(task, TaskStateQueued, "Task enqueued"); err != nil {
@@ -2593,6 +2612,9 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 	}
 	if task.notifiedProcessed != nil {
 		task.notifiedProcessed.Notify()
+	}
+	if task.processedCb != nil {
+		task.processedCb()
 	}
 	p.taskPool.Put(task)
 }

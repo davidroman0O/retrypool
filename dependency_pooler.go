@@ -2,8 +2,10 @@ package retrypool
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 /// DependencyPool: a pool that manage the execution order of tasks that depends on other tasks from same group.
@@ -35,32 +37,21 @@ import (
 ///
 /// The dependency pool must use the round-robin strategy option to have a deterministic behavior when a task is submitted to the pool. It will helps to track the state of the tasks and the dependencies and in which order they are processed by which worker to prevent any kind of deadlocks.
 
+// TaskDistributionStrategy defines how tasks are distributed across workers
+type TaskDistributionStrategy int
+
+const (
+	TaskDistributionRoundRobin TaskDistributionStrategy = iota
+	TaskDistributionLeastLoaded
+)
+
+// DependencyStrategy defines how tasks and groups are prioritized
 type DependencyStrategy int
 
 const (
-	DependencyStrategyOrder DependencyStrategy = iota
-	DependencyStrategyPriority
+	DependencyStrategyOrder    DependencyStrategy = iota // Execute tasks in dependency order within groups
+	DependencyStrategyPriority                           // Prioritize completing started groups before starting new ones
 )
-
-// DependencyConfig holds configuration for handling dependent tasks
-type DependencyConfig[T any] struct {
-	EqualsTaskID            func(originTaskID interface{}, targetTaskID interface{}) bool
-	EqualsGroupID           func(originGroupID interface{}, targetGroupID interface{}) bool
-	MaxDynamicWorkers       int
-	AutoCreateWorkers       bool
-	WorkerFactory           func() Worker[T]
-	OnDependencyFailure     func(groupID interface{}, taskID interface{}, dependentIDs []interface{}, reason string) TaskAction
-	OnCreateWorker          func(workerID int)
-	OnTaskWaiting           func(groupID interface{}, taskID interface{})
-	OnGroupCreated          func(groupID interface{})
-	OnTaskRunning           func(groupID interface{}, taskID interface{})
-	OnGroupCompleted        func(groupID interface{})
-	OnGroupCompletedChan    chan *RequestResponse[interface{}, error]
-	OnGroupStarted          func(groupID interface{})
-	OnTaskQueued            func(groupID interface{}, taskID interface{})
-	OnTaskProcessed         func(groupID interface{}, taskID interface{})
-	PrioritizeStartedGroups bool
-}
 
 // DependentTask represents a task that depends on other tasks
 type DependentTask interface {
@@ -70,134 +61,251 @@ type DependentTask interface {
 	HashID() uint64
 }
 
-// dependencyGraph manages the dependency relationships between tasks
-type dependencyGraph[T any] struct {
-	mu           sync.RWMutex
-	groups       map[interface{}]map[interface{}]*Task[T]
-	dependencies map[interface{}][]interface{}
+// DependencyConfig holds configuration for handling dependent tasks
+type DependencyConfig[T any] struct {
+	// Core configuration
+	EqualsTaskID      func(originTaskID interface{}, targetTaskID interface{}) bool
+	EqualsGroupID     func(originGroupID interface{}, targetGroupID interface{}) bool
+	Strategy          DependencyStrategy // Determines task scheduling strategy
+	MaxDynamicWorkers int                // Maximum number of workers to create dynamically
+	AutoCreateWorkers bool               // Whether to automatically create new workers when needed
+	WorkerFactory     func() Worker[T]   // Factory function for creating new workers
+
+	// Callbacks for task lifecycle events
+	OnDependencyFailure func(groupID interface{}, taskID interface{}, dependentIDs []interface{}, reason string) TaskAction
+	OnCreateWorker      func(workerID int)
+	OnTaskWaiting       func(groupID interface{}, taskID interface{})
+	OnGroupCreated      func(groupID interface{})
+	OnTaskRunning       func(groupID interface{}, taskID interface{})
+	OnGroupCompleted    func(groupID interface{})
+	OnGroupStarted      func(groupID interface{})
+	OnTaskQueued        func(groupID interface{}, taskID interface{})
+	OnTaskProcessed     func(groupID interface{}, taskID interface{})
+
+	// Channel for handling group completion requests
+	OnGroupCompletedChan chan *RequestResponse[interface{}, error]
 }
 
-// pendingTask holds task data and options
+// TaskInfo holds metadata about a task
+type TaskInfo struct {
+	State        TaskState
+	Dependencies []interface{}
+	Completed    bool
+	Failed       bool
+	Processing   bool
+	WorkerID     int // Tracks which worker is processing the task
+	RetryCount   int
+	QueuedAt     time.Time
+	StartedAt    time.Time
+	WaitingOn    []interface{} // List of task IDs this task is waiting on
+}
+
+// GroupInfo holds metadata about a group
+type GroupInfo struct {
+	Tasks          map[interface{}]*TaskInfo
+	Started        bool
+	Priority       int
+	TaskOrder      []interface{} // Maintains order of task submission
+	ActiveTasks    int32         // Number of currently processing tasks
+	CompletedTasks int32
+	FailedTasks    int32
+}
+
+// DependencyPool manages task dependencies and execution order
+type DependencyPool[T any] struct {
+	pool                 *Pool[T]
+	config               *DependencyConfig[T]
+	groups               map[interface{}]*GroupInfo
+	waitingTasks         map[interface{}][]pendingTask[T]
+	dynamicWorkers       int64
+	workerStats          map[int]*workerStats
+	mu                   sync.RWMutex
+	completionChan       chan *RequestResponse[interface{}, error]
+	logger               Logger
+	distributionStrategy TaskDistributionStrategy
+	lastWorkerIndex      atomic.Int64 // For round-robin distribution
+}
+
+// workerStats tracks worker-specific metrics
+type workerStats struct {
+	activeTaskCount atomic.Int64
+	totalProcessed  atomic.Int64
+	lastTaskTime    atomic.Int64
+}
+
+// pendingTask holds a task waiting for dependencies
 type pendingTask[T any] struct {
 	data    T
 	options []TaskOption[T]
 }
 
-// DependencyPool wraps the Pool to manage dependent tasks
-type DependencyPool[T any] struct {
-	pool             *Pool[T]
-	config           *DependencyConfig[T]
-	dependencyGraph  *dependencyGraph[T]
-	waitingTasks     map[interface{}][]pendingTask[T]
-	groupStates      map[interface{}]map[interface{}]TaskState
-	groupCompletedCh chan *RequestResponse[interface{}, error]
-	mu               sync.Mutex
+func NewDependencyPool[T any](pool *Pool[T], config *DependencyConfig[T]) (*DependencyPool[T], error) {
+	pool.logger.Debug(pool.ctx, "Creating new DependencyPool", "has_completion_chan", config.OnGroupCompletedChan != nil, "strategy", config.Strategy)
 
-	dynamicWorkerCount int64
-	startedGroups      []interface{}
-}
-
-// NewDependencyPool creates a new DependencyPool
-func NewDependencyPool[T any](pool *Pool[T], config *DependencyConfig[T]) *DependencyPool[T] {
-	pool.logger.Info(pool.ctx, "Creating new DependencyPool")
-
-	dp := &DependencyPool[T]{
-		pool:   pool,
-		config: config,
-		dependencyGraph: &dependencyGraph[T]{
-			groups:       make(map[interface{}]map[interface{}]*Task[T]),
-			dependencies: make(map[interface{}][]interface{}),
-		},
-		waitingTasks:     make(map[interface{}][]pendingTask[T]),
-		groupStates:      make(map[interface{}]map[interface{}]TaskState),
-		groupCompletedCh: config.OnGroupCompletedChan,
-		startedGroups:    make([]interface{}, 0),
+	if config.EqualsTaskID == nil || config.EqualsGroupID == nil {
+		pool.logger.Error(pool.ctx, "Missing required comparison functions", "equals_task_id_nil", config.EqualsTaskID == nil, "equals_group_id_nil", config.EqualsGroupID == nil)
+		return nil, fmt.Errorf("EqualsTaskID and EqualsGroupID functions must be provided")
+	}
+	if !pool.config.roundRobin {
+		pool.logger.Error(pool.ctx, "Pool not configured for round-robin distribution")
+		return nil, fmt.Errorf("dependency pool requires round-robin task distribution")
 	}
 
-	pool.logger.Debug(pool.ctx, "Setting up success handler")
+	dp := &DependencyPool[T]{
+		pool:                 pool,
+		config:               config,
+		groups:               make(map[interface{}]*GroupInfo),
+		waitingTasks:         make(map[interface{}][]pendingTask[T]),
+		completionChan:       config.OnGroupCompletedChan,
+		logger:               pool.logger,
+		workerStats:          make(map[int]*workerStats),
+		distributionStrategy: TaskDistributionRoundRobin,
+	}
+
+	// Initialize worker stats
+	workers, _ := pool.Workers()
+	pool.logger.Debug(pool.ctx, "Initializing worker stats", "worker_count", len(workers))
+	for _, workerID := range workers {
+		dp.workerStats[workerID] = &workerStats{}
+	}
+
+	// Set up handlers
 	pool.SetOnTaskSuccess(func(data T) {
-		pool.logger.Debug(pool.ctx, "Task success callback triggered", "data", fmt.Sprintf("%+v", data))
-		dp.HandlePoolTaskSuccess(data)
+		if task, ok := any(data).(DependentTask); ok {
+			pool.logger.Debug(pool.ctx, "Task success callback triggered", "task_id", task.GetTaskID(), "group_id", task.GetGroupID())
+			dp.handleTaskSuccess(task)
+		}
 	})
 
-	pool.logger.Debug(pool.ctx, "Setting up failure handler")
 	pool.SetOnTaskFailure(func(data T, err error) TaskAction {
-		pool.logger.Debug(pool.ctx, "Task failure callback triggered", "data", fmt.Sprintf("%+v", data), "error", err)
-		if dp.config.OnDependencyFailure != nil {
-			if dependentTask, ok := any(data).(DependentTask); ok {
-				dp.config.OnDependencyFailure(
-					dependentTask.GetGroupID(),
-					dependentTask.GetTaskID(),
-					dependentTask.GetDependencies(),
-					err.Error(),
-				)
-			}
+		if task, ok := any(data).(DependentTask); ok {
+			pool.logger.Debug(pool.ctx, "Task failure callback triggered", "task_id", task.GetTaskID(), "group_id", task.GetGroupID(), "error", err)
+			return dp.handleTaskFailure(task, err)
 		}
-		dp.HandlePoolTaskFailure(data, err)
 		return TaskActionRetry
 	})
 
-	if config.OnGroupCompletedChan != nil {
+	if dp.completionChan != nil {
 		pool.logger.Debug(pool.ctx, "Starting group completion handler")
-		go dp.handleGroupCompletedRequests()
+		go dp.handleCompletionRequests()
 	}
 
-	pool.logger.Info(pool.ctx, "DependencyPool created successfully")
-	return dp
+	pool.logger.Info(pool.ctx, "DependencyPool created successfully", "worker_count", len(workers))
+	return dp, nil
 }
 
-// Close closes the underlying pool
-func (dp *DependencyPool[T]) Close() error {
-	dp.pool.logger.Info(dp.pool.ctx, "Closing DependencyPool")
-	return dp.pool.Close()
-}
-
-// Submit submits a task to the pool, handling dependencies
-// We only care about DependentTask
 func (dp *DependencyPool[T]) Submit(data T, options ...TaskOption[T]) error {
-	var dependentTask DependentTask
-	var ok bool
-	if dependentTask, ok = any(data).(DependentTask); !ok {
-		dp.pool.logger.Error(dp.pool.ctx, "Task data is not a DependentTask", "data", fmt.Sprintf("%+v", data))
-		return fmt.Errorf("task data is not a DependentTask")
+	task, ok := any(data).(DependentTask)
+	if !ok {
+		dp.pool.logger.Error(dp.pool.ctx, "Invalid task type", "data_type", fmt.Sprintf("%T", data))
+		return fmt.Errorf("submitted data must implement DependentTask interface")
 	}
 
-	dp.pool.logger.Debug(dp.pool.ctx, "Submitting task", "data", fmt.Sprintf("%+v", data))
+	dp.pool.logger.Debug(dp.pool.ctx, "Submitting task", "group_id", task.GetGroupID(), "task_id", task.GetTaskID(), "dependencies", task.GetDependencies())
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
 
-	dp.pool.logger.Debug(dp.pool.ctx, "Task is dependent",
-		"group_id", dependentTask.GetGroupID(),
-		"task_id", dependentTask.GetTaskID(),
-		"dependencies", dependentTask.GetDependencies())
-	return dp.submitDependentTask(data, dependentTask, options...)
+	groupID := task.GetGroupID()
+	taskID := task.GetTaskID()
+
+	// Initialize group if needed
+	group, exists := dp.groups[groupID]
+	if !exists {
+		dp.pool.logger.Debug(dp.pool.ctx, "Creating new group", "group_id", groupID)
+		group = &GroupInfo{
+			Tasks: make(map[interface{}]*TaskInfo),
+		}
+		dp.groups[groupID] = group
+
+		if dp.config.OnGroupCreated != nil {
+			dp.config.OnGroupCreated(groupID)
+		}
+	}
+
+	// Create task info
+	taskInfo := &TaskInfo{
+		State:        TaskStateCreated,
+		Dependencies: task.GetDependencies(),
+		QueuedAt:     time.Now(),
+	}
+	group.Tasks[taskID] = taskInfo
+	group.TaskOrder = append(group.TaskOrder, taskID)
+
+	dp.pool.logger.Debug(dp.pool.ctx, "Checking task submission eligibility", "group_id", groupID, "task_id", taskID, "dependencies_count", len(task.GetDependencies()))
+	if dp.canSubmitTask(task) {
+		dp.pool.logger.Debug(dp.pool.ctx, "Task eligible for immediate submission", "group_id", groupID, "task_id", taskID)
+		return dp.submitTask(data, options...)
+	}
+
+	dp.pool.logger.Debug(dp.pool.ctx, "Adding task to waiting list", "group_id", groupID, "task_id", taskID)
+	dp.waitingTasks[groupID] = append(dp.waitingTasks[groupID], pendingTask[T]{
+		data:    data,
+		options: options,
+	})
+
+	if dp.config.OnTaskWaiting != nil {
+		dp.config.OnTaskWaiting(groupID, taskID)
+	}
+
+	dp.checkAndCreateWorkers()
+	return nil
 }
 
-// checkAndCreateWorkers checks if more workers are needed and creates them if allowed
-func (dp *DependencyPool[T]) checkAndCreateWorkers() {
-	dp.pool.logger.Debug(dp.pool.ctx, "Checking if new workers are needed",
-		"auto_create", dp.config.AutoCreateWorkers,
-		"has_factory", dp.config.WorkerFactory != nil)
+func (dp *DependencyPool[T]) canSubmitTask(task DependentTask) bool {
+	dp.pool.logger.Debug(dp.pool.ctx, "Checking task dependencies", "group_id", task.GetGroupID(), "task_id", task.GetTaskID())
+	group := dp.groups[task.GetGroupID()]
 
+	for _, depID := range task.GetDependencies() {
+		if depTask, exists := group.Tasks[depID]; !exists || !depTask.Completed {
+			dp.pool.logger.Debug(dp.pool.ctx, "Dependency not satisfied", "dependency_id", depID, "exists", exists, "completed", exists && depTask.Completed)
+			return false
+		}
+	}
+
+	if dp.config.Strategy == DependencyStrategyPriority {
+		if !group.Started {
+			for _, g := range dp.groups {
+				if g.Started {
+					dp.pool.logger.Debug(dp.pool.ctx, "Cannot start new group due to priority strategy", "group_id", task.GetGroupID())
+					return false
+				}
+			}
+		}
+	}
+
+	dp.pool.logger.Debug(dp.pool.ctx, "Task can be submitted", "group_id", task.GetGroupID(), "task_id", task.GetTaskID())
+	return true
+}
+
+func (dp *DependencyPool[T]) checkAndCreateWorkers() {
 	if !dp.config.AutoCreateWorkers || dp.config.WorkerFactory == nil {
+		dp.pool.logger.Debug(dp.pool.ctx, "Auto worker creation disabled or no factory available", "auto_create", dp.config.AutoCreateWorkers, "has_factory", dp.config.WorkerFactory != nil)
 		return
 	}
 
-	availableWorkers := dp.pool.availableWorkers.Load()
-	totalQueueSize := dp.pool.QueueSize()
+	currentWorkers := atomic.LoadInt64(&dp.dynamicWorkers)
+	if dp.config.MaxDynamicWorkers > 0 && currentWorkers >= int64(dp.config.MaxDynamicWorkers) {
+		dp.pool.logger.Debug(dp.pool.ctx, "Maximum dynamic workers reached", "current", currentWorkers, "max", dp.config.MaxDynamicWorkers)
+		return
+	}
 
-	dp.pool.logger.Debug(dp.pool.ctx, "Worker stats",
-		"available_workers", availableWorkers,
-		"queue_size", totalQueueSize,
-		"dynamic_workers", dp.dynamicWorkerCount,
-		"max_dynamic_workers", dp.config.MaxDynamicWorkers)
+	totalLoad := int64(0)
+	for _, stats := range dp.workerStats {
+		totalLoad += stats.activeTaskCount.Load()
+	}
 
-	if totalQueueSize > availableWorkers && dp.dynamicWorkerCount < int64(dp.config.MaxDynamicWorkers) {
-		dp.pool.logger.Info(dp.pool.ctx, "Creating new worker")
-		newWorker := dp.config.WorkerFactory()
-		if err := dp.pool.Add(newWorker, nil); err == nil {
+	availableWorkers := len(dp.workerStats)
+	dp.pool.logger.Debug(dp.pool.ctx, "Checking worker load", "total_load", totalLoad, "available_workers", availableWorkers)
+
+	if availableWorkers == 0 || totalLoad/int64(availableWorkers) > 2 {
+		dp.pool.logger.Info(dp.pool.ctx, "Creating new worker", "current_workers", currentWorkers)
+		worker := dp.config.WorkerFactory()
+		if err := dp.pool.Add(worker, nil); err == nil {
 			newWorkerID := dp.pool.nextWorkerID - 1
-			atomic.AddInt64(&dp.dynamicWorkerCount, 1)
+			dp.workerStats[newWorkerID] = &workerStats{}
+			atomic.AddInt64(&dp.dynamicWorkers, 1)
+
 			if dp.config.OnCreateWorker != nil {
-				dp.pool.logger.Debug(dp.pool.ctx, "Calling OnCreateWorker callback", "worker_id", newWorkerID)
 				dp.config.OnCreateWorker(newWorkerID)
 			}
 			dp.pool.logger.Info(dp.pool.ctx, "New worker created successfully", "worker_id", newWorkerID)
@@ -207,309 +315,259 @@ func (dp *DependencyPool[T]) checkAndCreateWorkers() {
 	}
 }
 
-// HandlePoolTaskSuccess handles successful task completion
-func (dp *DependencyPool[T]) HandlePoolTaskSuccess(data T) {
-	dependentTask, ok := any(data).(DependentTask)
-	if !ok {
-		dp.pool.logger.Error(dp.pool.ctx, "Task data is not a DependentTask", "data", fmt.Sprintf("%+v", data))
-		return
+func (dp *DependencyPool[T]) selectWorker(task DependentTask) (int, error) {
+	workers, err := dp.pool.Workers()
+	if err != nil || len(workers) == 0 {
+		dp.pool.logger.Error(dp.pool.ctx, "No workers available", "error", err, "workers_count", len(workers))
+		return -1, fmt.Errorf("no workers available")
 	}
 
-	groupID := dependentTask.GetGroupID()
-	taskID := dependentTask.GetTaskID()
+	dp.pool.logger.Debug(dp.pool.ctx, "Selecting worker for task", "task_id", task.GetTaskID(), "strategy", dp.distributionStrategy, "workers_count", len(workers))
 
-	dp.mu.Lock()
-	defer dp.mu.Unlock()
+	switch dp.distributionStrategy {
+	case TaskDistributionRoundRobin:
+		nextIndex := dp.lastWorkerIndex.Add(1) % int64(len(workers))
+		dp.pool.logger.Debug(dp.pool.ctx, "Selected worker using round-robin", "worker_id", workers[nextIndex], "index", nextIndex)
+		return workers[nextIndex], nil
 
-	dp.pool.logger.Info(dp.pool.ctx, "Processing task completion",
-		"group_id", groupID,
-		"task_id", taskID,
-		"dependencies", dependentTask.GetDependencies())
+	case TaskDistributionLeastLoaded:
+		var minLoad int64 = math.MaxInt64
+		selectedWorker := -1
 
-	dp.groupStates[groupID][taskID] = TaskStateCompleted
-
-	// Check group completion
-	allCompleted := true
-	completedCount := 0
-	totalCount := len(dp.groupStates[groupID])
-	for tid, state := range dp.groupStates[groupID] {
-		if state == TaskStateCompleted {
-			completedCount++
-		} else {
-			dp.pool.logger.Debug(dp.pool.ctx, "Task not completed",
-				"task_id", tid,
-				"state", state)
-			allCompleted = false
-		}
-	}
-
-	dp.pool.logger.Debug(dp.pool.ctx, "Group completion status",
-		"group_id", groupID,
-		"completed_tasks", completedCount,
-		"total_tasks", totalCount,
-		"all_completed", allCompleted)
-
-	if allCompleted {
-		dp.pool.logger.Info(dp.pool.ctx, "Group completed", "group_id", groupID)
-
-		// Remove from started groups
-		for i, id := range dp.startedGroups {
-			if id == groupID {
-				dp.startedGroups = append(dp.startedGroups[:i], dp.startedGroups[i+1:]...)
-				break
+		for _, workerID := range workers {
+			if stats := dp.workerStats[workerID]; stats != nil {
+				currentLoad := stats.activeTaskCount.Load()
+				if currentLoad < minLoad {
+					minLoad = currentLoad
+					selectedWorker = workerID
+				}
 			}
 		}
-
-		if dp.config.OnGroupCompleted != nil {
-			dp.pool.logger.Debug(dp.pool.ctx, "Calling OnGroupCompleted callback", "group_id", groupID)
-			dp.config.OnGroupCompleted(groupID)
-		}
-
-		// Handle prioritized groups
-		if dp.config.PrioritizeStartedGroups {
-			dp.pool.logger.Debug(dp.pool.ctx, "Processing next group due to prioritization")
-
-			for nextGroupID, tasks := range dp.waitingTasks {
-				dp.pool.logger.Info(dp.pool.ctx, "Starting next group",
-					"group_id", nextGroupID,
-					"waiting_tasks", len(tasks))
-
-				dp.startedGroups = append(dp.startedGroups, nextGroupID)
-
-				if dp.config.OnGroupStarted != nil {
-					dp.pool.logger.Debug(dp.pool.ctx, "Calling OnGroupStarted callback", "group_id", nextGroupID)
-					dp.config.OnGroupStarted(nextGroupID)
-				}
-
-				var remainingTasks []pendingTask[T]
-				submittedCount := 0
-
-				for _, task := range tasks {
-					if dt, ok := any(task.data).(DependentTask); ok {
-						if len(dt.GetDependencies()) == 0 {
-							dp.pool.logger.Debug(dp.pool.ctx, "Submitting task with no dependencies",
-								"group_id", nextGroupID,
-								"task_id", dt.GetTaskID())
-
-							if err := dp.pool.Submit(task.data, task.options...); err != nil {
-								dp.pool.logger.Error(dp.pool.ctx, "Failed to submit task",
-									"error", err,
-									"group_id", nextGroupID,
-									"task_id", dt.GetTaskID())
-								continue
-							}
-
-							dp.groupStates[nextGroupID][dt.GetTaskID()] = TaskStateQueued
-							submittedCount++
-
-							if dp.config.OnTaskQueued != nil {
-								dp.config.OnTaskQueued(nextGroupID, dt.GetTaskID())
-							}
-						} else {
-							dp.pool.logger.Debug(dp.pool.ctx, "Task has dependencies, keeping in waiting list",
-								"group_id", nextGroupID,
-								"task_id", dt.GetTaskID(),
-								"dependencies", dt.GetDependencies())
-							remainingTasks = append(remainingTasks, task)
-						}
-					}
-				}
-
-				dp.pool.logger.Info(dp.pool.ctx, "Group processing complete",
-					"group_id", nextGroupID,
-					"submitted_tasks", submittedCount,
-					"remaining_tasks", len(remainingTasks))
-
-				if len(remainingTasks) > 0 {
-					dp.waitingTasks[nextGroupID] = remainingTasks
-				} else {
-					delete(dp.waitingTasks, nextGroupID)
-				}
-
-				break // Only start one group
-			}
-		}
+		dp.pool.logger.Debug(dp.pool.ctx, "Selected worker using least-loaded strategy", "worker_id", selectedWorker, "load", minLoad)
+		return selectedWorker, nil
 	}
 
-	// Check for dependent tasks that can now be submitted
-	dp.checkAndSubmitDependentTasks(groupID)
+	dp.pool.logger.Error(dp.pool.ctx, "Invalid distribution strategy", "strategy", dp.distributionStrategy)
+	return -1, fmt.Errorf("invalid distribution strategy")
 }
 
-// HandlePoolTaskFailure handles task failures
-func (dp *DependencyPool[T]) HandlePoolTaskFailure(data T, err error) {
-	if dependentTask, ok := any(data).(DependentTask); ok {
-		dp.mu.Lock()
-		defer dp.mu.Unlock()
+func (dp *DependencyPool[T]) submitTask(data T, options ...TaskOption[T]) error {
+	task := any(data).(DependentTask)
+	groupID := task.GetGroupID()
+	taskID := task.GetTaskID()
 
-		groupID := dependentTask.GetGroupID()
-		taskID := dependentTask.GetTaskID()
+	dp.pool.logger.Debug(dp.pool.ctx, "Submitting task", "group_id", groupID, "task_id", taskID, "dependencies", task.GetDependencies())
 
-		dp.pool.logger.Error(dp.pool.ctx, "Task failed",
-			"group_id", groupID,
-			"task_id", taskID,
-			"error", err)
-
-		dp.groupStates[groupID][taskID] = TaskStateFailed
+	workerID, err := dp.selectWorker(task)
+	if err != nil {
+		dp.pool.logger.Error(dp.pool.ctx, "Worker selection failed", "error", err, "group_id", groupID, "task_id", taskID)
+		return fmt.Errorf("worker selection failed: %w", err)
 	}
-}
 
-// submitDependentTask handles the submission of dependent tasks
-func (dp *DependencyPool[T]) submitDependentTask(data T, dependentTask DependentTask, options ...TaskOption[T]) error {
 	dp.mu.Lock()
-	defer dp.mu.Unlock()
+	group := dp.groups[groupID]
+	taskInfo := group.Tasks[taskID]
+	taskInfo.State = TaskStateQueued
+	taskInfo.WorkerID = workerID
 
-	groupID := dependentTask.GetGroupID()
-	taskID := dependentTask.GetTaskID()
-
-	dp.pool.logger.Info(dp.pool.ctx, "Submitting dependent task",
-		"group_id", groupID,
-		"task_id", taskID,
-		"dependencies", dependentTask.GetDependencies())
-
-	// Initialize group if needed
-	if _, exists := dp.groupStates[groupID]; !exists {
-		dp.pool.logger.Debug(dp.pool.ctx, "Creating new group", "group_id", groupID)
-		dp.groupStates[groupID] = make(map[interface{}]TaskState)
-		if dp.config.OnGroupCreated != nil {
-			dp.config.OnGroupCreated(groupID)
-		}
-	}
-
-	dp.groupStates[groupID][taskID] = TaskStatePending
-
-	canSubmit := true
-	if dp.config.PrioritizeStartedGroups {
-		if len(dp.startedGroups) == 0 {
-			dp.pool.logger.Debug(dp.pool.ctx, "Starting first group", "group_id", groupID)
-			dp.startedGroups = append(dp.startedGroups, groupID)
-			if dp.config.OnGroupStarted != nil {
-				dp.config.OnGroupStarted(groupID)
-			}
-		} else {
-			isStarted := false
-			for _, id := range dp.startedGroups {
-				if id == groupID {
-					isStarted = true
-					break
+	dp.pool.logger.Debug(dp.pool.ctx, "Checking for potential deadlocks", "worker_id", workerID, "task_id", taskID)
+	for _, depID := range task.GetDependencies() {
+		if depInfo := group.Tasks[depID]; depInfo != nil {
+			if depInfo.State == TaskStateQueued && depInfo.WorkerID == workerID {
+				newWorkerID, err := dp.selectWorker(task)
+				if err != nil || newWorkerID == workerID {
+					dp.mu.Unlock()
+					dp.pool.logger.Error(dp.pool.ctx, "Deadlock prevention failed", "error", err, "original_worker", workerID, "new_worker", newWorkerID)
+					return fmt.Errorf("deadlock prevention: cannot find alternative worker")
 				}
+				workerID = newWorkerID
+				taskInfo.WorkerID = workerID
+				dp.pool.logger.Debug(dp.pool.ctx, "Reassigned task to prevent deadlock", "new_worker_id", workerID, "task_id", taskID)
 			}
-			if !isStarted {
-				dp.pool.logger.Debug(dp.pool.ctx, "Group not started, delaying submission",
-					"group_id", groupID)
-				canSubmit = false
+			taskInfo.WaitingOn = append(taskInfo.WaitingOn, depID)
+		}
+	}
+	dp.mu.Unlock()
+
+	dp.pool.logger.Debug(dp.pool.ctx, "Setting up task callbacks", "group_id", groupID, "task_id", taskID)
+	options = append(options,
+		WithQueuedCb[T](func() {
+			if dp.config.OnTaskQueued != nil {
+				dp.config.OnTaskQueued(groupID, taskID)
 			}
+		}),
+		WithProcessedCb[T](func() {
+			if dp.config.OnTaskProcessed != nil {
+				dp.config.OnTaskProcessed(groupID, taskID)
+			}
+		}),
+	)
+
+	if stats := dp.workerStats[workerID]; stats != nil {
+		stats.activeTaskCount.Add(1)
+		dp.pool.logger.Debug(dp.pool.ctx, "Updated worker stats", "worker_id", workerID, "active_count", stats.activeTaskCount.Load())
+	}
+
+	options = append(options, WithBounceRetry[T]())
+
+	if err := dp.pool.Submit(data, options...); err != nil {
+		if stats := dp.workerStats[workerID]; stats != nil {
+			stats.activeTaskCount.Add(-1)
+		}
+		dp.pool.logger.Error(dp.pool.ctx, "Failed to submit task to pool", "error", err, "group_id", groupID, "task_id", taskID)
+		return err
+	}
+
+	if dp.config.OnTaskRunning != nil {
+		dp.config.OnTaskRunning(groupID, taskID)
+	}
+
+	if !group.Started {
+		group.Started = true
+		dp.pool.logger.Debug(dp.pool.ctx, "Starting group", "group_id", groupID)
+		if dp.config.OnGroupStarted != nil {
+			dp.config.OnGroupStarted(groupID)
 		}
 	}
 
-	// Check dependencies
-	if canSubmit && len(dependentTask.GetDependencies()) > 0 {
-		for _, depID := range dependentTask.GetDependencies() {
-			if state, exists := dp.groupStates[groupID][depID]; !exists || state != TaskStateCompleted {
-				dp.pool.logger.Debug(dp.pool.ctx, "Dependency not satisfied",
-					"group_id", groupID,
-					"task_id", taskID,
-					"dependency_id", depID,
-					"dependency_state", state)
-				canSubmit = false
-				break
-			}
-		}
-	}
-
-	if canSubmit {
-		dp.pool.logger.Info(dp.pool.ctx, "Submitting task to pool",
-			"group_id", groupID,
-			"task_id", taskID)
-
-		err := dp.pool.Submit(data, options...)
-		if err != nil {
-			dp.pool.logger.Error(dp.pool.ctx, "Failed to submit task",
-				"group_id", groupID,
-				"task_id", taskID,
-				"error", err)
-			return err
-		}
-
-		dp.groupStates[groupID][taskID] = TaskStateQueued
-		if dp.config.OnTaskQueued != nil {
-			dp.config.OnTaskQueued(groupID, taskID)
-		}
-	} else {
-		dp.pool.logger.Debug(dp.pool.ctx, "Adding task to waiting list",
-			"group_id", groupID,
-			"task_id", taskID)
-
-		dp.waitingTasks[groupID] = append(dp.waitingTasks[groupID],
-			pendingTask[T]{data: data, options: options})
-
-		if dp.config.OnTaskWaiting != nil {
-			dp.config.OnTaskWaiting(groupID, taskID)
-		}
-	}
-
-	dp.checkAndCreateWorkers()
+	atomic.AddInt32(&group.ActiveTasks, 1)
+	dp.pool.logger.Debug(dp.pool.ctx, "Task submitted successfully", "group_id", groupID, "task_id", taskID, "worker_id", workerID)
 	return nil
 }
 
-// checkAndSubmitDependentTasks checks and submits tasks whose dependencies are met
-func (dp *DependencyPool[T]) checkAndSubmitDependentTasks(groupID interface{}) {
-	tasks := dp.waitingTasks[groupID]
-	if len(tasks) == 0 {
+func (dp *DependencyPool[T]) handleTaskSuccess(task DependentTask) {
+	dp.pool.logger.Debug(dp.pool.ctx, "Processing task success", "group_id", task.GetGroupID(), "task_id", task.GetTaskID())
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+
+	groupID := task.GetGroupID()
+	taskID := task.GetTaskID()
+	group := dp.groups[groupID]
+
+	if group == nil {
+		dp.pool.logger.Error(dp.pool.ctx, "Group not found for successful task", "group_id", groupID, "task_id", taskID)
 		return
 	}
 
-	dp.pool.logger.Debug(dp.pool.ctx, "Checking dependent tasks",
-		"group_id", groupID,
-		"waiting_tasks", len(tasks))
+	taskInfo := group.Tasks[taskID]
+	if taskInfo == nil {
+		dp.pool.logger.Error(dp.pool.ctx, "Task info not found", "group_id", groupID, "task_id", taskID)
+		return
+	}
+
+	dp.pool.logger.Debug(dp.pool.ctx, "Updating task state", "group_id", groupID, "task_id", taskID, "previous_state", taskInfo.State)
+	taskInfo.State = TaskStateCompleted
+	taskInfo.Completed = true
+	taskInfo.Processing = false
+
+	if stats := dp.workerStats[taskInfo.WorkerID]; stats != nil {
+		dp.pool.logger.Debug(dp.pool.ctx, "Updating worker stats", "worker_id", taskInfo.WorkerID, "total_processed", stats.totalProcessed.Load())
+		stats.activeTaskCount.Add(-1)
+		stats.totalProcessed.Add(1)
+		stats.lastTaskTime.Store(time.Now().UnixNano())
+	}
+
+	atomic.AddInt32(&group.ActiveTasks, -1)
+	atomic.AddInt32(&group.CompletedTasks, 1)
+	dp.pool.logger.Debug(dp.pool.ctx, "Updated group stats", "group_id", groupID, "active_tasks", atomic.LoadInt32(&group.ActiveTasks), "completed_tasks", atomic.LoadInt32(&group.CompletedTasks))
+
+	if dp.config.OnTaskProcessed != nil {
+		dp.config.OnTaskProcessed(groupID, taskID)
+	}
+
+	dp.processWaitingTasks(groupID)
+
+	completed := atomic.LoadInt32(&group.CompletedTasks)+atomic.LoadInt32(&group.FailedTasks) == int32(len(group.Tasks))
+	if completed {
+		dp.pool.logger.Info(dp.pool.ctx, "Group completed", "group_id", groupID, "total_tasks", len(group.Tasks))
+		if dp.config.OnGroupCompleted != nil {
+			dp.config.OnGroupCompleted(groupID)
+		}
+
+		if dp.completionChan == nil {
+			delete(dp.groups, groupID)
+			delete(dp.waitingTasks, groupID)
+			dp.pool.logger.Debug(dp.pool.ctx, "Cleaned up completed group", "group_id", groupID)
+		}
+	}
+}
+
+func (dp *DependencyPool[T]) handleTaskFailure(task DependentTask, err error) TaskAction {
+	dp.pool.logger.Debug(dp.pool.ctx, "Processing task failure", "group_id", task.GetGroupID(), "task_id", task.GetTaskID(), "error", err)
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+
+	groupID := task.GetGroupID()
+	taskID := task.GetTaskID()
+
+	group := dp.groups[groupID]
+	if group == nil {
+		dp.pool.logger.Error(dp.pool.ctx, "Group not found for failed task", "group_id", groupID, "task_id", taskID)
+		return TaskActionAddToDeadTasks
+	}
+
+	taskInfo := group.Tasks[taskID]
+	if taskInfo == nil {
+		dp.pool.logger.Error(dp.pool.ctx, "Task info not found for failed task", "group_id", groupID, "task_id", taskID)
+		return TaskActionAddToDeadTasks
+	}
+
+	taskInfo.RetryCount++
+	taskInfo.Failed = true
+	taskInfo.Processing = false
+	dp.pool.logger.Debug(dp.pool.ctx, "Updated task failure state", "group_id", groupID, "task_id", taskID, "retry_count", taskInfo.RetryCount)
+
+	if stats := dp.workerStats[taskInfo.WorkerID]; stats != nil {
+		stats.activeTaskCount.Add(-1)
+	}
+
+	atomic.AddInt32(&group.ActiveTasks, -1)
+	atomic.AddInt32(&group.FailedTasks, 1)
+	dp.pool.logger.Debug(dp.pool.ctx, "Updated group failure stats", "group_id", groupID, "active_tasks", atomic.LoadInt32(&group.ActiveTasks), "failed_tasks", atomic.LoadInt32(&group.FailedTasks))
+
+	if dp.config.OnDependencyFailure != nil {
+		action := dp.config.OnDependencyFailure(groupID, taskID, task.GetDependencies(), err.Error())
+		dp.pool.logger.Debug(dp.pool.ctx, "Dependency failure callback executed", "group_id", groupID, "task_id", taskID, "action", action)
+		return action
+	}
+
+	if taskInfo.RetryCount < 3 {
+		taskInfo.Failed = false
+		atomic.AddInt32(&group.FailedTasks, -1)
+		dp.pool.logger.Debug(dp.pool.ctx, "Retrying failed task", "group_id", groupID, "task_id", taskID, "retry_count", taskInfo.RetryCount)
+		return TaskActionRetry
+	}
+
+	dp.pool.logger.Info(dp.pool.ctx, "Task exceeded retry limit", "group_id", groupID, "task_id", taskID, "retry_count", taskInfo.RetryCount)
+	return TaskActionAddToDeadTasks
+}
+
+func (dp *DependencyPool[T]) processWaitingTasks(groupID interface{}) {
+	dp.pool.logger.Debug(dp.pool.ctx, "Processing waiting tasks", "group_id", groupID)
+	waiting := dp.waitingTasks[groupID]
+	if len(waiting) == 0 {
+		return
+	}
 
 	var remainingTasks []pendingTask[T]
-	submittedCount := 0
-
-	for _, task := range tasks {
-		if dt, ok := any(task.data).(DependentTask); ok {
-			canSubmit := true
-			for _, depID := range dt.GetDependencies() {
-				if state, exists := dp.groupStates[groupID][depID]; !exists || state != TaskStateCompleted {
-					dp.pool.logger.Debug(dp.pool.ctx, "Dependency not yet satisfied",
-						"group_id", groupID,
-						"task_id", dt.GetTaskID(),
-						"dependency_id", depID,
-						"dependency_state", state)
-					canSubmit = false
-					break
-				}
-			}
-
-			if canSubmit {
-				dp.pool.logger.Info(dp.pool.ctx, "Submitting dependent task",
-					"group_id", groupID,
-					"task_id", dt.GetTaskID())
-
-				if err := dp.pool.Submit(task.data, task.options...); err != nil {
-					dp.pool.logger.Error(dp.pool.ctx, "Failed to submit dependent task",
-						"group_id", groupID,
-						"task_id", dt.GetTaskID(),
-						"error", err)
-					continue
-				}
-
-				dp.groupStates[groupID][dt.GetTaskID()] = TaskStateQueued
-				submittedCount++
-
-				if dp.config.OnTaskQueued != nil {
-					dp.config.OnTaskQueued(groupID, dt.GetTaskID())
+	processed := 0
+	for _, pt := range waiting {
+		if task, ok := any(pt.data).(DependentTask); ok {
+			if dp.canSubmitTask(task) {
+				dp.pool.logger.Debug(dp.pool.ctx, "Attempting to submit waiting task", "group_id", groupID, "task_id", task.GetTaskID())
+				if err := dp.submitTask(pt.data, pt.options...); err != nil {
+					dp.pool.logger.Error(dp.pool.ctx, "Failed to submit waiting task", "error", err, "group_id", groupID, "task_id", task.GetTaskID())
+					remainingTasks = append(remainingTasks, pt)
+				} else {
+					processed++
 				}
 			} else {
-				remainingTasks = append(remainingTasks, task)
+				remainingTasks = append(remainingTasks, pt)
 			}
 		}
 	}
 
-	dp.pool.logger.Info(dp.pool.ctx, "Dependent task processing complete",
-		"group_id", groupID,
-		"submitted_tasks", submittedCount,
-		"remaining_tasks", len(remainingTasks))
-
+	dp.pool.logger.Debug(dp.pool.ctx, "Waiting task processing complete", "group_id", groupID, "processed", processed, "remaining", len(remainingTasks))
 	if len(remainingTasks) > 0 {
 		dp.waitingTasks[groupID] = remainingTasks
 	} else {
@@ -517,46 +575,177 @@ func (dp *DependencyPool[T]) checkAndSubmitDependentTasks(groupID interface{}) {
 	}
 }
 
-// handleGroupCompletedRequests handles completion status requests for groups
-func (dp *DependencyPool[T]) handleGroupCompletedRequests() {
+func (dp *DependencyPool[T]) handleCompletionRequests() {
 	dp.pool.logger.Info(dp.pool.ctx, "Starting group completion request handler")
-
-	for req := range dp.groupCompletedCh {
-		groupID := req.Request
-
-		dp.pool.logger.Debug(dp.pool.ctx, "Processing group completion request",
-			"group_id", groupID)
-
+	for req := range dp.completionChan {
+		dp.pool.logger.Debug(dp.pool.ctx, "Processing group completion request", "request_group", req.Request)
 		dp.mu.Lock()
-		if states, exists := dp.groupStates[groupID]; exists {
-			allCompleted := true
-			for tid, state := range states {
-				if state != TaskStateCompleted && state != TaskStateFailed {
-					dp.pool.logger.Debug(dp.pool.ctx, "Group not completed",
-						"group_id", groupID,
-						"task_id", tid,
-						"state", state)
-					allCompleted = false
-					break
-				}
-			}
-
-			if allCompleted {
-				dp.pool.logger.Info(dp.pool.ctx, "Group is completed, cleaning up",
-					"group_id", groupID)
-				delete(dp.groupStates, groupID)
-				delete(dp.waitingTasks, groupID)
-				req.Complete(nil)
-			} else {
-				dp.pool.logger.Debug(dp.pool.ctx, "Group not yet completed",
-					"group_id", groupID)
-				req.CompleteWithError(fmt.Errorf("group %v is not completed", groupID))
-			}
-		} else {
-			dp.pool.logger.Error(dp.pool.ctx, "Group not found",
-				"group_id", groupID)
-			req.CompleteWithError(fmt.Errorf("group %v does not exist", groupID))
+		group, exists := dp.groups[req.Request]
+		if !exists {
+			dp.pool.logger.Error(dp.pool.ctx, "Group not found for completion request", "request_group", req.Request)
+			dp.mu.Unlock()
+			req.CompleteWithError(fmt.Errorf("group %v not found", req.Request))
+			continue
 		}
-		dp.mu.Unlock()
+
+		completed := atomic.LoadInt32(&group.CompletedTasks)+atomic.LoadInt32(&group.FailedTasks) == int32(len(group.Tasks))
+		dp.pool.logger.Debug(dp.pool.ctx, "Checking group completion status", "group_id", req.Request, "completed", completed, "total_tasks", len(group.Tasks))
+
+		if completed {
+			groupID := req.Request
+			delete(dp.groups, groupID)
+			delete(dp.waitingTasks, groupID)
+			dp.mu.Unlock()
+			dp.pool.logger.Info(dp.pool.ctx, "Group completion confirmed and cleaned up", "group_id", groupID)
+			req.Complete(nil)
+		} else {
+			dp.mu.Unlock()
+			dp.pool.logger.Debug(dp.pool.ctx, "Group not yet completed", "group_id", req.Request, "completed_tasks", group.CompletedTasks, "failed_tasks", group.FailedTasks)
+			req.CompleteWithError(fmt.Errorf("group %v is not yet completed", req.Request))
+		}
 	}
+}
+
+func (dp *DependencyPool[T]) GetTaskState(groupID, taskID interface{}) (TaskState, error) {
+	dp.pool.logger.Debug(dp.pool.ctx, "Getting task state", "group_id", groupID, "task_id", taskID)
+	dp.mu.RLock()
+	defer dp.mu.RUnlock()
+
+	group, exists := dp.groups[groupID]
+	if !exists {
+		dp.pool.logger.Error(dp.pool.ctx, "Group not found for task state query", "group_id", groupID)
+		return TaskState(0), fmt.Errorf("group %v not found", groupID)
+	}
+
+	taskInfo, exists := group.Tasks[taskID]
+	if !exists {
+		dp.pool.logger.Error(dp.pool.ctx, "Task not found in group", "group_id", groupID, "task_id", taskID)
+		return TaskState(0), fmt.Errorf("task %v not found in group %v", taskID, groupID)
+	}
+
+	dp.pool.logger.Debug(dp.pool.ctx, "Task state retrieved", "group_id", groupID, "task_id", taskID, "state", taskInfo.State)
+	return taskInfo.State, nil
+}
+
+func (dp *DependencyPool[T]) GetGroupStats(groupID interface{}) (active, completed, failed int32, err error) {
+	dp.pool.logger.Debug(dp.pool.ctx, "Getting group stats", "group_id", groupID)
+	dp.mu.RLock()
+	defer dp.mu.RUnlock()
+
+	group, exists := dp.groups[groupID]
+	if !exists {
+		dp.pool.logger.Error(dp.pool.ctx, "Group not found for stats query", "group_id", groupID)
+		return 0, 0, 0, fmt.Errorf("group %v not found", groupID)
+	}
+
+	active = atomic.LoadInt32(&group.ActiveTasks)
+	completed = atomic.LoadInt32(&group.CompletedTasks)
+	failed = atomic.LoadInt32(&group.FailedTasks)
+	dp.pool.logger.Debug(dp.pool.ctx, "Group stats retrieved", "group_id", groupID, "active", active, "completed", completed, "failed", failed)
+	return
+}
+
+func (dp *DependencyPool[T]) GetWorkerStats(workerID int) (activeCount, totalProcessed int64, err error) {
+	dp.pool.logger.Debug(dp.pool.ctx, "Getting worker stats", "worker_id", workerID)
+	stats, exists := dp.workerStats[workerID]
+	if !exists {
+		dp.pool.logger.Error(dp.pool.ctx, "Worker stats not found", "worker_id", workerID)
+		return 0, 0, fmt.Errorf("worker %d not found", workerID)
+	}
+
+	activeCount = stats.activeTaskCount.Load()
+	totalProcessed = stats.totalProcessed.Load()
+	dp.pool.logger.Debug(dp.pool.ctx, "Worker stats retrieved", "worker_id", workerID, "active_count", activeCount, "total_processed", totalProcessed)
+	return
+}
+
+func (dp *DependencyPool[T]) Close() error {
+	dp.pool.logger.Info(dp.pool.ctx, "Closing dependency pool")
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+
+	if dp.completionChan != nil {
+		close(dp.completionChan)
+		dp.pool.logger.Debug(dp.pool.ctx, "Closed completion channel")
+	}
+
+	for groupID, group := range dp.groups {
+		if dp.config.OnGroupCompleted != nil && len(group.Tasks) > 0 {
+			dp.pool.logger.Debug(dp.pool.ctx, "Calling completion callback for remaining group", "group_id", groupID, "remaining_tasks", len(group.Tasks))
+			dp.config.OnGroupCompleted(groupID)
+		}
+	}
+
+	dp.groups = make(map[interface{}]*GroupInfo)
+	dp.waitingTasks = make(map[interface{}][]pendingTask[T])
+	dp.workerStats = make(map[int]*workerStats)
+	dp.pool.logger.Debug(dp.pool.ctx, "Cleared all internal state")
+
+	err := dp.pool.Close()
+	if err != nil {
+		dp.pool.logger.Error(dp.pool.ctx, "Error closing underlying pool", "error", err)
+	}
+	return err
+}
+
+func (dp *DependencyPool[T]) GetWaitingTasksCount(groupID interface{}) int {
+	dp.mu.RLock()
+	defer dp.mu.RUnlock()
+	count := 0
+	if tasks, exists := dp.waitingTasks[groupID]; exists {
+		count = len(tasks)
+	}
+	dp.pool.logger.Debug(dp.pool.ctx, "Getting waiting tasks count", "group_id", groupID, "count", count)
+	return count
+}
+
+func (dp *DependencyPool[T]) GetGroupTaskOrder(groupID interface{}) ([]interface{}, error) {
+	dp.pool.logger.Debug(dp.pool.ctx, "Getting group task order", "group_id", groupID)
+	dp.mu.RLock()
+	defer dp.mu.RUnlock()
+
+	group, exists := dp.groups[groupID]
+	if !exists {
+		dp.pool.logger.Error(dp.pool.ctx, "Group not found for task order query", "group_id", groupID)
+		return nil, fmt.Errorf("group %v not found", groupID)
+	}
+
+	order := make([]interface{}, len(group.TaskOrder))
+	copy(order, group.TaskOrder)
+	dp.pool.logger.Debug(dp.pool.ctx, "Group task order retrieved", "group_id", groupID, "order_length", len(order))
+	return order, nil
+}
+
+func (dp *DependencyPool[T]) IsGroupStarted(groupID interface{}) bool {
+	dp.mu.RLock()
+	defer dp.mu.RUnlock()
+	started := false
+	if group, exists := dp.groups[groupID]; exists {
+		started = group.Started
+	}
+	dp.pool.logger.Debug(dp.pool.ctx, "Checking if group is started", "group_id", groupID, "started", started)
+	return started
+}
+
+func (dp *DependencyPool[T]) GetTaskDependencies(groupID, taskID interface{}) ([]interface{}, error) {
+	dp.pool.logger.Debug(dp.pool.ctx, "Getting task dependencies", "group_id", groupID, "task_id", taskID)
+	dp.mu.RLock()
+	defer dp.mu.RUnlock()
+
+	group, exists := dp.groups[groupID]
+	if !exists {
+		dp.pool.logger.Error(dp.pool.ctx, "Group not found for dependencies query", "group_id", groupID)
+		return nil, fmt.Errorf("group %v not found", groupID)
+	}
+
+	taskInfo, exists := group.Tasks[taskID]
+	if !exists {
+		dp.pool.logger.Error(dp.pool.ctx, "Task not found for dependencies query", "group_id", groupID, "task_id", taskID)
+		return nil, fmt.Errorf("task %v not found in group %v", taskID, groupID)
+	}
+
+	deps := make([]interface{}, len(taskInfo.Dependencies))
+	copy(deps, taskInfo.Dependencies)
+	dp.pool.logger.Debug(dp.pool.ctx, "Task dependencies retrieved", "group_id", groupID, "task_id", taskID, "dependencies_count", len(deps))
+	return deps, nil
 }
