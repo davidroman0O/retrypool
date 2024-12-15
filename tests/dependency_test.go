@@ -30,6 +30,7 @@ func (w *SimpleWorker[T]) Run(ctx context.Context, data T) error {
 	if w.ProcessErr != nil {
 		return w.ProcessErr
 	}
+	fmt.Printf("Worker %d processing data: %v\n", w.ID, data)
 	w.Processed = append(w.Processed, data)
 	return nil
 }

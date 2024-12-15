@@ -172,7 +172,7 @@ func NewDependencyPool[T any](pool *Pool[T], config *DependencyConfig[T]) (*Depe
 	// Set up handlers
 	pool.SetOnTaskSuccess(func(data T) {
 		if task, ok := any(data).(DependentTask); ok {
-			pool.logger.Debug(pool.ctx, "Task success callback triggered", "task_id", task.GetTaskID(), "group_id", task.GetGroupID())
+			pool.logger.Debug(pool.ctx, "Pool task success callback triggered", "task_id", task.GetTaskID(), "group_id", task.GetGroupID())
 			dp.handleTaskSuccess(task)
 		}
 	})
@@ -392,14 +392,31 @@ func (dp *DependencyPool[T]) submitTask(data T, options ...TaskOption[T]) error 
 	dp.pool.logger.Debug(dp.pool.ctx, "Setting up task callbacks", "group_id", groupID, "task_id", taskID)
 	options = append(options,
 		WithQueuedCb[T](func() {
+			dp.pool.logger.Debug(dp.pool.ctx, "Task queued callback triggered", "group_id", groupID, "task_id", taskID)
 			if dp.config.OnTaskQueued != nil {
 				dp.config.OnTaskQueued(groupID, taskID)
 			}
 		}),
 		WithProcessedCb[T](func() {
+			dp.pool.logger.Debug(dp.pool.ctx, "Task processed callback triggered", "group_id", groupID, "task_id", taskID)
+			dp.mu.Lock()
+			if group := dp.groups[groupID]; group != nil {
+				if taskInfo := group.Tasks[taskID]; taskInfo != nil {
+					dp.pool.logger.Debug(dp.pool.ctx, "Updating task state in processed callback", "group_id", groupID, "task_id", taskID, "old_state", taskInfo.State)
+					taskInfo.State = TaskStateCompleted
+					taskInfo.Completed = true
+					taskInfo.Processing = false
+					atomic.AddInt32(&group.CompletedTasks, 1)
+				}
+			}
+			dp.mu.Unlock()
+
 			if dp.config.OnTaskProcessed != nil {
 				dp.config.OnTaskProcessed(groupID, taskID)
 			}
+
+			// Trigger processing of waiting tasks that might depend on this one
+			dp.processWaitingTasks(groupID)
 		}),
 	)
 
