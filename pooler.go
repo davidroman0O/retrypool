@@ -2586,6 +2586,8 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 		p.logger.Error(p.ctx, "Failed to transition task state", "error", err)
 	}
 
+	p.logger.Debug(p.ctx, "Checking task success callback", "has_callback", p.config.onTaskSuccess != nil)
+
 	if p.config.onTaskSuccess != nil {
 		p.config.onTaskSuccess(task.data)
 	}

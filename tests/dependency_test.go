@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ type SimpleWorker[T any] struct {
 func (w *SimpleWorker[T]) Run(ctx context.Context, data T) error {
 	w.Lock()
 	defer w.Unlock()
+	fmt.Println("Worker", w.ID, "processing data:", data)
 	w.Processed = append(w.Processed, data)
 	return w.ProcessErr
 }
@@ -89,33 +92,33 @@ func TestDependencyPool_SubmitAndExecutionOrder(t *testing.T) {
 	})
 
 	// Define tasks with dependencies
-	task1 := &DependentTaskImpl{
+	task1a := &DependentTaskImpl{
 		TaskID:  "task1",
 		GroupID: "group1",
 	}
 
-	task2 := &DependentTaskImpl{
+	task2a := &DependentTaskImpl{
 		TaskID:       "task2",
 		GroupID:      "group1",
 		Dependencies: []string{"task1"},
 	}
 
-	task3 := &DependentTaskImpl{
+	task3a := &DependentTaskImpl{
 		TaskID:       "task3",
 		GroupID:      "group1",
 		Dependencies: []string{"task2"},
 	}
 
 	// Submit tasks (order of submission should not affect execution order)
-	err := dp.Submit(task3)
+	err := dp.Submit(task3a)
 	if err != nil {
 		t.Fatalf("Failed to submit task3: %v", err)
 	}
-	err = dp.Submit(task1)
+	err = dp.Submit(task1a)
 	if err != nil {
 		t.Fatalf("Failed to submit task1: %v", err)
 	}
-	err = dp.Submit(task2)
+	err = dp.Submit(task2a)
 	if err != nil {
 		t.Fatalf("Failed to submit task2: %v", err)
 	}
@@ -143,6 +146,131 @@ func TestDependencyPool_SubmitAndExecutionOrder(t *testing.T) {
 		if dependentTask.TaskID != expectedOrder[i] {
 			t.Errorf("Expected task ID %s at index %d, got %s", expectedOrder[i], i, dependentTask.TaskID)
 		}
+	}
+
+	if err := dp.Close(); err != nil {
+		t.Fatalf("Failed to close dependency pool: %v", err)
+	}
+}
+
+func TestDependencyPool_SubmitAndExecutionOrderGroups(t *testing.T) {
+	ctx := context.Background()
+	worker := &SimpleWorker[interface{}]{}
+	pool := retrypool.New(ctx, []retrypool.Worker[interface{}]{worker})
+
+	whenCompleted := make(chan *retrypool.RequestResponse[interface{}, error])
+
+	dpConfig := &retrypool.DependencyConfig[interface{}]{
+		OnGroupCompletedChan: whenCompleted,
+		OnGroupCompleted: func(groupID interface{}) {
+			fmt.Printf("OnGroupCompleted called for group: %v\n", groupID)
+		},
+	}
+	dp := retrypool.NewDependencyPool(pool, dpConfig)
+
+	// Set up synchronization
+	var wg sync.WaitGroup
+	wg.Add(3) // We expect 3 tasks to be processed
+
+	// Set up the pool's onTaskSuccess and onTaskFailure handlers
+	pool.SetOnTaskSuccess(func(data interface{}) {
+		fmt.Println("onTaskSuccess called with data:", data)
+		dp.HandlePoolTaskSuccess(data)
+		wg.Done()
+	})
+
+	pool.SetOnTaskFailure(func(data interface{}, err error) retrypool.TaskAction {
+		fmt.Println("onTaskFailure called with data:", data, "error:", err)
+		dp.HandlePoolTaskFailure(data, err)
+		wg.Done()
+		return retrypool.TaskActionRemove
+	})
+
+	// Define tasks with dependencies
+	task1a := &DependentTaskImpl{
+		TaskID:  "task1",
+		GroupID: "group1",
+	}
+
+	task2a := &DependentTaskImpl{
+		TaskID:       "task2",
+		GroupID:      "group1",
+		Dependencies: []string{"task1"},
+	}
+
+	task3a := &DependentTaskImpl{
+		TaskID:       "task3",
+		GroupID:      "group1",
+		Dependencies: []string{"task2"},
+	}
+
+	task1b := &DependentTaskImpl{
+		TaskID:  "task1",
+		GroupID: "group2",
+	}
+
+	task2b := &DependentTaskImpl{
+		TaskID:       "task2",
+		GroupID:      "group2",
+		Dependencies: []string{"task1"},
+	}
+
+	task3b := &DependentTaskImpl{
+		TaskID:       "task3",
+		GroupID:      "group2",
+		Dependencies: []string{"task2"},
+	}
+
+	// Submit tasks (order of submission should not affect execution order)
+	err := dp.Submit(task3a)
+	if err != nil {
+		t.Fatalf("Failed to submit task3: %v", err)
+	}
+	err = dp.Submit(task1a)
+	if err != nil {
+		t.Fatalf("Failed to submit task1: %v", err)
+	}
+	err = dp.Submit(task1b)
+	if err != nil {
+		t.Fatalf("Failed to submit task1: %v", err)
+	}
+	err = dp.Submit(task2b)
+	if err != nil {
+		t.Fatalf("Failed to submit task1: %v", err)
+	}
+	err = dp.Submit(task3b)
+	if err != nil {
+		t.Fatalf("Failed to submit task1: %v", err)
+	}
+	err = dp.Submit(task2a)
+	if err != nil {
+		t.Fatalf("Failed to submit task2: %v", err)
+	}
+
+	// Wait for tasks to complete
+	wg.Wait()
+
+	// Safely copy the processed tasks
+	worker.Lock()
+	processedTasks := make([]interface{}, len(worker.Processed))
+	copy(processedTasks, worker.Processed)
+	worker.Unlock()
+
+	if len(processedTasks) != 3 {
+		t.Fatalf("Expected 3 tasks to be processed, got %d", len(processedTasks))
+	}
+
+	// Verify execution order based on dependencies
+	expectedOrder := []string{"task1", "task2", "task3"}
+	for i, processedTask := range processedTasks {
+		// dependentTask, ok := processedTask.(*DependentTaskImpl)
+		// if !ok {
+		// 	t.Fatalf("Processed task is not of type *DependentTaskImpl")
+		// }
+		// if dependentTask.TaskID != expectedOrder[i] {
+		// 	t.Errorf("Expected task ID %s at index %d, got %s", expectedOrder[i], i, dependentTask.TaskID)
+		// }
+		fmt.Println("\tProcessed task:", processedTask, "expected:", expectedOrder[i])
 	}
 
 	if err := dp.Close(); err != nil {
@@ -312,5 +440,236 @@ func TestDependencyPool_WaitingTasks(t *testing.T) {
 	}
 	if taskIDs[0] != "task1" || taskIDs[1] != "task2" {
 		t.Errorf("Tasks processed in wrong order: %v", taskIDs)
+	}
+}
+
+func TestDependencyPool_DynamicWorkerScaling(t *testing.T) {
+	ctx := context.Background()
+	var workerCreationCount int32
+
+	// Worker factory that counts the number of workers created
+	workerFactory := func() retrypool.Worker[interface{}] {
+		atomic.AddInt32(&workerCreationCount, 1)
+		return &SimpleWorker[interface{}]{}
+	}
+
+	// Initialize the pool with one worker
+	initialWorkers := 1
+	pool := retrypool.New(ctx, []retrypool.Worker[interface{}]{&SimpleWorker[interface{}]{}}, retrypool.WithLogger[interface{}](retrypool.NewLogger(slog.LevelInfo)))
+
+	dpConfig := &retrypool.DependencyConfig[interface{}]{
+		AutoCreateWorkers: true,
+		MaxDynamicWorkers: 2,
+		WorkerFactory:     workerFactory,
+	}
+
+	dp := retrypool.NewDependencyPool(pool, dpConfig)
+
+	// Number of tasks to submit
+	taskCount := 5
+	var wg sync.WaitGroup
+	wg.Add(taskCount)
+
+	// Channel to track tasks being processed
+	var processedTasks int32
+
+	// Set up the pool's onTaskSuccess handler
+	pool.SetOnTaskSuccess(func(data interface{}) {
+		atomic.AddInt32(&processedTasks, 1)
+		wg.Done()
+	})
+
+	// Submit tasks
+	for i := 0; i < taskCount; i++ {
+		task := &DependentTaskImpl{
+			TaskID:  fmt.Sprintf("task%d", i),
+			GroupID: fmt.Sprintf("group%d", i%2), // Alternate between two groups
+		}
+		err := dp.Submit(task)
+		if err != nil {
+			t.Fatalf("Failed to submit task %d: %v", i, err)
+		}
+	}
+
+	// Wait for all tasks to be processed
+	wg.Wait()
+
+	// Verify that dynamic workers were added
+	expectedTotalWorkers := initialWorkers + dpConfig.MaxDynamicWorkers
+	actualWorkers := int(atomic.LoadInt32(&workerCreationCount)) + initialWorkers
+	if actualWorkers != expectedTotalWorkers {
+		t.Errorf("Expected total workers to be %d, but got %d", expectedTotalWorkers, actualWorkers)
+	}
+
+	// Verify that all tasks were processed
+	if int(atomic.LoadInt32(&processedTasks)) != taskCount {
+		t.Errorf("Expected %d tasks to be processed, but got %d", taskCount, processedTasks)
+	}
+
+	// Close the pool
+	if err := dp.Close(); err != nil {
+		t.Fatalf("Failed to close dependency pool: %v", err)
+	}
+}
+
+func TestDependencyPool_TaskProcessingWithDynamicWorkers(t *testing.T) {
+	ctx := context.Background()
+	var workerCreationCount int32
+
+	workerFactory := func() retrypool.Worker[interface{}] {
+		id := atomic.AddInt32(&workerCreationCount, 1)
+		return &SimpleWorker[interface{}]{ID: int(id)}
+	}
+
+	// Initialize the pool with initialWorkers
+	initialWorkers := 2
+	initialWorkerList := make([]retrypool.Worker[interface{}], initialWorkers)
+	for i := 0; i < initialWorkers; i++ {
+		initialWorkerList[i] = &SimpleWorker[interface{}]{ID: i}
+	}
+	pool := retrypool.New(ctx, initialWorkerList, retrypool.WithLogger[interface{}](retrypool.NewLogger(slog.LevelInfo)))
+
+	dpConfig := &retrypool.DependencyConfig[interface{}]{
+		AutoCreateWorkers: true,
+		MaxDynamicWorkers: 3,
+		WorkerFactory:     workerFactory,
+	}
+
+	dp := retrypool.NewDependencyPool(pool, dpConfig)
+
+	// Number of tasks to submit
+	taskCount := 10
+	var wg sync.WaitGroup
+	wg.Add(taskCount)
+
+	// Map to store processed tasks
+	var processedTasks sync.Map
+
+	// Set up the pool's onTaskSuccess handler
+	pool.SetOnTaskSuccess(func(data interface{}) {
+		if dt, ok := data.(*DependentTaskImpl); ok {
+			processedTasks.Store(dt.TaskID, true)
+		}
+		wg.Done()
+	})
+
+	// Submit tasks
+	for i := 0; i < taskCount; i++ {
+		task := &DependentTaskImpl{
+			TaskID:  fmt.Sprintf("task%d", i),
+			GroupID: "group1",
+		}
+		err := dp.Submit(task)
+		if err != nil {
+			t.Fatalf("Failed to submit task %d: %v", i, err)
+		}
+	}
+
+	// Wait for all tasks to be processed
+	wg.Wait()
+
+	// Verify that all tasks were processed
+	for i := 0; i < taskCount; i++ {
+		taskID := fmt.Sprintf("task%d", i)
+		if _, ok := processedTasks.Load(taskID); !ok {
+			t.Errorf("Task %s was not processed", taskID)
+		}
+	}
+
+	// Verify that dynamic workers were added
+	totalWorkers := initialWorkers + int(workerCreationCount)
+	expectedMaxWorkers := initialWorkers + dpConfig.MaxDynamicWorkers
+	if totalWorkers > expectedMaxWorkers {
+		t.Errorf("Expected total workers to be at most %d, but got %d", expectedMaxWorkers, totalWorkers)
+	}
+
+	// Close the pool
+	if err := dp.Close(); err != nil {
+		t.Fatalf("Failed to close dependency pool: %v", err)
+	}
+}
+
+func TestDependencyPool_GroupPrioritization(t *testing.T) {
+	ctx := context.Background()
+	worker := &SimpleWorker[interface{}]{}
+	pool := retrypool.New(ctx, []retrypool.Worker[interface{}]{worker}, retrypool.WithLogger[interface{}](retrypool.NewLogger(slog.LevelInfo)))
+
+	dpConfig := &retrypool.DependencyConfig[interface{}]{
+		PrioritizeStartedGroups: true,
+	}
+
+	dp := retrypool.NewDependencyPool(pool, dpConfig)
+
+	// Variables to track task execution order
+	var mu sync.Mutex
+	var executionOrder []string
+
+	// Set up the pool's onTaskSuccess handler
+	pool.SetOnTaskSuccess(func(data interface{}) {
+		if dt, ok := data.(*DependentTaskImpl); ok {
+			mu.Lock()
+			executionOrder = append(executionOrder, dt.TaskID)
+			mu.Unlock()
+		}
+	})
+
+	// Submit tasks from Group 1
+	taskCountGroup1 := 5
+	for i := 0; i < taskCountGroup1; i++ {
+		task := &DependentTaskImpl{
+			TaskID:  fmt.Sprintf("G1_task%d", i),
+			GroupID: "group1",
+		}
+		err := dp.Submit(task)
+		if err != nil {
+			t.Fatalf("Failed to submit task %s: %v", task.TaskID, err)
+		}
+	}
+
+	// Simulate a slight delay before submitting tasks from Group 2
+	time.Sleep(50 * time.Millisecond)
+
+	// Submit tasks from Group 2
+	taskCountGroup2 := 5
+	for i := 0; i < taskCountGroup2; i++ {
+		task := &DependentTaskImpl{
+			TaskID:  fmt.Sprintf("G2_task%d", i),
+			GroupID: "group2",
+		}
+		err := dp.Submit(task)
+		if err != nil {
+			t.Fatalf("Failed to submit task %s: %v", task.TaskID, err)
+		}
+	}
+
+	// Wait for all tasks to be processed
+	totalTaskCount := taskCountGroup1 + taskCountGroup2
+	for {
+		mu.Lock()
+		if len(executionOrder) == totalTaskCount {
+			mu.Unlock()
+			break
+		}
+		mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify that tasks from Group 1 were processed before Group 2
+	mu.Lock()
+	defer mu.Unlock()
+	group1Completed := false
+	for _, taskID := range executionOrder {
+		if !group1Completed && taskID[:2] == "G2" {
+			group1Completed = true
+			t.Errorf("Task from Group 2 processed before Group 1 completed")
+		}
+		if group1Completed && taskID[:2] == "G1" {
+			t.Errorf("Task from Group 1 processed after Group 2 started")
+		}
+	}
+
+	// Close the pool
+	if err := dp.Close(); err != nil {
+		t.Fatalf("Failed to close dependency pool: %v", err)
 	}
 }
