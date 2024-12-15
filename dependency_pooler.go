@@ -412,33 +412,40 @@ func (dp *DependencyPool[T]) submitTask(data T, options ...TaskOption[T]) error 
 
 	dp.pool.logger.Debug(dp.pool.ctx, "Setting up task callbacks", "group_id", groupID, "task_id", taskID)
 	options = append(options,
+
 		WithQueuedCb[T](func() {
 			dp.pool.logger.Debug(dp.pool.ctx, "Task queued callback triggered", "group_id", groupID, "task_id", taskID)
 			if dp.config.OnTaskQueued != nil {
 				dp.config.OnTaskQueued(groupID, taskID)
 			}
 		}),
-		WithProcessedCb[T](func() {
-			dp.pool.logger.Debug(dp.pool.ctx, "Task processed callback triggered", "group_id", groupID, "task_id", taskID)
-			dp.mu.Lock()
-			if group := dp.groups[groupID]; group != nil {
-				if taskInfo := group.Tasks[taskID]; taskInfo != nil {
-					dp.pool.logger.Debug(dp.pool.ctx, "Updating task state in processed callback", "group_id", groupID, "task_id", taskID, "old_state", taskInfo.State)
-					taskInfo.State = TaskStateCompleted
-					taskInfo.Completed = true
-					taskInfo.Processing = false
-					atomic.AddInt32(&group.CompletedTasks, 1)
-				}
-			}
-			dp.mu.Unlock()
+		// WithQueuedCb[T](func() {
+		// 	dp.pool.logger.Debug(dp.pool.ctx, "Task queued callback triggered", "group_id", groupID, "task_id", taskID)
+		// 	if dp.config.OnTaskQueued != nil {
+		// 		dp.config.OnTaskQueued(groupID, taskID)
+		// 	}
+		// }),
+		// WithProcessedCb[T](func() {
+		// 	dp.pool.logger.Debug(dp.pool.ctx, "Task processed callback triggered", "group_id", groupID, "task_id", taskID)
+		// 	dp.mu.Lock()
+		// 	if group := dp.groups[groupID]; group != nil {
+		// 		if taskInfo := group.Tasks[taskID]; taskInfo != nil {
+		// 			dp.pool.logger.Debug(dp.pool.ctx, "Updating task state in processed callback", "group_id", groupID, "task_id", taskID, "old_state", taskInfo.State)
+		// 			taskInfo.State = TaskStateCompleted
+		// 			taskInfo.Completed = true
+		// 			taskInfo.Processing = false
+		// 			atomic.AddInt32(&group.CompletedTasks, 1)
+		// 		}
+		// 	}
+		// 	dp.mu.Unlock()
 
-			if dp.config.OnTaskProcessed != nil {
-				dp.config.OnTaskProcessed(groupID, taskID)
-			}
+		// 	if dp.config.OnTaskProcessed != nil {
+		// 		dp.config.OnTaskProcessed(groupID, taskID)
+		// 	}
 
-			// Trigger processing of waiting tasks that might depend on this one
-			dp.processWaitingTasks(groupID)
-		}),
+		// 	// Trigger processing of waiting tasks that might depend on this one
+		// 	dp.processWaitingTasks(groupID)
+		// }),
 	)
 
 	if stats := dp.workerStats[workerID]; stats != nil {
@@ -509,14 +516,15 @@ func (dp *DependencyPool[T]) handleTaskSuccess(task DependentTask) {
 	atomic.AddInt32(&group.ActiveTasks, -1)
 	atomic.AddInt32(&group.CompletedTasks, 1)
 
+	// Call OnTaskProcessed here, while we still have task state information
+	if dp.config.OnTaskProcessed != nil {
+		dp.config.OnTaskProcessed(groupID, taskID)
+	}
+
 	// Store necessary information before releasing lock
 	completed := atomic.LoadInt32(&group.CompletedTasks)+atomic.LoadInt32(&group.FailedTasks) == int32(len(group.Tasks))
 
 	dp.mu.Unlock()
-
-	if dp.config.OnTaskProcessed != nil {
-		dp.config.OnTaskProcessed(groupID, taskID)
-	}
 
 	// Process waiting tasks without holding the lock
 	dp.processWaitingTasks(groupID)
