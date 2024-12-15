@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sasha-s/go-deadlock"
 	"golang.org/x/time/rate"
 )
 
@@ -27,17 +28,17 @@ import (
 
 // Initialize deadlock detection
 func init() {
-	//// ATTENTION TO MYSELF FROM THE FUTURE
-	//// Also see that we commented all the logs, it's on purpose for the performances (for now we mogged the old retrypool).
-	//// DO NOT REMOVE THAT
-	//// When you're development and debugging, you MUST replace all `sync.` with their `deadlock.` counterparts to allow you to detect deadlocks!!
-	// deadlock.Opts.DeadlockTimeout = time.Second * 2
-	// deadlock.Opts.OnPotentialDeadlock = func() {
-	// 	// fmt.Println("Potential deadlock detected")
-	// 	buf := make([]byte, 1<<16)
-	// 	n := runtime.Stack(buf, true)
-	// 	fmt.Printf("Stack trace:\n%s\n", string(buf[:n]))
-	// }
+	// ATTENTION TO MYSELF FROM THE FUTURE
+	// Also see that we commented all the logs, it's on purpose for the performances (for now we mogged the old retrypool).
+	// DO NOT REMOVE THAT
+	// When you're development and debugging, you MUST replace all `sync.` with their `deadlock.` counterparts to allow you to detect deadlocks!!
+	deadlock.Opts.DeadlockTimeout = time.Second * 2
+	deadlock.Opts.OnPotentialDeadlock = func() {
+		// fmt.Println("Potential deadlock detected")
+		buf := make([]byte, 1<<16)
+		n := runtime.Stack(buf, true)
+		fmt.Printf("Stack trace:\n%s\n", string(buf[:n]))
+	}
 }
 
 // Worker interface for task processing
@@ -146,7 +147,7 @@ func newStateMetrics() *stateMetrics {
 }
 
 type taskQueues[T any] struct {
-	mu     sync.Mutex
+	mu     deadlock.Mutex
 	queues map[int]TaskQueue[T]
 }
 
@@ -203,7 +204,7 @@ type Pool[T any] struct {
 	nextWorkerID          int
 	taskQueues            *taskQueues[T]
 	taskQueueType         TaskQueueType
-	mu                    sync.Mutex
+	mu                    deadlock.Mutex
 	cond                  *sync.Cond
 	stopped               bool
 	ctx                   context.Context
@@ -213,7 +214,7 @@ type Pool[T any] struct {
 	limiter               *rate.Limiter
 	taskPool              sync.Pool
 	deadTasks             []*DeadTask[T]
-	deadMu                sync.Mutex
+	deadMu                deadlock.Mutex
 	roundRobinIndex       atomic.Int64
 	totalProcessing       atomic.Int64
 	totalQueueSize        atomic.Int64
@@ -616,7 +617,7 @@ type Metrics struct {
 
 // Task represents a task in the pool
 type Task[T any] struct {
-	mu                sync.Mutex
+	mu                deadlock.Mutex
 	data              T
 	retries           int
 	totalDuration     time.Duration
@@ -1138,7 +1139,7 @@ func (p *Pool[T]) NewTaskQueue(queueType TaskQueueType) TaskQueue[T] {
 
 // sliceTaskQueue is a simple slice-based queue
 type sliceTaskQueue[T any] struct {
-	mu     sync.Mutex
+	mu     deadlock.Mutex
 	tasks  []*Task[T]
 	logger Logger
 }
@@ -1227,7 +1228,7 @@ func (q *sliceTaskQueue[T]) Drain() []*Task[T] {
 
 // linkedListQueue is a linked list-based queue
 type linkedListQueue[T any] struct {
-	mu     sync.Mutex
+	mu     deadlock.Mutex
 	head   *listNode[T]
 	tail   *listNode[T]
 	size   int
@@ -1333,7 +1334,7 @@ type RingBufferQueue[T any] struct {
 	tail   int
 	size   int
 	cap    int
-	mu     sync.Mutex
+	mu     deadlock.Mutex
 	logger Logger
 }
 
@@ -1438,7 +1439,7 @@ type GrowingRingBufferQueue[T any] struct {
 	tail   int
 	size   int
 	cap    int
-	mu     sync.Mutex
+	mu     deadlock.Mutex
 	logger Logger
 }
 
@@ -1564,7 +1565,7 @@ type CircularQueue[T any] struct {
 	tail   int
 	size   int
 	cap    int
-	mu     sync.Mutex
+	mu     deadlock.Mutex
 	logger Logger
 }
 
@@ -1672,7 +1673,7 @@ type GrowingCircularQueue[T any] struct {
 	tail   int
 	size   int
 	cap    int
-	mu     sync.Mutex
+	mu     deadlock.Mutex
 	logger Logger
 }
 
@@ -1801,7 +1802,7 @@ type workerState[T any] struct {
 	currentTask  *Task[T]
 	taskQueue    TaskQueue[T]
 	removed      atomic.Bool
-	mu           sync.Mutex
+	mu           deadlock.Mutex
 	cond         *sync.Cond
 	async        bool
 	methodsCache map[string]*reflect.Value
@@ -2938,12 +2939,12 @@ func (n *QueuedNotification) Done() <-chan struct{} {
 
 // RequestResponse manages the lifecycle of a task request and its response
 type RequestResponse[T any, R any] struct {
-	Request     T             // The request data
-	done        chan struct{} // Channel to signal completion
-	response    R             // Stores the successful response
-	err         error         // Stores any error that occurred
-	mu          sync.Mutex    // Protects response and err
-	isCompleted bool          // Indicates if request is completed
+	Request     T              // The request data
+	done        chan struct{}  // Channel to signal completion
+	response    R              // Stores the successful response
+	err         error          // Stores any error that occurred
+	mu          deadlock.Mutex // Protects response and err
+	isCompleted bool           // Indicates if request is completed
 }
 
 // NewRequestResponse creates a new RequestResponse instance

@@ -284,7 +284,7 @@ func TestDependencyPool_DynamicWorkers(t *testing.T) {
 		return &SimpleWorker[interface{}]{ID: int(id)}
 	}
 
-	pool := retrypool.New(ctx, []retrypool.Worker[interface{}]{workerFactory()})
+	pool := retrypool.New(ctx, []retrypool.Worker[interface{}]{workerFactory()}, retrypool.WithRoundRobinDistribution[interface{}]())
 
 	config := &retrypool.DependencyConfig[interface{}]{
 		EqualsTaskID:      func(a, b interface{}) bool { return a == b },

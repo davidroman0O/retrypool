@@ -73,7 +73,7 @@ func NewLogger(level LogLevel, opts ...LogOption) Logger {
 
 	handlerOpts := &slog.HandlerOptions{
 		Level:     cfg.level,
-		AddSource: true,
+		AddSource: false,
 	}
 
 	var handler slog.Handler
