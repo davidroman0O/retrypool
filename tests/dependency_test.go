@@ -12,6 +12,10 @@ import (
 	"github.com/davidroman0O/retrypool"
 )
 
+/// TODO: make test using OnGroupCompletedChan to manually end the group while using OnGroupCompleted
+/// TODO: make a test with failures and retries
+/// TODO: make a critical failure test
+
 // SimpleWorker represents a basic worker for testing
 type SimpleWorker[T any] struct {
 	sync.Mutex
@@ -118,6 +122,10 @@ func TestDependencyPool_DependencyOrder(t *testing.T) {
 			executionOrder = append(executionOrder, taskID.(string))
 			executionMu.Unlock()
 			wg.Done()
+		},
+
+		OnGroupRemoved: func(groupID interface{}) {
+			fmt.Println("Group removed:", groupID)
 		},
 	}
 
@@ -331,4 +339,70 @@ func sliceEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestDependencyPool_ManualGroupCompletion tests manual group completion using OnGroupCompletedChan
+func TestDependencyPool_ManualGroupCompletion(t *testing.T) {
+	ctx := context.Background()
+	worker := &SimpleWorker[interface{}]{}
+	pool := retrypool.New(ctx, []retrypool.Worker[interface{}]{worker}, retrypool.WithRoundRobinDistribution[interface{}]())
+
+	completionChan := make(chan *retrypool.RequestResponse[interface{}, error])
+	var groupCompletedCalled bool
+	var mu sync.Mutex
+
+	config := &retrypool.DependencyConfig[interface{}]{
+		EqualsTaskID:  func(a, b interface{}) bool { return a == b },
+		EqualsGroupID: func(a, b interface{}) bool { return a == b },
+		OnGroupCompleted: func(groupID interface{}) {
+			mu.Lock()
+			groupCompletedCalled = true
+			mu.Unlock()
+			fmt.Println("Group completed:", groupID)
+		},
+		OnGroupCompletedChan: completionChan,
+		OnGroupRemoved: func(groupID interface{}) {
+			fmt.Println("Group removed:", groupID)
+		},
+	}
+
+	dp, err := retrypool.NewDependencyPool(pool, config)
+	if err != nil {
+		t.Fatalf("Failed to create dependency pool: %v", err)
+	}
+
+	// Submit tasks
+	tasks := []*DependentTaskImpl{
+		{TaskID: "A", GroupID: "group1"},
+		{TaskID: "B", GroupID: "group1", Dependencies: []string{"A"}},
+	}
+
+	for _, task := range tasks {
+		if err := dp.Submit(task); err != nil {
+			t.Fatalf("Failed to submit task %s: %v", task.TaskID, err)
+		}
+	}
+
+	// Wait for tasks to complete
+	time.Sleep(1 * time.Second)
+
+	// Request group completion
+	req := retrypool.NewRequestResponse[interface{}, error]("group1")
+	completionChan <- req
+
+	// Wait for completion response
+	select {
+	case <-req.Done():
+		if err := req.Err(); err != nil {
+			t.Errorf("Group completion failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("Group completion timed out")
+	}
+
+	mu.Lock()
+	if !groupCompletedCalled {
+		t.Error("OnGroupCompleted was not called")
+	}
+	mu.Unlock()
 }

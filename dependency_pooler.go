@@ -80,6 +80,7 @@ type DependencyConfig[T any] struct {
 	OnTaskRunning       func(groupID interface{}, taskID interface{})
 	OnGroupCompleted    func(groupID interface{})
 	OnGroupStarted      func(groupID interface{})
+	OnGroupRemoved      func(groupID interface{})
 	OnTaskQueued        func(groupID interface{}, taskID interface{})
 	OnTaskProcessed     func(groupID interface{}, taskID interface{})
 
@@ -543,6 +544,9 @@ func (dp *DependencyPool[T]) handleTaskSuccess(task DependentTask) {
 				}
 			}
 			delete(dp.groups, groupID)
+			if dp.config.OnGroupRemoved != nil {
+				dp.config.OnGroupRemoved(groupID)
+			}
 			delete(dp.waitingTasks, groupID)
 			dp.pool.logger.Debug(dp.pool.ctx, "Cleaned up completed group", "group_id", groupID)
 		}
@@ -678,6 +682,7 @@ func (dp *DependencyPool[T]) handleCompletionRequests() {
 		dp.mu.Lock()
 		group, exists := dp.groups[req.Request]
 		if !exists {
+			fmt.Println("Group not found for completion request")
 			dp.pool.logger.Error(dp.pool.ctx, "Group not found for completion request", "request_group", req.Request)
 			dp.mu.Unlock()
 			req.CompleteWithError(fmt.Errorf("group %v not found", req.Request))
@@ -688,13 +693,18 @@ func (dp *DependencyPool[T]) handleCompletionRequests() {
 		dp.pool.logger.Debug(dp.pool.ctx, "Checking group completion status", "group_id", req.Request, "completed", completed, "total_tasks", len(group.Tasks))
 
 		if completed {
+			fmt.Println("Group completed")
 			groupID := req.Request
 			delete(dp.groups, groupID)
+			if dp.config.OnGroupRemoved != nil {
+				dp.config.OnGroupRemoved(groupID)
+			}
 			delete(dp.waitingTasks, groupID)
 			dp.mu.Unlock()
 			dp.pool.logger.Info(dp.pool.ctx, "Group completion confirmed and cleaned up", "group_id", groupID)
 			req.Complete(nil)
 		} else {
+			fmt.Println("Group not yet completed")
 			dp.mu.Unlock()
 			dp.pool.logger.Debug(dp.pool.ctx, "Group not yet completed", "group_id", req.Request, "completed_tasks", group.CompletedTasks, "failed_tasks", group.FailedTasks)
 			req.CompleteWithError(fmt.Errorf("group %v is not yet completed", req.Request))
