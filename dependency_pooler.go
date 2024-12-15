@@ -281,9 +281,13 @@ func (dp *DependencyPool[T]) canSubmitTask(task DependentTask) bool {
 
 	// Priority strategy check with proper group state validation
 	if dp.config.Strategy == DependencyStrategyPriority {
+		group := dp.groups[task.GetGroupID()]
 		if !group.Started {
+			// Check if any other group is currently processing
 			for otherGroupID, otherGroup := range dp.groups {
-				if otherGroup.Started {
+				if otherGroupID != task.GetGroupID() &&
+					otherGroup.Started &&
+					atomic.LoadInt32(&otherGroup.CompletedTasks) < int32(len(otherGroup.Tasks)) {
 					dp.pool.logger.Debug(dp.pool.ctx, "Cannot start new group while another is in progress",
 						"group_id", task.GetGroupID(),
 						"task_id", task.GetTaskID(),
@@ -516,33 +520,44 @@ func (dp *DependencyPool[T]) handleTaskSuccess(task DependentTask) {
 	atomic.AddInt32(&group.ActiveTasks, -1)
 	atomic.AddInt32(&group.CompletedTasks, 1)
 
-	// Call OnTaskProcessed here, while we still have task state information
 	if dp.config.OnTaskProcessed != nil {
 		dp.config.OnTaskProcessed(groupID, taskID)
 	}
 
-	// Store necessary information before releasing lock
 	completed := atomic.LoadInt32(&group.CompletedTasks)+atomic.LoadInt32(&group.FailedTasks) == int32(len(group.Tasks))
 
-	dp.mu.Unlock()
-
-	// Process waiting tasks without holding the lock
-	dp.processWaitingTasks(groupID)
-
-	// Handle group completion
+	// Store waiting groups to process
+	var waitingGroups []interface{}
 	if completed {
-		dp.mu.Lock()
+		group.Started = false
 		dp.pool.logger.Info(dp.pool.ctx, "Group completed", "group_id", groupID, "total_tasks", len(group.Tasks))
 		if dp.config.OnGroupCompleted != nil {
 			dp.config.OnGroupCompleted(groupID)
 		}
 
 		if dp.completionChan == nil {
+			// Collect waiting groups before cleanup
+			for wgID := range dp.waitingTasks {
+				if wgID != groupID {
+					waitingGroups = append(waitingGroups, wgID)
+				}
+			}
 			delete(dp.groups, groupID)
 			delete(dp.waitingTasks, groupID)
 			dp.pool.logger.Debug(dp.pool.ctx, "Cleaned up completed group", "group_id", groupID)
 		}
-		dp.mu.Unlock()
+	}
+
+	dp.mu.Unlock()
+
+	// Process waiting tasks after releasing the lock
+	if !completed {
+		dp.processWaitingTasks(groupID)
+	} else {
+		// Process waiting groups after group completion
+		for _, wgID := range waitingGroups {
+			dp.processWaitingTasks(wgID)
+		}
 	}
 }
 
