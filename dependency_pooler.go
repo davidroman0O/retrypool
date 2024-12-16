@@ -113,12 +113,139 @@ type GroupInfo struct {
 	FailedTasks    int32
 }
 
+type groupMap struct {
+	mu     deadlock.RWMutex
+	groups map[interface{}]*GroupInfo
+}
+
+func (g *groupMap) Get(groupID interface{}) *GroupInfo {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.groups[groupID]
+}
+
+func (g *groupMap) GetSafe(groupID interface{}) (*GroupInfo, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	data, ok := g.groups[groupID]
+	return data, ok
+}
+
+func (g *groupMap) Delete(groupID interface{}) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.groups, groupID)
+}
+
+func (g *groupMap) Set(groupID interface{}, group *GroupInfo) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.groups[groupID] = group
+}
+
+func (g *groupMap) Keys() []interface{} {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	keys := make([]interface{}, 0, len(g.groups))
+	for key := range g.groups {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func (g *groupMap) Values() []*GroupInfo {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	values := make([]*GroupInfo, 0, len(g.groups))
+	for _, value := range g.groups {
+		values = append(values, value)
+	}
+	return values
+}
+
+func (g *groupMap) Range(f func(groupID interface{}, group *GroupInfo) bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	for groupID, group := range g.groups {
+		if !f(groupID, group) {
+			break
+		}
+	}
+}
+
+type waitingMap[T any] struct {
+	mu    deadlock.RWMutex
+	tasks map[interface{}][]pendingTask[T]
+}
+
+func (w *waitingMap[T]) Get(groupID interface{}) []pendingTask[T] {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.tasks[groupID]
+}
+
+func (w *waitingMap[T]) Has(groupID interface{}) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	_, ok := w.tasks[groupID]
+	return ok
+}
+
+func (w *waitingMap[T]) GetSafe(groupID interface{}) ([]pendingTask[T], bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	data, ok := w.tasks[groupID]
+	return data, ok
+}
+
+func (w *waitingMap[T]) Set(groupID interface{}, tasks []pendingTask[T]) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.tasks[groupID] = tasks
+}
+
+func (w *waitingMap[T]) Delete(groupID interface{}) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.tasks, groupID)
+}
+
+func (w *waitingMap[T]) Keys() []interface{} {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	keys := make([]interface{}, 0, len(w.tasks))
+	for key := range w.tasks {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func (w *waitingMap[T]) Values() [][]pendingTask[T] {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	values := make([][]pendingTask[T], 0, len(w.tasks))
+	for _, value := range w.tasks {
+		values = append(values, value)
+	}
+	return values
+}
+
+func (w *waitingMap[T]) Range(f func(groupID interface{}, tasks []pendingTask[T]) bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	for groupID, tasks := range w.tasks {
+		if !f(groupID, tasks) {
+			break
+		}
+	}
+}
+
 // DependencyPool manages task dependencies and execution order
 type DependencyPool[T any] struct {
 	pool                 *Pool[T]
 	config               *DependencyConfig[T]
-	groups               map[interface{}]*GroupInfo
-	waitingTasks         map[interface{}][]pendingTask[T]
+	groups               *groupMap
+	waitingTasks         *waitingMap[T]
 	dynamicWorkers       int64
 	workerStats          map[int]*workerStats
 	mu                   deadlock.RWMutex
@@ -152,12 +279,16 @@ func NewDependencyPool[T any](pool *Pool[T], config *DependencyConfig[T]) (*Depe
 		pool.logger.Error(pool.ctx, "Pool not configured for round-robin distribution")
 		return nil, fmt.Errorf("dependency pool requires round-robin task distribution")
 	}
+	if !pool.config.async {
+		pool.logger.Error(pool.ctx, "Pool not configured for async operation")
+		return nil, fmt.Errorf("dependency pool requires async operation")
+	}
 
 	dp := &DependencyPool[T]{
 		pool:                 pool,
 		config:               config,
-		groups:               make(map[interface{}]*GroupInfo),
-		waitingTasks:         make(map[interface{}][]pendingTask[T]),
+		groups:               &groupMap{groups: make(map[interface{}]*GroupInfo)},
+		waitingTasks:         &waitingMap[T]{tasks: make(map[interface{}][]pendingTask[T])},
 		completionChan:       config.OnGroupCompletedChan,
 		logger:               pool.logger,
 		workerStats:          make(map[int]*workerStats),
@@ -211,14 +342,14 @@ func (dp *DependencyPool[T]) Submit(data T, options ...TaskOption[T]) error {
 	groupID := task.GetGroupID()
 	taskID := task.GetTaskID()
 
-	group, exists := dp.groups[groupID]
+	group, exists := dp.groups.GetSafe(groupID)
 	if !exists {
 		dp.pool.logger.Debug(dp.pool.ctx, "Creating new group", "group_id", groupID)
 		group = &GroupInfo{
 			Tasks:     make(map[interface{}]*TaskInfo),
 			TaskOrder: make([]interface{}, 0),
 		}
-		dp.groups[groupID] = group
+		dp.groups.Set(groupID, group)
 
 		if dp.config.OnGroupCreated != nil {
 			dp.config.OnGroupCreated(groupID)
@@ -245,13 +376,9 @@ func (dp *DependencyPool[T]) Submit(data T, options ...TaskOption[T]) error {
 
 	dp.pool.logger.Debug(dp.pool.ctx, "Adding task to waiting list", "group_id", groupID, "task_id", taskID)
 
-	if _, exists := dp.waitingTasks[groupID]; !exists {
-		dp.waitingTasks[groupID] = make([]pendingTask[T], 0)
+	if dp.waitingTasks.Has(groupID) {
+		dp.waitingTasks.Set(groupID, append(make([]pendingTask[T], 0), pendingTask[T]{data: data, options: options}))
 	}
-	dp.waitingTasks[groupID] = append(dp.waitingTasks[groupID], pendingTask[T]{
-		data:    data,
-		options: options,
-	})
 
 	dp.checkAndCreateWorkers()
 	return nil
@@ -260,7 +387,7 @@ func (dp *DependencyPool[T]) Submit(data T, options ...TaskOption[T]) error {
 func (dp *DependencyPool[T]) canSubmitTask(task DependentTask) bool {
 	dp.pool.logger.Debug(dp.pool.ctx, "Checking task dependencies", "group_id", task.GetGroupID(), "task_id", task.GetTaskID())
 
-	group, exists := dp.groups[task.GetGroupID()]
+	group, exists := dp.groups.GetSafe(task.GetGroupID())
 	if !exists {
 		dp.pool.logger.Error(dp.pool.ctx, "Group not found for dependency check", "group_id", task.GetGroupID())
 		return false
@@ -280,12 +407,13 @@ func (dp *DependencyPool[T]) canSubmitTask(task DependentTask) bool {
 		}
 	}
 
+	can := true
 	// Priority strategy check with proper group state validation
 	if dp.config.Strategy == DependencyStrategyPriority {
-		group := dp.groups[task.GetGroupID()]
+		group := dp.groups.Get(task.GetGroupID())
 		if !group.Started {
 			// Check if any other group is currently processing
-			for otherGroupID, otherGroup := range dp.groups {
+			dp.groups.Range(func(otherGroupID interface{}, otherGroup *GroupInfo) bool {
 				if otherGroupID != task.GetGroupID() &&
 					otherGroup.Started &&
 					atomic.LoadInt32(&otherGroup.CompletedTasks) < int32(len(otherGroup.Tasks)) {
@@ -293,14 +421,16 @@ func (dp *DependencyPool[T]) canSubmitTask(task DependentTask) bool {
 						"group_id", task.GetGroupID(),
 						"task_id", task.GetTaskID(),
 						"blocking_group", otherGroupID)
-					return false
+					can = false
+					return true
 				}
-			}
+				return true
+			})
 		}
 	}
 
 	dp.pool.logger.Debug(dp.pool.ctx, "Task dependencies satisfied", "group_id", task.GetGroupID(), "task_id", task.GetTaskID())
-	return true
+	return can
 }
 
 func (dp *DependencyPool[T]) checkAndCreateWorkers() {
@@ -391,7 +521,7 @@ func (dp *DependencyPool[T]) submitTask(data T, options ...TaskOption[T]) error 
 	}
 
 	dp.mu.Lock()
-	group := dp.groups[groupID]
+	group := dp.groups.Get(groupID)
 	taskInfo := group.Tasks[taskID]
 	taskInfo.State = TaskStateQueued
 	taskInfo.WorkerID = workerID
@@ -491,7 +621,7 @@ func (dp *DependencyPool[T]) handleTaskSuccess(task DependentTask) {
 
 	groupID := task.GetGroupID()
 	taskID := task.GetTaskID()
-	group := dp.groups[groupID]
+	group := dp.groups.Get(groupID)
 
 	if group == nil {
 		dp.mu.Unlock()
@@ -538,16 +668,17 @@ func (dp *DependencyPool[T]) handleTaskSuccess(task DependentTask) {
 
 		if dp.completionChan == nil {
 			// Collect waiting groups before cleanup
-			for wgID := range dp.waitingTasks {
+			dp.waitingTasks.Range(func(wgID interface{}, _ []pendingTask[T]) bool {
 				if wgID != groupID {
 					waitingGroups = append(waitingGroups, wgID)
 				}
-			}
-			delete(dp.groups, groupID)
+				return true
+			})
+			dp.groups.Delete(groupID)
 			if dp.config.OnGroupRemoved != nil {
 				dp.config.OnGroupRemoved(groupID)
 			}
-			delete(dp.waitingTasks, groupID)
+			dp.waitingTasks.Delete(groupID)
 			dp.pool.logger.Debug(dp.pool.ctx, "Cleaned up completed group", "group_id", groupID)
 		}
 	}
@@ -573,7 +704,7 @@ func (dp *DependencyPool[T]) handleTaskFailure(task DependentTask, err error) Ta
 	groupID := task.GetGroupID()
 	taskID := task.GetTaskID()
 
-	group := dp.groups[groupID]
+	group := dp.groups.Get(groupID)
 	if group == nil {
 		dp.pool.logger.Error(dp.pool.ctx, "Group not found for failed task", "group_id", groupID, "task_id", taskID)
 		return TaskActionAddToDeadTasks
@@ -618,7 +749,7 @@ func (dp *DependencyPool[T]) handleTaskFailure(task DependentTask, err error) Ta
 func (dp *DependencyPool[T]) processWaitingTasks(groupID interface{}) {
 	dp.pool.logger.Debug(dp.pool.ctx, "Processing waiting tasks", "group_id", groupID)
 
-	waiting, exists := dp.waitingTasks[groupID]
+	waiting, exists := dp.waitingTasks.GetSafe(groupID)
 	if !exists || len(waiting) == 0 {
 		dp.pool.logger.Debug(dp.pool.ctx, "No waiting tasks found", "group_id", groupID)
 		return
@@ -669,9 +800,9 @@ func (dp *DependencyPool[T]) processWaitingTasks(groupID interface{}) {
 	dp.pool.logger.Debug(dp.pool.ctx, "Waiting tasks processing completed", "group_id", groupID, "processed_count", processedCount, "remaining_count", len(remainingTasks))
 
 	if len(remainingTasks) > 0 {
-		dp.waitingTasks[groupID] = remainingTasks
+		dp.waitingTasks.Set(groupID, remainingTasks)
 	} else {
-		delete(dp.waitingTasks, groupID)
+		dp.waitingTasks.Delete(groupID)
 	}
 }
 
@@ -680,7 +811,7 @@ func (dp *DependencyPool[T]) handleCompletionRequests() {
 	for req := range dp.completionChan {
 		dp.pool.logger.Debug(dp.pool.ctx, "Processing group completion request", "request_group", req.Request)
 		dp.mu.Lock()
-		group, exists := dp.groups[req.Request]
+		group, exists := dp.groups.GetSafe(req.Request)
 		if !exists {
 			fmt.Println("Group not found for completion request")
 			dp.pool.logger.Error(dp.pool.ctx, "Group not found for completion request", "request_group", req.Request)
@@ -695,11 +826,11 @@ func (dp *DependencyPool[T]) handleCompletionRequests() {
 		if completed {
 			fmt.Println("Group completed")
 			groupID := req.Request
-			delete(dp.groups, groupID)
+			dp.groups.Delete(groupID)
 			if dp.config.OnGroupRemoved != nil {
 				dp.config.OnGroupRemoved(groupID)
 			}
-			delete(dp.waitingTasks, groupID)
+			dp.waitingTasks.Delete(groupID)
 			dp.mu.Unlock()
 			dp.pool.logger.Info(dp.pool.ctx, "Group completion confirmed and cleaned up", "group_id", groupID)
 			req.Complete(nil)
@@ -717,7 +848,7 @@ func (dp *DependencyPool[T]) GetTaskState(groupID, taskID interface{}) (TaskStat
 	dp.mu.RLock()
 	defer dp.mu.RUnlock()
 
-	group, exists := dp.groups[groupID]
+	group, exists := dp.groups.GetSafe(groupID)
 	if !exists {
 		dp.pool.logger.Error(dp.pool.ctx, "Group not found for task state query", "group_id", groupID)
 		return TaskState(0), fmt.Errorf("group %v not found", groupID)
@@ -738,7 +869,7 @@ func (dp *DependencyPool[T]) GetGroupStats(groupID interface{}) (active, complet
 	dp.mu.RLock()
 	defer dp.mu.RUnlock()
 
-	group, exists := dp.groups[groupID]
+	group, exists := dp.groups.GetSafe(groupID)
 	if !exists {
 		dp.pool.logger.Error(dp.pool.ctx, "Group not found for stats query", "group_id", groupID)
 		return 0, 0, 0, fmt.Errorf("group %v not found", groupID)
@@ -775,15 +906,16 @@ func (dp *DependencyPool[T]) Close() error {
 		dp.pool.logger.Debug(dp.pool.ctx, "Closed completion channel")
 	}
 
-	for groupID, group := range dp.groups {
+	dp.groups.Range(func(groupID interface{}, group *GroupInfo) bool {
 		if dp.config.OnGroupCompleted != nil && len(group.Tasks) > 0 {
 			dp.pool.logger.Debug(dp.pool.ctx, "Calling completion callback for remaining group", "group_id", groupID, "remaining_tasks", len(group.Tasks))
 			dp.config.OnGroupCompleted(groupID)
 		}
-	}
+		return true
+	})
 
-	dp.groups = make(map[interface{}]*GroupInfo)
-	dp.waitingTasks = make(map[interface{}][]pendingTask[T])
+	dp.groups = &groupMap{groups: make(map[interface{}]*GroupInfo)}
+	dp.waitingTasks = &waitingMap[T]{tasks: make(map[interface{}][]pendingTask[T])}
 	dp.workerStats = make(map[int]*workerStats)
 	dp.pool.logger.Debug(dp.pool.ctx, "Cleared all internal state")
 
@@ -798,7 +930,7 @@ func (dp *DependencyPool[T]) GetWaitingTasksCount(groupID interface{}) int {
 	dp.mu.RLock()
 	defer dp.mu.RUnlock()
 	count := 0
-	if tasks, exists := dp.waitingTasks[groupID]; exists {
+	if tasks, exists := dp.waitingTasks.GetSafe(groupID); exists {
 		count = len(tasks)
 	}
 	dp.pool.logger.Debug(dp.pool.ctx, "Getting waiting tasks count", "group_id", groupID, "count", count)
@@ -810,7 +942,7 @@ func (dp *DependencyPool[T]) GetGroupTaskOrder(groupID interface{}) ([]interface
 	dp.mu.RLock()
 	defer dp.mu.RUnlock()
 
-	group, exists := dp.groups[groupID]
+	group, exists := dp.groups.GetSafe(groupID)
 	if !exists {
 		dp.pool.logger.Error(dp.pool.ctx, "Group not found for task order query", "group_id", groupID)
 		return nil, fmt.Errorf("group %v not found", groupID)
@@ -826,7 +958,7 @@ func (dp *DependencyPool[T]) IsGroupStarted(groupID interface{}) bool {
 	dp.mu.RLock()
 	defer dp.mu.RUnlock()
 	started := false
-	if group, exists := dp.groups[groupID]; exists {
+	if group, exists := dp.groups.GetSafe(groupID); exists {
 		started = group.Started
 	}
 	dp.pool.logger.Debug(dp.pool.ctx, "Checking if group is started", "group_id", groupID, "started", started)
@@ -838,7 +970,7 @@ func (dp *DependencyPool[T]) GetTaskDependencies(groupID, taskID interface{}) ([
 	dp.mu.RLock()
 	defer dp.mu.RUnlock()
 
-	group, exists := dp.groups[groupID]
+	group, exists := dp.groups.GetSafe(groupID)
 	if !exists {
 		dp.pool.logger.Error(dp.pool.ctx, "Group not found for dependencies query", "group_id", groupID)
 		return nil, fmt.Errorf("group %v not found", groupID)

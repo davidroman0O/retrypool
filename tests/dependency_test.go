@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -405,4 +407,255 @@ func TestDependencyPool_ManualGroupCompletion(t *testing.T) {
 		t.Error("OnGroupCompleted was not called")
 	}
 	mu.Unlock()
+}
+
+// StressWorker is a worker that can simulate various conditions
+type StressWorker struct {
+	ID               int
+	processedCount   atomic.Int64
+	failureRate      float64          // 0.0 to 1.0
+	processingTime   [2]time.Duration // min and max processing time
+	panicProbability float64          // 0.0 to 1.0
+}
+
+func (w *StressWorker) Run(ctx context.Context, data interface{}) error {
+	w.processedCount.Add(1)
+
+	// Simulate random processing time
+	processingTime := w.processingTime[0] + time.Duration(rand.Float64())*
+		(w.processingTime[1]-w.processingTime[0])
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(processingTime):
+	}
+
+	// Simulate random panic
+	if rand.Float64() < w.panicProbability {
+		panic(fmt.Sprintf("Simulated panic in worker %d", w.ID))
+	}
+
+	// Simulate random failure
+	if rand.Float64() < w.failureRate {
+		return fmt.Errorf("simulated failure in worker %d", w.ID)
+	}
+
+	return nil
+}
+
+// ComplexTask represents a task with multiple dependencies
+type ComplexTask struct {
+	TaskID       string
+	GroupID      string
+	Dependencies []string
+	Priority     int
+	Size         int // Simulated workload size
+}
+
+func (t *ComplexTask) GetDependencies() []interface{} {
+	deps := make([]interface{}, len(t.Dependencies))
+	for i, dep := range t.Dependencies {
+		deps[i] = dep
+	}
+	return deps
+}
+
+func (t *ComplexTask) GetGroupID() interface{} { return t.GroupID }
+func (t *ComplexTask) GetTaskID() interface{}  { return t.TaskID }
+func (t *ComplexTask) HashID() uint64          { return 0 }
+
+func TestDependencyPool_StressTest(t *testing.T) {
+	// Test configuration
+	const (
+		numGroups         = 20
+		tasksPerGroup     = 15
+		maxDependencies   = 5
+		numWorkers        = 4
+		testDuration      = 30 * time.Second
+		workerFailureRate = 0.1
+		workerPanicRate   = 0.01
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testDuration)
+	defer cancel()
+
+	// Create workers with varying characteristics
+	workers := make([]retrypool.Worker[interface{}], numWorkers)
+	for i := range workers {
+		workers[i] = &StressWorker{
+			ID:          i,
+			failureRate: workerFailureRate,
+			processingTime: [2]time.Duration{
+				50 * time.Millisecond,  // min processing time
+				200 * time.Millisecond, // max processing time
+			},
+			panicProbability: workerPanicRate,
+		}
+	}
+
+	// Create pool with round-robin distribution
+	pool := retrypool.New(ctx, workers, retrypool.WithRoundRobinDistribution[interface{}]())
+
+	// Metrics tracking
+	var (
+		tasksSubmitted  atomic.Int64
+		tasksCompleted  atomic.Int64
+		tasksFailed     atomic.Int64
+		groupsCompleted atomic.Int64
+		deadTasks       atomic.Int64
+	)
+
+	// Create dependency pool configuration
+	config := &retrypool.DependencyConfig[interface{}]{
+		EqualsTaskID:  func(a, b interface{}) bool { return a == b },
+		EqualsGroupID: func(a, b interface{}) bool { return a == b },
+		Strategy:      retrypool.DependencyStrategyPriority,
+		// MaxDynamicWorkers: 2, // Allow dynamic worker creation
+		AutoCreateWorkers: true,
+		WorkerFactory: func() retrypool.Worker[interface{}] {
+			return &StressWorker{
+				ID:          numWorkers + int(rand.Int31n(1000)),
+				failureRate: workerFailureRate,
+				processingTime: [2]time.Duration{
+					50 * time.Millisecond,
+					200 * time.Millisecond,
+				},
+				panicProbability: workerPanicRate,
+			}
+		},
+		OnTaskProcessed: func(groupID, taskID interface{}) {
+			tasksCompleted.Add(1)
+		},
+		OnGroupCompleted: func(groupID interface{}) {
+			groupsCompleted.Add(1)
+		},
+		OnDependencyFailure: func(groupID, taskID interface{}, deps []interface{}, reason string) retrypool.TaskAction {
+			tasksFailed.Add(1)
+			if rand.Float64() < 0.5 {
+				return retrypool.TaskActionRetry
+			}
+			deadTasks.Add(1)
+			return retrypool.TaskActionAddToDeadTasks
+		},
+	}
+
+	dp, err := retrypool.NewDependencyPool(pool, config)
+	if err != nil {
+		t.Fatalf("Failed to create dependency pool: %v", err)
+	}
+
+	// Channel to signal test completion
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Start task submission goroutine
+	go func() {
+		defer close(done)
+
+		for groupNum := 0; groupNum < numGroups; groupNum++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			// Create tasks for this group with random dependencies
+			tasks := make([]*ComplexTask, tasksPerGroup)
+			for i := 0; i < tasksPerGroup; i++ {
+				task := &ComplexTask{
+					TaskID:   fmt.Sprintf("g%d-t%d", groupNum, i),
+					GroupID:  fmt.Sprintf("group-%d", groupNum),
+					Priority: rand.Intn(5),
+					Size:     rand.Intn(100) + 50,
+				}
+
+				// Add random dependencies to previous tasks in the same group
+				maxDeps := min(i, maxDependencies)
+				if maxDeps > 0 {
+					numDeps := rand.Intn(maxDeps + 1)
+					task.Dependencies = make([]string, numDeps)
+					for j := 0; j < numDeps; j++ {
+						depIndex := rand.Intn(i)
+						task.Dependencies[j] = fmt.Sprintf("g%d-t%d", groupNum, depIndex)
+					}
+				}
+
+				tasks[i] = task
+			}
+
+			// Submit tasks in random order
+			indices := rand.Perm(len(tasks))
+			for _, idx := range indices {
+				wg.Add(1)
+				task := tasks[idx]
+				go func(t *ComplexTask) {
+					defer wg.Done()
+					if err := dp.Submit(t); err != nil {
+						fmt.Printf("Failed to submit task %s: %v\n", t.TaskID, err)
+						return
+					}
+					tasksSubmitted.Add(1)
+				}(task)
+			}
+
+			// Add random delays between groups
+			time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+		}
+	}()
+
+	// Wait for completion or timeout
+	select {
+	case <-ctx.Done():
+		t.Log("Test timed out")
+	case <-done:
+		wg.Wait()
+		t.Log("All tasks submitted")
+	}
+
+	// Log final metrics
+	t.Logf("Test Results:")
+	t.Logf("Tasks Submitted: %d", tasksSubmitted.Load())
+	t.Logf("Tasks Completed: %d", tasksCompleted.Load())
+	t.Logf("Tasks Failed: %d", tasksFailed.Load())
+	t.Logf("Groups Completed: %d", groupsCompleted.Load())
+	t.Logf("Dead Tasks: %d", deadTasks.Load())
+
+	// Verify results
+	if tasksSubmitted.Load() == 0 {
+		t.Error("No tasks were submitted")
+	}
+
+	if tasksCompleted.Load() == 0 {
+		t.Error("No tasks were completed")
+	}
+
+	expectedGroups := min(numGroups, int(float64(testDuration)/float64(time.Second)))
+	if groupsCompleted.Load() < int64(expectedGroups/2) {
+		t.Errorf("Too few groups completed. Expected at least %d, got %d",
+			expectedGroups/2, groupsCompleted.Load())
+	}
+
+	// Check worker stats using the correct Workers() signature
+	workerIDs, err := pool.Workers()
+	if err != nil {
+		t.Errorf("Failed to get worker IDs: %v", err)
+	} else {
+		for _, workerID := range workerIDs {
+			activeCount, totalProcessed, err := dp.GetWorkerStats(workerID)
+			if err != nil {
+				t.Errorf("Failed to get worker stats for worker %d: %v", workerID, err)
+				continue
+			}
+			t.Logf("Worker %d - Active: %d, Total Processed: %d",
+				workerID, activeCount, totalProcessed)
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
