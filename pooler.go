@@ -286,6 +286,14 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 	return pool
 }
 
+func (p *Pool[T]) IsAsync() bool {
+	return p.config.async
+}
+
+func (p *Pool[T]) IsRoundRobin() bool {
+	return p.config.roundRobin
+}
+
 // SetOnTaskSuccess allows setting the onTaskSuccess handler after pool creation
 func (p *Pool[T]) SetOnTaskSuccess(handler func(data T)) {
 	p.mu.Lock()
@@ -633,6 +641,7 @@ type Task[T any] struct {
 	notifiedProcessed *ProcessedNotification
 	notifiedQueued    *QueuedNotification
 	queuedCb          func()
+	runningCb         func()
 	processedCb       func()
 	immediateRetry    bool
 	bounceRetry       bool
@@ -794,6 +803,13 @@ func WithQueuedCb[T any](cb func()) TaskOption[T] {
 func WithProcessedCb[T any](cb func()) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.processedCb = cb
+	}
+}
+
+// WithRunningCb sets a callback for when a task is running
+func WithRunningCb[T any](cb func()) TaskOption[T] {
+	return func(t *Task[T]) {
+		t.runningCb = cb
 	}
 }
 
@@ -2552,6 +2568,10 @@ func (p *Pool[T]) executeTask(ctx context.Context, state *workerState[T], task *
 	}()
 
 	p.logger.Debug(p.ctx, "Executing task", "worker_id", state.id, "task_data", task.data)
+
+	if task.runningCb != nil {
+		task.runningCb()
+	}
 
 	return state.worker.Run(ctx, task.data)
 }
