@@ -5714,8 +5714,8 @@
     },
     {
       "type": "arrow",
-      "version": 232,
-      "versionNonce": 474127481,
+      "version": 235,
+      "versionNonce": 1827106137,
       "isDeleted": false,
       "id": "UUTqwOiPgRIH5By6GTGTz",
       "fillStyle": "solid",
@@ -5725,7 +5725,7 @@
       "opacity": 100,
       "angle": 0,
       "x": 1926.340918532304,
-      "y": 5121.705256285853,
+      "y": 5121.984379743869,
       "strokeColor": "#1e1e1e",
       "backgroundColor": "#ffc9c9",
       "width": 322.85839993176137,
@@ -5737,18 +5737,18 @@
         "type": 2
       },
       "boundElements": [],
-      "updated": 1734471748440,
+      "updated": 1734494265504,
       "link": null,
       "locked": false,
       "startBinding": {
         "elementId": "7dqcH1mcAQZrorWafY9tK",
-        "focus": -0.8276409992502733,
-        "gap": 8.105869687791042
+        "focus": -0.8317664540881065,
+        "gap": 8.302060640809358
       },
       "endBinding": {
         "elementId": "IwVWh3xOMqeSdXU0w9qWV",
-        "focus": 0.3999234721565721,
-        "gap": 19.49737669049742
+        "focus": 0.4040489269944053,
+        "gap": 19.598439625591595
       },
       "lastCommittedPoint": null,
       "startArrowhead": "arrow",
@@ -6255,8 +6255,8 @@
     {
       "id": "op6GCtHCbTfaL8QuGyAsW",
       "type": "text",
-      "x": 1401.6052714267018,
-      "y": 4846.98504826376,
+      "x": 1327.1351328281137,
+      "y": 4850.213576261474,
       "width": 738.2518310546875,
       "height": 45,
       "angle": 0,
@@ -6271,11 +6271,11 @@
       "frameId": null,
       "roundness": null,
       "seed": 1928399193,
-      "version": 50,
-      "versionNonce": 292177401,
+      "version": 84,
+      "versionNonce": 1246851673,
       "isDeleted": false,
       "boundElements": null,
-      "updated": 1734471798158,
+      "updated": 1734494272513,
       "link": null,
       "locked": false,
       "text": "That mode probably won't be that useful",

@@ -1,7 +1,7 @@
 
-Blocking use case: the developer wrote a worker that will create new tasks to the DP, that worker will wait for the task to complete.
+Blocking use case: the developer wrote a worker that will create new tasks to the DP, that worker will wait for the task to complete from another worker: submit 1 -> submit 2 -> done 2 -> done 1
 
-Non-blocking use case: the developer is simply sending tasks to the DP.
+Non-blocking use case: the developer is simply sending tasks to the DP: submit 1 -> done 1 -> submit 2 -> done 2.
 
 When dealing with blocking operations:
 

@@ -102,8 +102,8 @@ func main() {
 			return &OrdWorker{len(workers) + 1, executionLog}
 		},
 		retrypool.DependencyConfig[OrdTask, string, int]{
-			TaskOrderMode:  retrypool.TaskOrderOrdered,
-			DependencyMode: retrypool.DependencyOrdered,
+			ExecutionOrder: retrypool.ExecutionOrderForward,
+			TaskMode:       retrypool.TaskModeIndependent,
 			MaxWorkers:     10,
 		},
 	)

@@ -118,8 +118,8 @@ func main() {
 			return &BlockingRevWorker{len(workers) + 1, executionLog, taskStates}
 		},
 		retrypool.DependencyConfig[BlockingRevTask, string, int]{
-			TaskOrderMode:  retrypool.TaskOrderOrdered,
-			DependencyMode: retrypool.DependencyReversed,
+			ExecutionOrder: retrypool.ExecutionOrderReverse,
+			TaskMode:       retrypool.TaskModeBlocking,
 		},
 	)
 
