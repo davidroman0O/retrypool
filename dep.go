@@ -312,10 +312,7 @@ func (dp *DependencyPool[T, GID, TID]) WaitWithCallback(
 
 // scaleWorkersIfNeeded scales the worker pool if needed
 func (dp *DependencyPool[T, GID, TID]) scaleWorkersIfNeeded() error {
-	currentWorkers, err := dp.pooler.Workers()
-	if err != nil {
-		return err
-	}
+	currentWorkers := dp.pooler.GetFreeWorkers()
 
 	totalTasks := int64(0)
 	dp.pooler.RangeWorkerQueues(func(workerID int, queueSize int64) bool {
