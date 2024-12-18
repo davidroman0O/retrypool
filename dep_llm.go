@@ -4,54 +4,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
+
+	"github.com/sasha-s/go-deadlock"
 )
 
-// Errors
-var (
-	ErrTaskAlreadyExists = errors.New("task already exists in group")
-	ErrCyclicDependency  = errors.New("cyclic dependency detected")
-	ErrMissingDependency = errors.New("missing dependency")
+type DependencyMode int
+type TaskOrderMode int
+
+const (
+	DependencyOrdered DependencyMode = iota
+	DependencyReversed
 )
 
-// DependencyPool manages tasks with dependencies
-type DependencyPool[T any, GID comparable, TID comparable] struct {
-	pooler        Pooler[T]
-	workerFactory WorkerFactory[T]
-	config        DependencyConfig[T, GID, TID]
+const (
+	TaskOrderOrdered TaskOrderMode = iota
+	TaskOrderReversed
+)
 
-	mu     sync.RWMutex
-	groups map[GID]*groupState[T, GID, TID]
-}
-
-// DependencyConfig holds configuration for the dependency pool
 type DependencyConfig[T any, GID comparable, TID comparable] struct {
-	// Add any configuration options you need
-	MaxConcurrentTasks int
-}
-
-// groupState tracks the state of tasks within a group
-type groupState[T any, GID comparable, TID comparable] struct {
-	id            GID
-	mu            sync.RWMutex
-	tasks         map[TID]*taskState[T, GID, TID]
-	processing    map[TID]struct{}
-	completed     map[TID]struct{}
-	pendingCount  int
-	currentActive int // tracks currently active tasks for MaxConcurrentTasks
-}
-
-type dependencyTaskConfig[T any, GID comparable, TID comparable] struct {
-	waitForCompletion bool // will have to wait for dependent task to complete before processing (non-blocking processing) ELSE will be processed in parallel (blocking processing)
-}
-
-type dependencyTaskOption[T any, GID comparable, TID comparable] func(*dependencyTaskConfig[T, GID, TID])
-
-func WithWaitForCompletion[T any, GID comparable, TID comparable]() dependencyTaskOption[T, GID, TID] {
-	return func(cfg *dependencyTaskConfig[T, GID, TID]) {
-		cfg.waitForCompletion = true
-	}
+	DependencyMode DependencyMode
+	TaskOrderMode  TaskOrderMode
+	MinWorkers     int
+	MaxWorkers     int
+	ScaleUpRatio   float64
 }
 
 type DependentTask[GID comparable, TID comparable] interface {
@@ -60,15 +36,34 @@ type DependentTask[GID comparable, TID comparable] interface {
 	GetTaskID() TID
 }
 
-// taskState tracks individual task state
+type taskGroup[T any, GID comparable, TID comparable] struct {
+	id        GID
+	tasks     map[TID]*taskState[T, GID, TID]
+	completed map[TID]bool
+	order     []TID
+	blocked   map[TID][]TID
+	mu        deadlock.RWMutex
+}
+
 type taskState[T any, GID comparable, TID comparable] struct {
-	data              T
-	id                TID
-	groupID           GID
-	dependencies      []TID
-	waitForCompletion bool
-	isProcessing      bool
-	isCompleted       bool
+	task         T
+	taskID       TID
+	groupID      GID
+	dependencies []TID
+	submitted    bool
+	completed    bool
+	completionCh chan struct{}
+	parentTask   TID
+}
+
+type DependencyPool[T any, GID comparable, TID comparable] struct {
+	pooler        Pooler[T]
+	workerFactory WorkerFactory[T]
+	config        DependencyConfig[T, GID, TID]
+
+	mu          deadlock.RWMutex
+	taskGroups  map[GID]*taskGroup[T, GID, TID]
+	workerCount int
 }
 
 func NewDependencyPool[T any, GID comparable, TID comparable](
@@ -76,220 +71,298 @@ func NewDependencyPool[T any, GID comparable, TID comparable](
 	workerFactory WorkerFactory[T],
 	config DependencyConfig[T, GID, TID],
 ) (*DependencyPool[T, GID, TID], error) {
+	if config.MinWorkers <= 0 {
+		config.MinWorkers = 1
+	}
+	if config.MaxWorkers <= 0 {
+		config.MaxWorkers = 100
+	}
+	if config.ScaleUpRatio <= 0 {
+		config.ScaleUpRatio = 2.0
+	}
+
 	dp := &DependencyPool[T, GID, TID]{
 		pooler:        pooler,
 		workerFactory: workerFactory,
 		config:        config,
-		groups:        make(map[GID]*groupState[T, GID, TID]),
+		taskGroups:    make(map[GID]*taskGroup[T, GID, TID]),
 	}
 
-	// Set up task completion handler
-	pooler.SetOnTaskSuccess(func(data T) {
-		if dtask, ok := any(data).(DependentTask[GID, TID]); ok {
-			dp.markTaskCompleted(dtask.GetGroupID(), dtask.GetTaskID())
+	for i := 0; i < config.MinWorkers; i++ {
+		worker := workerFactory()
+		if err := pooler.Add(worker, nil); err != nil {
+			return nil, err
 		}
-	})
+		dp.workerCount++
+	}
 
+	pooler.SetOnTaskSuccess(dp.handleTaskCompletion)
 	return dp, nil
 }
 
-func (dp *DependencyPool[T, GID, TID]) Submit(data T, opt ...dependencyTaskOption[T, GID, TID]) error {
+func (dp *DependencyPool[T, GID, TID]) Submit(data T) error {
 	dtask, ok := any(data).(DependentTask[GID, TID])
 	if !ok {
 		return errors.New("data does not implement DependentTask interface")
 	}
 
-	cfg := dependencyTaskConfig[T, GID, TID]{}
-	for _, o := range opt {
-		o(&cfg)
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+
+	groupID := dtask.GetGroupID()
+	taskID := dtask.GetTaskID()
+	deps := dtask.GetDependencies()
+
+	if err := dp.scaleWorkersIfNeeded(); err != nil {
+		return fmt.Errorf("worker scaling failed: %w", err)
 	}
 
-	dp.mu.Lock()
-	// Get or create group state
-	group, exists := dp.groups[dtask.GetGroupID()]
+	group, exists := dp.taskGroups[groupID]
 	if !exists {
-		group = &groupState[T, GID, TID]{
-			id:         dtask.GetGroupID(),
-			tasks:      make(map[TID]*taskState[T, GID, TID]),
-			processing: make(map[TID]struct{}),
-			completed:  make(map[TID]struct{}),
+		group = &taskGroup[T, GID, TID]{
+			id:        groupID,
+			tasks:     make(map[TID]*taskState[T, GID, TID]),
+			completed: make(map[TID]bool),
+			blocked:   make(map[TID][]TID),
+			order:     make([]TID, 0),
 		}
-		dp.groups[dtask.GetGroupID()] = group
+		dp.taskGroups[groupID] = group
 	}
-	dp.mu.Unlock()
+
+	task := &taskState[T, GID, TID]{
+		task:         data,
+		taskID:       taskID,
+		groupID:      groupID,
+		dependencies: deps,
+		completionCh: make(chan struct{}),
+	}
 
 	group.mu.Lock()
-	// Check if task already exists in this group
-	if _, exists := group.tasks[dtask.GetTaskID()]; exists {
-		group.mu.Unlock()
-		return fmt.Errorf("%w: task ID %v in group %v", ErrTaskAlreadyExists, dtask.GetTaskID(), dtask.GetGroupID())
-	}
+	group.tasks[taskID] = task
+	group.order = append(group.order, taskID)
 
-	// Create task state
-	task := &taskState[T, GID, TID]{
-		data:              data,
-		id:                dtask.GetTaskID(),
-		groupID:           dtask.GetGroupID(),
-		dependencies:      dtask.GetDependencies(),
-		waitForCompletion: cfg.waitForCompletion,
+	// In reversed mode, update blocked tasks
+	if dp.config.DependencyMode == DependencyReversed {
+		for _, depID := range deps {
+			group.blocked[depID] = append(group.blocked[depID], taskID)
+		}
 	}
-
-	// Add task to group tracking
-	group.tasks[task.id] = task
-	group.pendingCount++
 	group.mu.Unlock()
 
-	// Check dependencies and submit if ready
-	if err := dp.checkAndSubmitTasks(group); err != nil {
+	if dp.canSubmitTask(group, task) {
+		fmt.Printf("Submitting task %v\n", taskID)
+		return dp.submitTask(task)
+	}
+
+	fmt.Printf("Task %v stored (waiting for deps: %v)\n", taskID, deps)
+	return nil
+}
+
+func (dp *DependencyPool[T, GID, TID]) canSubmitTask(group *taskGroup[T, GID, TID], task *taskState[T, GID, TID]) bool {
+	if task.submitted || task.completed {
+		return false
+	}
+
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+
+	// Different dependency checking based on mode
+	if dp.config.DependencyMode == DependencyOrdered {
+		// Normal dependency checking - task runs when deps complete
+		for _, depID := range task.dependencies {
+			if !group.completed[depID] {
+				return false
+			}
+		}
+	} else {
+		// Reversed dependency checking - task runs if it blocks nothing
+		if blockedTasks, exists := group.blocked[task.taskID]; exists && len(blockedTasks) > 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (dp *DependencyPool[T, GID, TID]) handleTaskCompletion(data T) {
+	dtask := any(data).(DependentTask[GID, TID])
+
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+
+	groupID := dtask.GetGroupID()
+	taskID := dtask.GetTaskID()
+
+	group, exists := dp.taskGroups[groupID]
+	if !exists {
+		return
+	}
+
+	group.mu.Lock()
+	group.completed[taskID] = true
+	task := group.tasks[taskID]
+	if task != nil {
+		task.completed = true
+		close(task.completionCh)
+
+		// In reversed mode, remove this task from blocking others
+		if dp.config.DependencyMode == DependencyReversed {
+			delete(group.blocked, taskID)
+		}
+	}
+	group.mu.Unlock()
+
+	// Process pending tasks based on configured order
+	if dp.config.TaskOrderMode == TaskOrderOrdered {
+		dp.processOrderedTasks(group)
+	} else {
+		dp.processReversedTasks(group)
+	}
+}
+
+func (dp *DependencyPool[T, GID, TID]) processOrderedTasks(group *taskGroup[T, GID, TID]) {
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+
+	for _, taskID := range group.order {
+		task := group.tasks[taskID]
+		if dp.canSubmitTask(group, task) {
+			dp.submitTask(task)
+		}
+	}
+}
+
+func (dp *DependencyPool[T, GID, TID]) processReversedTasks(group *taskGroup[T, GID, TID]) {
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+
+	for i := len(group.order) - 1; i >= 0; i-- {
+		taskID := group.order[i]
+		task := group.tasks[taskID]
+		if dp.canSubmitTask(group, task) {
+			dp.submitTask(task)
+		}
+	}
+}
+
+func (dp *DependencyPool[T, GID, TID]) submitTask(task *taskState[T, GID, TID]) error {
+	if task.submitted {
+		return nil
+	}
+
+	task.submitted = true
+	if err := dp.pooler.Submit(task.task); err != nil {
+		task.submitted = false
 		return err
 	}
 
 	return nil
 }
 
-func (dp *DependencyPool[T, GID, TID]) checkAndSubmitTasks(group *groupState[T, GID, TID]) error {
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	readyTasks := dp.findReadyTasks(group)
-	if len(readyTasks) == 0 {
-		return nil
+func (dp *DependencyPool[T, GID, TID]) scaleWorkersIfNeeded() error {
+	currentWorkers, err := dp.pooler.Workers()
+	if err != nil {
+		return err
 	}
 
-	fmt.Printf("Found %d ready tasks\n", len(readyTasks))
-	for _, task := range readyTasks {
-		if err := dp.submitTask(task, group); err != nil {
-			return fmt.Errorf("failed to submit task %v: %w", task.id, err)
+	totalTasks := int64(0)
+	dp.pooler.RangeWorkerQueues(func(workerID int, queueSize int64) bool {
+		totalTasks += queueSize
+		return true
+	})
+	totalTasks += dp.pooler.ProcessingCount()
+
+	desiredWorkers := int(float64(totalTasks) / dp.config.ScaleUpRatio)
+	if desiredWorkers < dp.config.MinWorkers {
+		desiredWorkers = dp.config.MinWorkers
+	}
+	if desiredWorkers > dp.config.MaxWorkers {
+		desiredWorkers = dp.config.MaxWorkers
+	}
+
+	for i := len(currentWorkers); i < desiredWorkers; i++ {
+		worker := dp.workerFactory()
+		if err := dp.pooler.Add(worker, nil); err != nil {
+			return err
 		}
+		dp.workerCount++
 	}
 
 	return nil
 }
 
-func (dp *DependencyPool[T, GID, TID]) findReadyTasks(group *groupState[T, GID, TID]) []*taskState[T, GID, TID] {
-	var readyTasks []*taskState[T, GID, TID]
-
-	// If waitForCompletion is true for any running task, don't process more tasks
-	if len(group.processing) > 0 {
-		for _, task := range group.tasks {
-			if task.isProcessing && task.waitForCompletion {
-				return nil
-			}
-		}
-	}
-
-	for _, task := range group.tasks {
-		if task.isProcessing || task.isCompleted {
-			continue
-		}
-
-		// Check if all dependencies are completed
-		allDepsCompleted := true
-		for _, depID := range task.dependencies {
-			if _, completed := group.completed[depID]; !completed {
-				allDepsCompleted = false
-				break
-			}
-		}
-
-		if allDepsCompleted {
-			readyTasks = append(readyTasks, task)
-		}
-	}
-
-	return readyTasks
-}
-
-func (dp *DependencyPool[T, GID, TID]) submitTask(task *taskState[T, GID, TID], group *groupState[T, GID, TID]) error {
-	// Mark task as processing
-	task.isProcessing = true
-	group.processing[task.id] = struct{}{}
-
-	// Create callbacks for task state tracking
-	options := []TaskOption[T]{
-		WithRunningCb[T](func() {
-			group.mu.Lock()
-			task.isProcessing = true
-			group.mu.Unlock()
-		}),
-		WithProcessedCb[T](func() {
-			group.mu.Lock()
-			task.isCompleted = true
-			delete(group.processing, task.id)
-			group.completed[task.id] = struct{}{}
-			group.pendingCount--
-			group.mu.Unlock()
-
-			// Check for next tasks
-			if err := dp.checkAndSubmitTasks(group); err != nil {
-				fmt.Printf("Error submitting next tasks: %v\n", err)
-			}
-		}),
-	}
-
-	fmt.Printf("Submitting task ID %v in group %v with deps %v\n", task.id, task.groupID, task.dependencies)
-	return dp.pooler.Submit(task.data, options...)
-}
-
-func (dp *DependencyPool[T, GID, TID]) markTaskCompleted(groupID GID, taskID TID) {
+func (dp *DependencyPool[T, GID, TID]) WaitForTask(groupID GID, taskID TID) error {
 	dp.mu.RLock()
-	group, exists := dp.groups[groupID]
+	group, exists := dp.taskGroups[groupID]
+	if !exists {
+		dp.mu.RUnlock()
+		return fmt.Errorf("group %v not found", groupID)
+	}
+
+	group.mu.RLock()
+	task, exists := group.tasks[taskID]
+	if !exists {
+		group.mu.RUnlock()
+		dp.mu.RUnlock()
+		return fmt.Errorf("task %v not found", taskID)
+	}
+	completionCh := task.completionCh
+	group.mu.RUnlock()
 	dp.mu.RUnlock()
 
-	if exists {
-		group.mu.Lock()
-		if task, exists := group.tasks[taskID]; exists {
-			if !task.isCompleted { // Only process if not already completed
-				fmt.Printf("Completing task ID %v in group %v\n", taskID, groupID)
-				task.isCompleted = true
-				delete(group.processing, taskID)
-				group.completed[taskID] = struct{}{}
-				group.pendingCount--
-			}
-		}
-		group.mu.Unlock()
-
-		// Check for next tasks
-		if err := dp.checkAndSubmitTasks(group); err != nil {
-			fmt.Printf("Error submitting next tasks after completion: %v\n", err)
-		}
-	}
+	<-completionCh
+	return nil
 }
 
-func (dp *DependencyPool[T, GID, TID]) WaitWithCallback(ctx context.Context, callback func(queueSize, processingCount, deadTaskCount int) bool, interval time.Duration) error {
+func (dp *DependencyPool[T, GID, TID]) WaitWithCallback(ctx context.Context,
+	callback func(queueSize, processingCount, deadTaskCount int) bool,
+	interval time.Duration) error {
 	return dp.pooler.WaitWithCallback(ctx, callback, interval)
 }
 
 func (dp *DependencyPool[T, GID, TID]) Close() error {
-	// We can't hold the pool mutex while waiting for groups
-	var wg sync.WaitGroup
-
-	// First get all groups while holding the lock
-	dp.mu.RLock()
-	groups := make([]*groupState[T, GID, TID], 0, len(dp.groups))
-	for _, group := range dp.groups {
-		groups = append(groups, group)
-	}
-	dp.mu.RUnlock()
-
-	// Now wait for each group to complete
-	for _, group := range groups {
-		wg.Add(1)
-		go func(g *groupState[T, GID, TID]) {
-			defer wg.Done()
-			for {
-				g.mu.Lock()
-				processing := len(g.processing)
-				g.mu.Unlock()
-
-				if processing == 0 {
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-		}(group)
-	}
-
-	wg.Wait()
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+	dp.taskGroups = make(map[GID]*taskGroup[T, GID, TID])
 	return dp.pooler.Close()
+}
+
+func (dp *DependencyPool[T, GID, TID]) GetWorkerCount() int {
+	dp.mu.RLock()
+	defer dp.mu.RUnlock()
+	return dp.workerCount
+}
+
+func (dp *DependencyPool[T, GID, TID]) ScaleTo(count int) error {
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+
+	if count < dp.config.MinWorkers {
+		count = dp.config.MinWorkers
+	}
+	if count > dp.config.MaxWorkers {
+		count = dp.config.MaxWorkers
+	}
+
+	currentWorkers, err := dp.pooler.Workers()
+	if err != nil {
+		return err
+	}
+
+	for i := len(currentWorkers); i > count; i-- {
+		if err := dp.pooler.Remove(currentWorkers[i-1]); err != nil {
+			return err
+		}
+		dp.workerCount--
+	}
+
+	for i := len(currentWorkers); i < count; i++ {
+		worker := dp.workerFactory()
+		if err := dp.pooler.Add(worker, nil); err != nil {
+			return err
+		}
+		dp.workerCount++
+	}
+
+	return nil
 }

@@ -34,7 +34,7 @@ func init() {
 	// When you're development and debugging, you MUST replace all `sync.` with their `deadlock.` counterparts to allow you to detect deadlocks!!
 	deadlock.Opts.DeadlockTimeout = time.Second * 2
 	deadlock.Opts.OnPotentialDeadlock = func() {
-		// fmt.Println("Potential deadlock detected")
+		fmt.Println("Potential deadlock detected")
 		buf := make([]byte, 1<<16)
 		n := runtime.Stack(buf, true)
 		fmt.Printf("Stack trace:\n%s\n", string(buf[:n]))
@@ -306,6 +306,13 @@ func (p *Pool[T]) SetOnTaskFailure(handler func(data T, err error) TaskAction) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.config.onTaskFailure = handler
+}
+
+// SetOnTaskAttempt allows setting the onTaskAttempt handler after pool creation
+func (p *Pool[T]) SetOnTaskAttempt(handler func(task *Task[T], workerID int)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.config.onTaskAttempt = handler
 }
 
 type MetricsSnapshot struct {
@@ -667,6 +674,81 @@ func (t *Task[T]) GetAttemptedWorkers() []int {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+// GetFreeWorkers returns a list of worker IDs that have no tasks in their queue
+func (p *Pool[T]) GetFreeWorkers() []int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	freeWorkers := []int{}
+	for id, state := range p.workers {
+		if !state.paused.Load() && !state.removed.Load() {
+			if queue, ok := p.taskQueues.get(id); ok && queue.Length() == 0 && state.currentTask == nil {
+				freeWorkers = append(freeWorkers, id)
+			}
+		}
+	}
+
+	return freeWorkers
+}
+
+// SubmitToFreeWorker attempts to submit a task to a free worker
+func (p *Pool[T]) SubmitToFreeWorker(taskData T, options ...TaskOption[T]) error {
+
+	// Get the list of free workers without holding the lock
+	freeWorkers := p.GetFreeWorkers()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(freeWorkers) == 0 {
+		p.logger.Warn(p.ctx, "No free workers available for task submission", "task_data", taskData)
+		return ErrNoWorkersAvailable
+	}
+
+	// Select a random free worker
+	selectedWorkerID := freeWorkers[rand.Intn(len(freeWorkers))]
+	q := p.taskQueues.getOrCreate(selectedWorkerID, func() TaskQueue[T] {
+		return p.NewTaskQueue(p.taskQueueType)
+	})
+
+	task := p.taskPool.Get().(*Task[T])
+	*task = Task[T]{data: taskData, state: TaskStateCreated}
+
+	for _, option := range options {
+		option(task)
+	}
+
+	if err := p.TransitionTaskState(task, TaskStatePending, "SubmittedToFreeWorker"); err != nil {
+		return err
+	}
+
+	p.logger.Debug(p.ctx, "Submitting task to free worker", "worker_id", selectedWorkerID, "task_data", taskData)
+	p.metrics.TasksSubmitted.Add(1)
+	p.UpdateTotalQueueSize(1)
+	q.Enqueue(task)
+	p.UpdateWorkerQueueSize(selectedWorkerID, 1)
+
+	if task.notifiedQueued != nil {
+		task.notifiedQueued.Notify()
+	}
+	if task.queuedCb != nil {
+		task.queuedCb()
+	}
+
+	if err := p.TransitionTaskState(task, TaskStateQueued, "Task enqueued to free worker"); err != nil {
+		return err
+	}
+
+	// Signal differently based on mode
+	if p.config.async {
+		p.cond.Broadcast()
+	} else {
+		p.cond.Signal()
+	}
+
+	return nil
 }
 
 // TransitionTaskState handles state changes and maintains counts
@@ -2633,6 +2715,7 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 	if p.config.onTaskSuccess != nil {
 		p.config.onTaskSuccess(task.data)
 	}
+
 	if task.notifiedProcessed != nil {
 		task.notifiedProcessed.Notify()
 	}

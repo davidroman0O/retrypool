@@ -304,3 +304,130 @@ func TestAggressiveRoundRobinDistribution(t *testing.T) {
 		})
 	}
 }
+
+type BusyWorker struct {
+	mu    sync.Mutex
+	busy  bool
+	delay time.Duration
+}
+
+func (w *BusyWorker) Run(ctx context.Context, data int) error {
+	w.setBusy(true)
+	defer w.setBusy(false)
+
+	time.Sleep(w.delay) // Simulate task processing
+	return nil
+}
+
+func (w *BusyWorker) setBusy(b bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.busy = b
+}
+
+func (w *BusyWorker) isBusy() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.busy
+}
+
+func TestGetFreeWorkers(t *testing.T) {
+	ctx := context.Background()
+	taskDuration := 100 * time.Millisecond
+	workers := []retrypool.Worker[int]{
+		&BusyWorker{delay: taskDuration},
+		&BusyWorker{delay: taskDuration},
+		&BusyWorker{delay: taskDuration},
+	}
+
+	pool := retrypool.New[int](ctx, workers, retrypool.WithRoundRobinDistribution[int]())
+
+	initialFreeWorkers := pool.GetFreeWorkers()
+	if len(initialFreeWorkers) != len(workers) {
+		t.Errorf("expected all workers to be free initially, got: %d free workers", len(initialFreeWorkers))
+	}
+
+	// Submit tasks to make some workers busy
+	for i := 0; i < 2; i++ {
+		err := pool.Submit(i)
+		if err != nil {
+			t.Errorf("task submission error: %v", err)
+			return
+		}
+	}
+
+	// Wait enough time for tasks to potentially mark workers as busy.
+	time.Sleep(taskDuration / 2)
+
+	freeWorkers := pool.GetFreeWorkers()
+	if len(freeWorkers) == len(workers) {
+		t.Errorf("expected some workers to be busy, but all workers are free")
+	}
+}
+
+// TestWorker simulates a task worker that signals task completion
+type TestWorker struct {
+	id     int
+	blocks bool
+	done   chan struct{}
+}
+
+func (w *TestWorker) Run(ctx context.Context, data int) error {
+	if w.blocks {
+		fmt.Println("\tworker", w.id, "is busy")
+		w.done <- struct{}{}
+		<-ctx.Done()
+	} else {
+		fmt.Println("\tworker", w.id, "is busy")
+		w.done <- struct{}{}
+	}
+	return nil
+}
+
+func TestSubmitToFreeWorker(t *testing.T) {
+	ctx := context.Background()
+
+	// Channel to signal task completion
+	doneChan := make(chan struct{}, 3)
+
+	workers := []retrypool.Worker[int]{
+		&TestWorker{id: 0, blocks: true, done: doneChan},
+		&TestWorker{id: 1, done: doneChan},
+		&TestWorker{id: 2, blocks: true, done: doneChan},
+	}
+
+	pool := retrypool.New[int](ctx, workers, retrypool.WithRoundRobinDistribution[int]())
+
+	// Submit initial tasks to occupy workers
+	for i := 0; i < 3; i++ {
+		go func(i int) {
+			err := pool.Submit(i)
+			if err != nil {
+				t.Errorf("task submission error: %v", err)
+			}
+		}(i)
+	}
+
+	// Wait until all workers signal they are busy
+	for i := 0; i < 2; i++ {
+		fmt.Println("\twaiting for worker")
+		<-doneChan
+	}
+
+	fmt.Println("\tAll workers are busy")
+
+	time.Sleep(10 * time.Millisecond) // Ensure some overlap for finding workers busy
+
+	// Check if all workers are busy
+	if len(pool.GetFreeWorkers()) != 1 {
+		t.Errorf("Expected 1 free worker, got: %d", len(pool.GetFreeWorkers()))
+	}
+
+	fmt.Print("Submitting task to free worker\n")
+	// Try submitting a task expecting no free workers
+	if err := pool.SubmitToFreeWorker(5); err != nil {
+		t.Errorf("task submission error: %v", err)
+	}
+
+	t.Log("TestSubmitToFreeWorker completed successfully")
+}

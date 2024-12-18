@@ -14,6 +14,8 @@ type Pooler[T any] interface {
 	// The handler should return a TaskAction indicating how the pool should proceed.
 	SetOnTaskFailure(handler func(data T, err error) TaskAction)
 
+	SetOnTaskAttempt(handler func(task *Task[T], workerID int))
+
 	// GetMetricsSnapshot returns a snapshot of the current pool metrics.
 	GetMetricsSnapshot() MetricsSnapshot
 
@@ -34,6 +36,12 @@ type Pooler[T any] interface {
 
 	// Workers returns the list of worker IDs currently managed by the pool.
 	Workers() ([]int, error)
+
+	// GetFreeWorkers returns a list of worker IDs that have no tasks in their queue
+	GetFreeWorkers() []int
+
+	// SubmitToFreeWorker attempts to submit a task to a free worker
+	SubmitToFreeWorker(taskData T, options ...TaskOption[T]) error
 
 	// Allocate creates and submits a new task using the internal sync.Pool. The fn callback
 	// can be used to populate the task's data before enqueueing. Optional TaskOptions can modify the task's behavior.
