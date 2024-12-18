@@ -218,7 +218,7 @@ func (dp *DependencyPool[T, GID, TID]) submitTask(task *taskState[T, GID, TID]) 
 		opts = append(opts, WithBounceRetry[T]())
 	}
 
-	return dp.pooler.Submit(task.task, opts...)
+	return dp.pooler.SubmitToFreeWorker(task.task, opts...)
 }
 
 // handleTaskCompletion processes task completion
