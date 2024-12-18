@@ -226,30 +226,51 @@ func (dp *DependencyPool[T, GID, TID]) handleTaskCompletion(data T) {
 	dtask := any(data).(DependentTask[GID, TID])
 
 	dp.mu.Lock()
-	defer dp.mu.Unlock()
-
-	groupID := dtask.GetGroupID()
-	taskID := dtask.GetTaskID()
-
-	group, exists := dp.taskGroups[groupID]
+	group, exists := dp.taskGroups[dtask.GetGroupID()]
 	if !exists {
+		dp.mu.Unlock()
 		return
 	}
+	dp.mu.Unlock()
 
+	// Handle completion first
 	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	// Mark task as completed
-	task := group.tasks[taskID]
+	task := group.tasks[dtask.GetTaskID()]
 	if task != nil {
 		task.completed = true
 		close(task.completionCh)
-		group.completed[taskID] = true
+		group.completed[dtask.GetTaskID()] = true
 	}
+	group.mu.Unlock()
 
-	// Process next tasks based on mode and order
+	// If we're in independent mode, check for next tasks
 	if dp.config.TaskMode == TaskModeIndependent {
-		dp.processNextIndependentTasks(group)
+		var tasksToCheck []TID
+
+		group.mu.RLock()
+		if dp.config.ExecutionOrder == ExecutionOrderForward {
+			tasksToCheck = append([]TID{}, group.order...)
+		} else {
+			// Create reversed copy of order
+			tasksToCheck = make([]TID, len(group.order))
+			for i := len(group.order) - 1; i >= 0; i-- {
+				tasksToCheck[len(group.order)-1-i] = group.order[i]
+			}
+		}
+		group.mu.RUnlock()
+
+		// Check each task without holding the main lock
+		for _, taskID := range tasksToCheck {
+			group.mu.RLock()
+			task := group.tasks[taskID]
+			group.mu.RUnlock()
+
+			if task != nil && !task.submitted {
+				if dp.canStartIndependentTask(group, task) {
+					dp.submitTask(task)
+				}
+			}
+		}
 	}
 }
 

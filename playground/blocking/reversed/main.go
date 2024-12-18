@@ -1,29 +1,32 @@
-// // blocking/reversed.go
+// blocking/ordered.go
 package main
 
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/davidroman0O/retrypool"
+	"github.com/sasha-s/go-deadlock"
 )
 
-type BlockingRevTask struct {
-	id        int
-	group     string
-	deps      []int
-	completed chan struct{}
+type OrdTask struct {
+	id    int
+	group string
+	deps  []int
+	dp    *retrypool.DependencyPool[OrdTask, string, int]
+	log   *ExecutionLog
+	done  chan struct{}
 }
 
-func (t BlockingRevTask) GetDependencies() []int { return t.deps }
-func (t BlockingRevTask) GetGroupID() string     { return t.group }
-func (t BlockingRevTask) GetTaskID() int         { return t.id }
+func (t OrdTask) GetDependencies() []int { return t.deps }
+func (t OrdTask) GetGroupID() string     { return t.group }
+func (t OrdTask) GetTaskID() int         { return t.id }
 
 type ExecutionLog struct {
-	mu     sync.Mutex
-	events []ExecutionEvent
+	mu          deadlock.Mutex
+	events      []ExecutionEvent
+	completeChs map[int]chan struct{} // Track completion channels by task ID
 }
 
 type ExecutionEvent struct {
@@ -35,7 +38,8 @@ type ExecutionEvent struct {
 
 func NewExecutionLog() *ExecutionLog {
 	return &ExecutionLog{
-		events: make([]ExecutionEvent, 0),
+		events:      make([]ExecutionEvent, 0),
+		completeChs: make(map[int]chan struct{}),
 	}
 }
 
@@ -61,6 +65,22 @@ func (l *ExecutionLog) AddComplete(group string, id int) {
 		timestamp: time.Now(),
 	})
 	fmt.Printf("Task %s-%d completed\n", group, id)
+
+	// Signal completion
+	if ch, exists := l.completeChs[id]; exists {
+		close(ch)
+	}
+}
+
+func (l *ExecutionLog) GetCompletionCh(id int) chan struct{} {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if ch, exists := l.completeChs[id]; exists {
+		return ch
+	}
+	ch := make(chan struct{})
+	l.completeChs[id] = ch
+	return ch
 }
 
 func (l *ExecutionLog) Verify() {
@@ -73,73 +93,92 @@ func (l *ExecutionLog) Verify() {
 	}
 }
 
-type BlockingRevWorker struct {
-	id         int
-	log        *ExecutionLog
-	taskStates *sync.Map
+type OrdWorker struct {
+	ID  int
+	log *ExecutionLog
 }
 
-func (w *BlockingRevWorker) Run(ctx context.Context, data BlockingRevTask) error {
+func (w *OrdWorker) Run(ctx context.Context, data OrdTask) error {
 	w.log.AddStart(data.group, data.id)
 
-	// Wait for dependencies to complete
-	for _, depID := range data.GetDependencies() {
-		if depChan, ok := w.taskStates.Load(fmt.Sprintf("%s-%d", data.group, depID)); ok {
-			<-depChan.(chan struct{})
+	fmt.Println("\t Processing Task", w.ID, data.group, data.id)
+
+	// For tasks 1 and 2, submit next task FIRST before doing anything else
+	if data.id < 3 {
+		nextID := data.id + 1
+		nextDone := make(chan struct{})
+
+		nextTask := OrdTask{
+			id:    nextID,
+			group: data.group,
+			deps:  []int{data.id},
+			dp:    data.dp,
+			log:   data.log,
+			done:  nextDone,
 		}
+
+		fmt.Println("\t\t Submitting Next Task", w.ID, data.group, nextID, "with deps", data.id, "...", nextTask.deps)
+
+		// Submit next task immediately
+		if err := data.dp.Submit(nextTask); err != nil {
+			return err
+		}
+
+		<-nextDone
 	}
 
-	// Simulate work
-	time.Sleep(500 * time.Millisecond)
-
+	// Complete our task
 	w.log.AddComplete(data.group, data.id)
-
-	// Signal completion
-	close(data.completed)
-	w.taskStates.Store(fmt.Sprintf("%s-%d", data.group, data.id), data.completed)
+	if data.done != nil {
+		close(data.done)
+	}
 
 	return nil
 }
 
 func main() {
 	executionLog := NewExecutionLog()
-	taskStates := &sync.Map{}
 
-	workers := []retrypool.Worker[BlockingRevTask]{
-		&BlockingRevWorker{1, executionLog, taskStates},
-		&BlockingRevWorker{2, executionLog, taskStates},
+	workers := []retrypool.Worker[OrdTask]{
+		&OrdWorker{log: executionLog},
+		&OrdWorker{log: executionLog},
+		&OrdWorker{log: executionLog},
 	}
 
 	pool := retrypool.New(context.Background(), workers)
 
-	dp, _ := retrypool.NewDependencyPool[BlockingRevTask, string, int](
+	dp, _ := retrypool.NewDependencyPool[OrdTask, string, int](
 		pool,
-		func() retrypool.Worker[BlockingRevTask] {
-			return &BlockingRevWorker{len(workers) + 1, executionLog, taskStates}
+		func() retrypool.Worker[OrdTask] {
+			return &OrdWorker{len(workers) + 1, executionLog}
 		},
-		retrypool.DependencyConfig[BlockingRevTask, string, int]{
+		retrypool.DependencyConfig[OrdTask, string, int]{
 			ExecutionOrder: retrypool.ExecutionOrderReverse,
 			TaskMode:       retrypool.TaskModeBlocking,
 		},
 	)
 
-	// Create tasks with completion channels
-	groupB := []BlockingRevTask{
-		{3, "groupB", []int{}, make(chan struct{})},
-		{2, "groupB", []int{3}, make(chan struct{})},
-		{1, "groupB", []int{2}, make(chan struct{})},
+	// Create channels for synchronization
+	doneChan := make(chan struct{})
+
+	task1 := OrdTask{
+		id:    1,
+		group: "groupA",
+		deps:  []int{},
+		dp:    dp,
+		log:   executionLog,
+		done:  doneChan,
 	}
 
-	fmt.Println("Submitting Blocking Reversed Tasks for Group B")
-	for _, t := range groupB {
-		_ = dp.Submit(t)
+	fmt.Println("Submitting Initial Task")
+	if err := dp.Submit(task1); err != nil {
+		panic(err)
 	}
 
-	fmt.Println("Waiting for Blocking Reversed Tasks to Complete")
-	dp.WaitWithCallback(context.Background(), func(queueSize, processingCount, deadTaskCount int) bool {
-		return queueSize > 0 || processingCount > 0
-	}, time.Second)
+	// Wait for all tasks to complete
+	<-doneChan
 
-	executionLog.Verify()
+	fmt.Println("All tasks completed")
 	dp.Close()
+	executionLog.Verify()
 }

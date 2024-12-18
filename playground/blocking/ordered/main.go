@@ -179,6 +179,6 @@ func main() {
 	<-doneChan
 
 	fmt.Println("All tasks completed")
-	executionLog.Verify()
 	dp.Close()
+	executionLog.Verify()
 }
