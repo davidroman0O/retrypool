@@ -5,7 +5,7 @@ Non-blocking use case: the developer is simply sending tasks to the DP: submit 1
 
 When dealing with blocking operations:
 
-Execution Order (ordered):
+Execution Order (forward):
 1. groupA-1 (start)
 2. groupA-2 (start)
 3. groupA-3 (start)
@@ -17,13 +17,13 @@ Execution Order (reversed):
 1. groupB-3 (start)
 2. groupB-2 (start)
 3. groupB-1 (start)
-4. groupB-3 (complete)
+4. groupB-1 (complete)
 5. groupB-2 (complete)
-6. groupB-1 (complete)
+6. groupB-3 (complete)
 
 When dealing with non-blocking operations:
 
-Execution Order (ordered):
+Execution Order (forward):
 1. groupA-1 (start)
 2. groupA-1 (complete)
 3. groupA-2 (start)

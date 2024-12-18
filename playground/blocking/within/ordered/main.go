@@ -1,4 +1,4 @@
-// blocking/ordered.go
+// blocking/within/ordered.go
 package main
 
 import (
@@ -153,7 +153,7 @@ func main() {
 			return &OrdWorker{len(workers) + 1, executionLog}
 		},
 		retrypool.DependencyConfig[OrdTask, string, int]{
-			ExecutionOrder: retrypool.ExecutionOrderReverse,
+			ExecutionOrder: retrypool.ExecutionOrderForward,
 			TaskMode:       retrypool.TaskModeBlocking,
 		},
 	)
@@ -180,5 +180,6 @@ func main() {
 
 	fmt.Println("All tasks completed")
 	dp.Close()
+	<-time.After(1 * time.Second)
 	executionLog.Verify()
 }

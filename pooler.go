@@ -246,7 +246,7 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 		workerQueues:          make(map[int]*atomic.Int64),
 	}
 
-	// pool.logger.Disable()
+	pool.logger.Disable()
 
 	pool.logger.Info(ctx, "Creating new Pool", "workers_count", len(workers))
 

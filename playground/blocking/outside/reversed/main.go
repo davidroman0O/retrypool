@@ -1,4 +1,4 @@
-// non-blocking/ordered.go
+// blocking/outside/reversed.go
 package main
 
 import (
@@ -10,16 +10,19 @@ import (
 	"github.com/davidroman0O/retrypool"
 )
 
-type OrdTask struct {
+// Task definition with reversed mode
+type RevTask struct {
 	id    int
 	group string
 	deps  []int
 }
 
-func (t OrdTask) GetDependencies() []int { return t.deps }
-func (t OrdTask) GetGroupID() string     { return t.group }
-func (t OrdTask) GetTaskID() int         { return t.id }
+// Implement DependentTask interface
+func (t RevTask) GetDependencies() []int { return t.deps }
+func (t RevTask) GetGroupID() string     { return t.group }
+func (t RevTask) GetTaskID() int         { return t.id }
 
+// ExecutionLog tracks task execution for verification
 type ExecutionLog struct {
 	mu     sync.Mutex
 	events []ExecutionEvent
@@ -28,7 +31,7 @@ type ExecutionLog struct {
 type ExecutionEvent struct {
 	group     string
 	id        int
-	eventType string
+	eventType string // "start" or "complete"
 	timestamp time.Time
 }
 
@@ -72,15 +75,16 @@ func (l *ExecutionLog) Verify() {
 	}
 }
 
-type OrdWorker struct {
+// Worker implementation
+type RevWorker struct {
 	id  int
 	log *ExecutionLog
 }
 
-func (w *OrdWorker) Run(ctx context.Context, data OrdTask) error {
+func (w *RevWorker) Run(ctx context.Context, data RevTask) error {
 	w.log.AddStart(data.group, data.id)
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond) // Simulate work
 
 	w.log.AddComplete(data.group, data.id)
 	return nil
@@ -89,41 +93,47 @@ func (w *OrdWorker) Run(ctx context.Context, data OrdTask) error {
 func main() {
 	executionLog := NewExecutionLog()
 
-	workers := []retrypool.Worker[OrdTask]{
-		&OrdWorker{1, executionLog},
-		&OrdWorker{2, executionLog},
+	// Create workers
+	workers := []retrypool.Worker[RevTask]{
+		&RevWorker{1, executionLog},
+		&RevWorker{2, executionLog},
 	}
 
+	// Initialize the pool with workers
 	pool := retrypool.New(context.Background(), workers)
 
-	dp, _ := retrypool.NewDependencyPool[OrdTask, string, int](
+	// Create dependency pool
+	dp, _ := retrypool.NewDependencyPool[RevTask, string, int](
 		pool,
-		func() retrypool.Worker[OrdTask] {
-			return &OrdWorker{len(workers) + 1, executionLog}
+		func() retrypool.Worker[RevTask] {
+			return &RevWorker{len(workers) + 1, executionLog}
 		},
-		retrypool.DependencyConfig[OrdTask, string, int]{
+		retrypool.DependencyConfig[RevTask, string, int]{
 			ExecutionOrder: retrypool.ExecutionOrderForward,
-			TaskMode:       retrypool.TaskModeIndependent,
-			MaxWorkers:     10,
+			TaskMode:       retrypool.TaskModeBlocking,
 		},
 	)
 
-	groupA := []OrdTask{
-		{2, "groupA", []int{1}},
-		{1, "groupA", []int{}},
-		{3, "groupA", []int{2}},
+	// Define tasks with dependencies in reverse order
+	groupB := []RevTask{
+		{3, "groupB", []int{}},
+		{2, "groupB", []int{3}},
+		{1, "groupB", []int{2}},
 	}
 
-	fmt.Println("Submitting Ordered Tasks for Group A")
-	for _, t := range groupA {
+	// Submit all tasks
+	fmt.Println("Submitting Reversed Tasks for Group B")
+	for _, t := range groupB {
 		_ = dp.Submit(t)
 	}
 
-	fmt.Println("Waiting for Ordered Tasks to Complete")
+	// Wait for completion
+	fmt.Println("Waiting for Reversed Tasks to Complete")
 	dp.WaitWithCallback(context.Background(), func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0
 	}, time.Second)
 
+	// Verify execution
 	dp.Close()
 	<-time.After(1 * time.Second)
 	executionLog.Verify()

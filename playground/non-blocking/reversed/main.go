@@ -134,6 +134,7 @@ func main() {
 	}, time.Second)
 
 	// Verify execution
-	executionLog.Verify()
 	dp.Close()
+	<-time.After(1 * time.Second)
+	executionLog.Verify()
 }
