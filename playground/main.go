@@ -35,7 +35,7 @@ func ExampleIndependent() {
 
 	dp, err := retrypool.NewIndependentPool[IndependentTask, string, int](
 		ctx,
-		retrypool.WithWorkerFactory(func() retrypool.Worker[IndependentTask] { return &IndependentWorker{} }),
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[IndependentTask] { return &IndependentWorker{} }),
 	)
 	if err != nil {
 		log.Fatalf("Failed to create pool: %v", err)

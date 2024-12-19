@@ -47,7 +47,7 @@ func TestIndependentPool_Basic(t *testing.T) {
 
 	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
 		ctx,
-		retrypool.WithWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
@@ -84,7 +84,7 @@ func TestIndependentPool_Dependencies(t *testing.T) {
 
 	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
 		ctx,
-		retrypool.WithWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
@@ -131,7 +131,7 @@ func TestIndependentPool_MultipleGroups(t *testing.T) {
 
 	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
 		ctx,
-		retrypool.WithWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
@@ -175,7 +175,7 @@ func TestIndependentPool_ErrorHandling(t *testing.T) {
 
 	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
 		ctx,
-		retrypool.WithWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
@@ -214,8 +214,8 @@ func TestIndependentPool_StressTest(t *testing.T) {
 
 	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
 		ctx,
-		retrypool.WithWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
-		retrypool.WithWorkerLimits[TestTask](numWorkers, numWorkers),
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+		retrypool.WithIndependentWorkerLimits[TestTask](numWorkers, numWorkers),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)

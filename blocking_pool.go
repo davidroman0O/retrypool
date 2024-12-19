@@ -8,11 +8,27 @@ import (
 	"github.com/sasha-s/go-deadlock"
 )
 
+/// TODO: we need to clean up groups and tasks when they are no longer needed
+/// TODO: we need to add a callback for when a task is completed, group is completed, etc.
+/// TODO: we need a channel that will be listened to to close a group
+
 // BlockingConfig holds basic config—mainly the worker factory and min/max worker count.
 type BlockingConfig[T any] struct {
 	workerFactory WorkerFactory[T]
 	minWorkers    int
 	maxWorkers    int
+	// Task callbacks
+	OnTaskSubmitted func(task T)
+	OnTaskStarted   func(task T)
+	OnTaskCompleted func(task T)
+	OnTaskFailed    func(task T, err error)
+	// Group callbacks
+	OnGroupCreated   func(groupID any)
+	OnGroupCompleted func(groupID any)
+	// Pool events
+	OnWorkerAdded   func(workerID int)
+	OnWorkerRemoved func(workerID int)
+	OnPoolClosed    func()
 }
 
 // BlockingPoolOption is a functional option for configuring the blocking pool
@@ -21,7 +37,7 @@ type BlockingPoolOption[T any] func(*BlockingConfig[T])
 // WithBlockingWorkerFactory sets the worker factory for creating new workers
 func WithBlockingWorkerFactory[T any](factory WorkerFactory[T]) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
-		// fmt.Printf("[CONFIG] Setting worker factory\n")
+		fmt.Printf("[CONFIG] Setting worker factory\n")
 		c.workerFactory = factory
 	}
 }
@@ -29,18 +45,73 @@ func WithBlockingWorkerFactory[T any](factory WorkerFactory[T]) BlockingPoolOpti
 // WithBlockingWorkerLimits specifies how many workers to keep (min) and the absolute limit (max)
 func WithBlockingWorkerLimits[T any](min, max int) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
-		// fmt.Printf("[CONFIG] Setting worker limits: min=%d, max=%d\n", min, max)
+		fmt.Printf("[CONFIG] Setting worker limits: min=%d, max=%d\n", min, max)
 		if min < 1 {
-			// fmt.Printf("[CONFIG] min was < 1 => setting min=1\n")
+			fmt.Printf("[CONFIG] min was < 1 => setting min=1\n")
 			min = 1
 		}
 		c.minWorkers = min
 		// Ensure max ≥ min
 		if max < min {
-			// fmt.Printf("[CONFIG] max < min => setting max=min=%d\n", min)
+			fmt.Printf("[CONFIG] max < min => setting max=min=%d\n", min)
 			max = min
 		}
 		c.maxWorkers = max
+	}
+}
+
+// Callback options
+func WithBlockingOnTaskSubmitted[T any](cb func(task T)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnTaskSubmitted = cb
+	}
+}
+
+func WithBlockingOnTaskStarted[T any](cb func(task T)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnTaskStarted = cb
+	}
+}
+
+func WithBlockingOnTaskCompleted[T any](cb func(task T)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnTaskCompleted = cb
+	}
+}
+
+func WithBlockingOnTaskFailed[T any](cb func(task T, err error)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnTaskFailed = cb
+	}
+}
+
+func WithBlockingOnGroupCreated[T any](cb func(groupID any)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnGroupCreated = cb
+	}
+}
+
+func WithBlockingOnGroupCompleted[T any](cb func(groupID any)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnGroupCompleted = cb
+	}
+}
+
+func WithBlockingOnWorkerAdded[T any](cb func(workerID int)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnWorkerAdded = cb
+	}
+}
+
+func WithBlockingOnWorkerRemoved[T any](cb func(workerID int)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnWorkerRemoved = cb
+	}
+}
+
+func WithBlockingOnPoolClosed[T any](cb func()) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnPoolClosed = cb
 	}
 }
 
@@ -79,7 +150,7 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 	ctx context.Context,
 	opt ...BlockingPoolOption[T],
 ) (*BlockingPool[T, GID, TID], error) {
-	// fmt.Printf("[INIT] Creating new BlockingPool...\n")
+	fmt.Printf("[INIT] Creating new BlockingPool...\n")
 
 	cfg := BlockingConfig[T]{
 		minWorkers: 1,
@@ -101,12 +172,12 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 		cfg.maxWorkers = cfg.minWorkers
 	}
 
-	// fmt.Printf("[INIT] minWorkers=%d, maxWorkers=%d\n", cfg.minWorkers, cfg.maxWorkers)
+	fmt.Printf("[INIT] minWorkers=%d, maxWorkers=%d\n", cfg.minWorkers, cfg.maxWorkers)
 
 	// Create the initial set of workers = minWorkers
 	workers := make([]Worker[T], 0, cfg.minWorkers)
 	for i := 0; i < cfg.minWorkers; i++ {
-		// fmt.Printf("[INIT] Creating initial worker #%d\n", i+1)
+		fmt.Printf("[INIT] Creating initial worker #%d\n", i+1)
 		workers = append(workers, cfg.workerFactory())
 	}
 
@@ -122,7 +193,17 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 		cancel:        cancel,
 	}
 
-	// fmt.Printf("[INIT] Finished creating BlockingPool. Setting OnTaskSuccess handler.\n")
+	if cfg.OnWorkerAdded != nil {
+		ids, err := pool.pooler.Workers()
+		if err != nil {
+			return nil, fmt.Errorf("[INIT] failed to get initial worker IDs: %w", err)
+		}
+		for _, v := range ids {
+			cfg.OnWorkerAdded(v)
+		}
+	}
+
+	fmt.Printf("[INIT] Finished creating BlockingPool. Setting OnTaskSuccess handler.\n")
 	// Whenever a task succeeds, mark it complete in our metadata
 	pooler.SetOnTaskSuccess(pool.handleTaskCompletion)
 	return pool, nil
@@ -131,11 +212,19 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 // Submit enqueues the given data (which must implement DependentTask[GID,TID]).
 // We also attempt to scale up the worker count if needed to avoid deadlocks when tasks spawn children.
 func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
-	// fmt.Printf("[SUBMIT] Received Submit() for data=%#v\n", data)
+	fmt.Printf("[SUBMIT] Received Submit() for data=%#v\n", data)
+
+	if p.config.OnTaskSubmitted != nil {
+		p.config.OnTaskSubmitted(data)
+	}
 
 	dtask, ok := any(data).(DependentTask[GID, TID])
 	if !ok {
-		return fmt.Errorf("[SUBMIT] data does not implement DependentTask interface: %#v", data)
+		err := fmt.Errorf("[SUBMIT] data does not implement DependentTask interface: %#v", data)
+		if p.config.OnTaskFailed != nil {
+			p.config.OnTaskFailed(data, err)
+		}
+		return err
 	}
 
 	// Set the Pool field if the task implements a SetPool method
@@ -148,17 +237,20 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 	p.mu.Lock()
 	groupID := dtask.GetGroupID()
 	taskID := dtask.GetTaskID()
-	// fmt.Printf("[SUBMIT] GroupID=%#v, TaskID=%#v\n", groupID, taskID)
+	fmt.Printf("[SUBMIT] GroupID=%#v, TaskID=%#v\n", groupID, taskID)
 
 	group, gexists := p.groups[groupID]
 	if !gexists {
-		// fmt.Printf("[SUBMIT] Creating new taskGroup for groupID=%#v\n", groupID)
+		fmt.Printf("[SUBMIT] Creating new taskGroup for groupID=%#v\n", groupID)
 		group = &blockingTaskGroup[T, GID, TID]{
 			id:        groupID,
 			tasks:     make(map[TID]*blockingTaskState[T, GID, TID]),
 			completed: make(map[TID]bool),
 		}
 		p.groups[groupID] = group
+		if p.config.OnGroupCreated != nil {
+			p.config.OnGroupCreated(groupID)
+		}
 	}
 	p.mu.Unlock()
 
@@ -170,21 +262,31 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 	}
 
 	group.mu.Lock()
-	// fmt.Printf("[SUBMIT] groupID=%#v: adding taskID=%#v to group...\n", groupID, taskID)
+	fmt.Printf("[SUBMIT] groupID=%#v: adding taskID=%#v to group...\n", groupID, taskID)
 	group.tasks[taskID] = task
 	group.mu.Unlock()
 
 	// Attempt to scale up if we're short on workers:
 	if err := p.scaleWorkersIfNeeded(); err != nil {
+		if p.config.OnTaskFailed != nil {
+			p.config.OnTaskFailed(data, err)
+		}
 		return fmt.Errorf("[SUBMIT] failed scaling workers: %w", err)
 	}
 
-	// fmt.Printf("[SUBMIT] Submitting taskID=%#v to underlying pool...\n", taskID)
+	if p.config.OnTaskStarted != nil {
+		p.config.OnTaskStarted(data)
+	}
+
+	fmt.Printf("[SUBMIT] Submitting taskID=%#v to underlying pool...\n", taskID)
 	err := p.pooler.SubmitToFreeWorker(task.task, WithBounceRetry[T]())
 	if err != nil {
-		// fmt.Printf("[SUBMIT] Underlying pooler.Submit returned error: %v\n", err)
+		fmt.Printf("[SUBMIT] Underlying pooler.Submit returned error: %v\n", err)
+		if p.config.OnTaskFailed != nil {
+			p.config.OnTaskFailed(data, err)
+		}
 	} else {
-		// fmt.Printf("[SUBMIT] Successfully submitted taskID=%#v\n", taskID)
+		fmt.Printf("[SUBMIT] Successfully submitted taskID=%#v\n", taskID)
 	}
 	return err
 }
@@ -192,16 +294,20 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 // handleTaskCompletion is called by the pool when a task finishes successfully.
 // We mark its local completionCh as closed so WaitForTask can unblock.
 func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(data T) {
+	if p.config.OnTaskCompleted != nil {
+		p.config.OnTaskCompleted(data)
+	}
+
 	dtask, _ := any(data).(DependentTask[GID, TID])
 	groupID := dtask.GetGroupID()
 	taskID := dtask.GetTaskID()
 
-	// fmt.Printf("[COMPLETE] Task complete for groupID=%#v, taskID=%#v\n", groupID, taskID)
+	fmt.Printf("[COMPLETE] Task complete for groupID=%#v, taskID=%#v\n", groupID, taskID)
 
 	p.mu.RLock()
 	group, exists := p.groups[groupID]
 	if !exists {
-		// fmt.Printf("[COMPLETE] groupID=%#v not found in p.groups (possibly removed?)\n", groupID)
+		fmt.Printf("[COMPLETE] groupID=%#v not found in p.groups (possibly removed?)\n", groupID)
 		p.mu.RUnlock()
 		return
 	}
@@ -212,7 +318,7 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(data T) {
 
 	st := group.tasks[taskID]
 	if st == nil {
-		// fmt.Printf("[COMPLETE] groupID=%#v, taskID=%#v => no matching task in group map\n", groupID, taskID)
+		fmt.Printf("[COMPLETE] groupID=%#v, taskID=%#v => no matching task in group map\n", groupID, taskID)
 		return
 	}
 
@@ -222,19 +328,32 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(data T) {
 	close(st.completionCh)
 	group.completed[taskID] = true
 
-	// fmt.Printf("[COMPLETE] Marked groupID=%#v, taskID=%#v as complete. completionCh closed.\n", groupID, taskID)
+	// Check if all tasks in group are completed
+	allCompleted := true
+	for _, task := range group.tasks {
+		if !task.completed {
+			allCompleted = false
+			break
+		}
+	}
+
+	if allCompleted && p.config.OnGroupCompleted != nil {
+		p.config.OnGroupCompleted(groupID)
+	}
+
+	fmt.Printf("[COMPLETE] Marked groupID=%#v, taskID=%#v as complete. completionCh closed.\n", groupID, taskID)
 }
 
 // WaitForTask blocks until the specified task finishes or the pool is closed.
 func (p *BlockingPool[T, GID, TID]) WaitForTask(groupID GID, taskID TID) error {
-	// fmt.Printf("[WAIT] WaitForTask(%#v, %#v) called\n", groupID, taskID)
+	fmt.Printf("[WAIT] WaitForTask(%#v, %#v) called\n", groupID, taskID)
 
 	p.mu.RLock()
 	group, exists := p.groups[groupID]
 	if !exists {
 		p.mu.RUnlock()
 		msg := fmt.Sprintf("[WAIT] group %v not found in WaitForTask", groupID)
-		// fmt.Println(msg)
+		fmt.Println(msg)
 		return fmt.Errorf(msg)
 	}
 
@@ -244,37 +363,40 @@ func (p *BlockingPool[T, GID, TID]) WaitForTask(groupID GID, taskID TID) error {
 		group.mu.RUnlock()
 		p.mu.RUnlock()
 		msg := fmt.Sprintf("[WAIT] task %v not found in group %v", taskID, groupID)
-		// fmt.Println(msg)
+		fmt.Println(msg)
 		return fmt.Errorf(msg)
 	}
 	completionCh := task.completionCh
 	group.mu.RUnlock()
 	p.mu.RUnlock()
 
-	// fmt.Printf("[WAIT] Blocking on completionCh for groupID=%#v, taskID=%#v...\n", groupID, taskID)
+	fmt.Printf("[WAIT] Blocking on completionCh for groupID=%#v, taskID=%#v...\n", groupID, taskID)
 	select {
 	case <-completionCh:
-		// fmt.Printf("[WAIT] unblocked => task completed for groupID=%#v, taskID=%#v\n", groupID, taskID)
+		fmt.Printf("[WAIT] unblocked => task completed for groupID=%#v, taskID=%#v\n", groupID, taskID)
 		return nil
 	case <-p.ctx.Done():
-		// fmt.Printf("[WAIT] blocking context canceled => returning p.ctx.Err()\n")
+		fmt.Printf("[WAIT] blocking context canceled => returning p.ctx.Err()\n")
 		return p.ctx.Err()
 	}
 }
 
-// WaitWithCallback just defers to the underlying pool’s WaitWithCallback
+// WaitWithCallback just defers to the underlying pool's WaitWithCallback
 func (p *BlockingPool[T, GID, TID]) WaitWithCallback(
 	ctx context.Context,
 	callback func(queueSize, processingCount, deadTaskCount int) bool,
 	interval time.Duration,
 ) error {
-	// fmt.Println("[WAITCB] WaitWithCallback called, deferring to underlying pooler.")
+	fmt.Println("[WAITCB] WaitWithCallback called, deferring to underlying pooler.")
 	return p.pooler.WaitWithCallback(ctx, callback, interval)
 }
 
 // Close cancels our context and closes the underlying pool
 func (p *BlockingPool[T, GID, TID]) Close() error {
-	// fmt.Println("[CLOSE] Canceling BlockingPool context, then closing underlying pooler.")
+	if p.config.OnPoolClosed != nil {
+		p.config.OnPoolClosed()
+	}
+	fmt.Println("[CLOSE] Canceling BlockingPool context, then closing underlying pooler.")
 	p.cancel()
 	return p.pooler.Close()
 }
@@ -285,36 +407,36 @@ func (p *BlockingPool[T, GID, TID]) Close() error {
 // (each waiting on its child), there is always at least one extra worker free
 // for the newly spawned child.
 func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded() error {
-	// fmt.Println("[SCALE] Checking if we need to scale up workers...")
+	fmt.Println("[SCALE] Checking if we need to scale up workers...")
 
 	// Count how many tasks are queued across all workers
 	var queued int64
 	p.pooler.RangeWorkerQueues(func(wid int, qs int64) bool {
-		// fmt.Printf("[SCALE] worker=%d => queueSize=%d\n", wid, qs)
+		fmt.Printf("[SCALE] worker=%d => queueSize=%d\n", wid, qs)
 		queued += qs
 		return true
 	})
 
 	// Count how many tasks are currently processing
 	processing := p.pooler.ProcessingCount()
-	// fmt.Printf("[SCALE] total queueSize=%d, currently processing=%d\n", queued, processing)
+	fmt.Printf("[SCALE] total queueSize=%d, currently processing=%d\n", queued, processing)
 
 	// We need enough workers to handle currently processing tasks
-	// plus any queued tasks, plus 1 extra if there’s at least one task processing.
-	// That “+1” ensures the newly spawned child isn’t starved by its blocked parent.
+	// plus any queued tasks, plus 1 extra if there's at least one task processing.
+	// That "+1" ensures the newly spawned child isn't starved by its blocked parent.
 	desired := int(queued + processing)
 	if processing > 0 {
 		desired++
 	}
-	// fmt.Printf("[SCALE] raw desired count (queued + processing + optional extra)=%d\n", desired)
+	fmt.Printf("[SCALE] raw desired count (queued + processing + optional extra)=%d\n", desired)
 
 	// Enforce min/max
 	if desired < p.config.minWorkers {
-		// fmt.Printf("[SCALE] desired < minWorkers => setting desired=%d\n", p.config.minWorkers)
+		fmt.Printf("[SCALE] desired < minWorkers => setting desired=%d\n", p.config.minWorkers)
 		desired = p.config.minWorkers
 	}
 	if desired > p.config.maxWorkers {
-		// fmt.Printf("[SCALE] desired > maxWorkers => setting desired=%d\n", p.config.maxWorkers)
+		fmt.Printf("[SCALE] desired > maxWorkers => setting desired=%d\n", p.config.maxWorkers)
 		desired = p.config.maxWorkers
 	}
 
@@ -322,23 +444,25 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded() error {
 	cur := p.pooler.GetFreeWorkers()
 
 	currentCount := len(cur)
-	// fmt.Printf("[SCALE] current worker count=%d, desired count=%d\n", currentCount, desired)
+	fmt.Printf("[SCALE] current worker count=%d, desired count=%d\n", currentCount, desired)
 
 	// Scale up if needed
 	if currentCount < desired {
 		toAdd := desired - currentCount
-		// fmt.Printf("[SCALE] Need to add %d worker(s)\n", toAdd)
+		fmt.Printf("[SCALE] Need to add %d worker(s)\n", toAdd)
 		for i := 0; i < toAdd; i++ {
 			w := p.workerFactory()
-			// fmt.Printf("[SCALE] Adding worker #%d (plus existing %d => total %d)\n",
-			// i+1, currentCount, currentCount+i+1)
+			fmt.Printf("[SCALE] Adding worker #%d (plus existing %d => total %d)\n", i+1, currentCount, currentCount+i+1)
 			if e := p.pooler.Add(w, nil); e != nil {
-				// fmt.Printf("[SCALE] error adding worker: %v\n", e)
+				fmt.Printf("[SCALE] error adding worker: %v\n", e)
 				return e
+			}
+			if p.config.OnWorkerAdded != nil {
+				p.config.OnWorkerAdded(currentCount + i + 1)
 			}
 		}
 	} else {
-		// fmt.Println("[SCALE] current worker count is already >= desired => no scaling needed.")
+		fmt.Println("[SCALE] current worker count is already >= desired => no scaling needed.")
 	}
 
 	return nil
