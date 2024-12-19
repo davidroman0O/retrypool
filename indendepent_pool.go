@@ -10,8 +10,11 @@ import (
 )
 
 /// TODO: we need to clean up groups and tasks when they are no longer needed
-/// TODO: we need to add a callback for when a task is completed, group is completed, etc.
 /// TODO: we need a channel that will be listened to to close a group
+/// TODO: to scale and to make it work for real we enforce to submit an array of ALL tasks a group then schedule it
+/// TODO: we should refuse a new array of tasks that belong to a group that is already scheduled
+/// TODO: on failure, we can provide the pool's options for retry attempts, we will refuse unlimieted attempts, adding to task tasks is a task failed and group fail which result in the group being removed
+/// TODO: we should have a soft scalling strategy since we don't have blocking tasks, we just need the group to be scheduled with a correct execution order
 
 type independentTaskState[T any, GID comparable, TID comparable] struct {
 	mu           deadlock.RWMutex

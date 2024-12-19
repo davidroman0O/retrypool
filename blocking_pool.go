@@ -9,8 +9,9 @@ import (
 )
 
 /// TODO: we need to clean up groups and tasks when they are no longer needed
-/// TODO: we need to add a callback for when a task is completed, group is completed, etc.
 /// TODO: we need a channel that will be listened to to close a group
+/// TODO: to scale and make it work, instead of having ONE pool we could have ONE pool PER active group, aka allocating a pool to a group that we will process
+/// TODO: on failure, we can provide the pool's options for retry attempts, we will refuse unlimited attempts, adding to task tasks is a task failed and group fail which result in the group being removed
 
 // BlockingConfig holds basic config—mainly the worker factory and min/max worker count.
 type BlockingConfig[T any] struct {

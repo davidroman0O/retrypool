@@ -294,6 +294,11 @@ func (p *Pool[T]) IsRoundRobin() bool {
 	return p.config.roundRobin
 }
 
+// If you're using round robin, it might comes handy to know the current index
+func (p *Pool[T]) RoundRobinIndex() int {
+	return int(p.roundRobinIndex.Load())
+}
+
 // SetOnTaskSuccess allows setting the onTaskSuccess handler after pool creation
 func (p *Pool[T]) SetOnTaskSuccess(handler func(data T)) {
 	p.mu.Lock()
