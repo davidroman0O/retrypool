@@ -53,3 +53,36 @@ The DependencyPool shouldn't care WHERE tasks come from (worker or external) - i
    - Check all pending tasks that depend on completed one
    - Submit any that can now run
 
+----
+
+
+We can't make one DP all at once
+
+- IndependentDependencyPool: ideal for short tasks that doesn't block a worker to wait for another task, ideal for execution order
+- BlockingDependencyPool: ideal for tasks that wait for other tasks, generally created from within a worker blocking it's execution
+
+
+---
+
+1. `IndependentPool` Example:
+- Used for data processing pipeline where tasks have clear dependencies
+- Tasks are all submitted upfront
+- Each task runs independently after its dependencies complete
+- Execution order: Load Data -> Clean Data -> Transform Data -> Save Results
+- Perfect for ETL workflows, build systems, or any sequential processing
+
+2. `BlockingPool` Example:
+- Used for dynamic workflow where tasks create subtasks
+- Main task creates and waits for subtasks to complete
+- Subtasks can run in parallel if no dependencies between them
+- Shows document processing workflow:
+  * Main task creates subtasks
+  * Text extraction must complete before analysis
+  * Sentiment analysis and keyword extraction can run in parallel
+- Great for recursive tasks, document processing, or any workflow where tasks need to spawn and wait for subtasks
+
+Key differences:
+- Independent pool has all tasks known upfront
+- Blocking pool allows dynamic task creation inside workers
+- Independent tasks complete and move on
+- Blocking tasks can wait for their children
