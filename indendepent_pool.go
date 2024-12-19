@@ -92,6 +92,10 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 	}
 
 	pool.pooler.SetOnTaskSuccess(pool.handleTaskCompletion)
+	pool.pooler.SetOnTaskFailure(func(data T, err error) TaskAction {
+		fmt.Println("Task failed:", err)
+		return TaskActionRetry
+	})
 
 	return pool, nil
 }
