@@ -688,8 +688,14 @@ func (p *Pool[T]) GetFreeWorkers() []int {
 
 	freeWorkers := []int{}
 	for id, state := range p.workers {
-		if !state.paused.Load() && !state.removed.Load() {
-			if queue, ok := p.taskQueues.get(id); ok && queue.Length() == 0 && state.currentTask == nil {
+		state.mu.Lock()
+		isPaused := state.paused.Load()
+		isRemoved := state.removed.Load()
+		hasCurrentTask := state.currentTask != nil
+		state.mu.Unlock()
+
+		if !isPaused && !isRemoved {
+			if queue, ok := p.taskQueues.get(id); ok && queue.Length() == 0 && !hasCurrentTask {
 				freeWorkers = append(freeWorkers, id)
 			}
 		}
