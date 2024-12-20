@@ -141,6 +141,8 @@ type IndependentConfig[T any] struct {
 	workerFactory WorkerFactory[T]
 	minWorkers    int
 	maxWorkers    int
+	// mode
+	dependencyMode DependencyMode
 	// Task callbacks
 	OnTaskSubmitted func(task T)
 	OnTaskStarted   func(task T)
@@ -160,6 +162,12 @@ type IndependentPoolOption[T any] func(*IndependentConfig[T])
 func WithIndependentWorkerFactory[T any](factory WorkerFactory[T]) IndependentPoolOption[T] {
 	return func(c *IndependentConfig[T]) {
 		c.workerFactory = factory
+	}
+}
+
+func WithIndependentDependencyMode[T any](mode DependencyMode) IndependentPoolOption[T] {
+	return func(c *IndependentConfig[T]) {
+		c.dependencyMode = mode
 	}
 }
 
@@ -232,7 +240,8 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 	opt ...IndependentPoolOption[T],
 ) (*IndependentPool[T, GID, TID], error) {
 	cfg := IndependentConfig[T]{
-		minWorkers: 1,
+		minWorkers:     1,
+		dependencyMode: ForwardMode,
 	}
 
 	for _, o := range opt {
@@ -357,26 +366,46 @@ func (p *IndependentPool[T, GID, TID]) buildDependencyGraph(tasks []T) (*Depende
 			return nil, fmt.Errorf("duplicate task ID: %v", taskID)
 		}
 
+		// In reverse mode, we swap dependencies and dependents
+		var deps []TID
+		if p.config.dependencyMode == ReverseMode {
+			// In reverse mode, if A depends on B, then B should wait for A
+			// So we don't set dependencies here
+			deps = []TID{}
+		} else {
+			deps = dtask.GetDependencies()
+		}
+
 		graph.Nodes[taskID] = &Node[TID]{
 			ID:           taskID,
-			Dependencies: dtask.GetDependencies(),
+			Dependencies: deps,
 		}
 	}
 
-	// Second pass: Validate all dependencies exist and build dependency links
+	// Second pass: Build dependency links
 	for _, task := range tasks {
 		dtask := any(task).(DependentTask[GID, TID])
 		taskID := dtask.GetTaskID()
-		for _, depID := range dtask.GetDependencies() {
+		declaredDeps := dtask.GetDependencies()
+
+		for _, depID := range declaredDeps {
 			depNode, exists := graph.Nodes[depID]
 			if !exists {
 				return nil, fmt.Errorf("dependency %v not found for task %v", depID, taskID)
 			}
-			depNode.Dependents = append(depNode.Dependents, taskID)
+
+			if p.config.dependencyMode == ForwardMode {
+				// Forward mode: task depends on depID
+				depNode.Dependents = append(depNode.Dependents, taskID)
+			} else {
+				// Reverse mode: depID depends on taskID
+				graph.Nodes[depID].Dependencies = append(graph.Nodes[depID].Dependencies, taskID)
+				graph.Nodes[taskID].Dependents = append(graph.Nodes[taskID].Dependents, depID)
+			}
 		}
 	}
 
-	// Perform topological sort to detect cycles and establish execution order
+	// Perform topological sort
 	sorted, err := p.topologicalSort(graph)
 	if err != nil {
 		return nil, err
