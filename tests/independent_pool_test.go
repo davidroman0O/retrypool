@@ -61,7 +61,7 @@ func TestIndependentPool_Basic(t *testing.T) {
 		},
 	}
 
-	if err := pool.SubmitTaskGroup(tasks); err != nil {
+	if err := pool.Submit(tasks); err != nil {
 		t.Fatalf("Failed to submit task group: %v", err)
 	}
 
@@ -96,7 +96,7 @@ func TestIndependentPool_Dependencies(t *testing.T) {
 		{ID: 2, GroupID: "group1", Dependencies: []int{1}},
 	}
 
-	if err := pool.SubmitTaskGroup(tasks); err != nil {
+	if err := pool.Submit(tasks); err != nil {
 		t.Fatalf("Failed to submit task group: %v", err)
 	}
 
@@ -136,7 +136,7 @@ func TestIndependentPool_MultipleGroups(t *testing.T) {
 		{ID: 1, GroupID: "group1", Dependencies: []int{}},
 		{ID: 3, GroupID: "group1", Dependencies: []int{1}},
 	}
-	if err := pool.SubmitTaskGroup(group1Tasks); err != nil {
+	if err := pool.Submit(group1Tasks); err != nil {
 		t.Fatalf("Failed to submit group1: %v", err)
 	}
 
@@ -145,7 +145,7 @@ func TestIndependentPool_MultipleGroups(t *testing.T) {
 		{ID: 2, GroupID: "group2", Dependencies: []int{}},
 		{ID: 4, GroupID: "group2", Dependencies: []int{2}},
 	}
-	if err := pool.SubmitTaskGroup(group2Tasks); err != nil {
+	if err := pool.Submit(group2Tasks); err != nil {
 		t.Fatalf("Failed to submit group2: %v", err)
 	}
 
@@ -197,7 +197,7 @@ func TestIndependentPool_ErrorHandling(t *testing.T) {
 		},
 	}
 
-	if err := pool.SubmitTaskGroup(tasks); err != nil {
+	if err := pool.Submit(tasks); err != nil {
 		t.Fatalf("Failed to submit task group: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestIndependentPool_StressTest(t *testing.T) {
 			}
 
 			// Submit the entire group
-			if err := pool.SubmitTaskGroup(tasks); err != nil {
+			if err := pool.Submit(tasks); err != nil {
 				errorChan <- fmt.Errorf("failed to submit group %s: %v", gID, err)
 				return
 			}
@@ -342,7 +342,7 @@ func TestIndependentPool_CyclicDependencies(t *testing.T) {
 	}
 
 	// Submit should fail due to cyclic dependencies
-	err = pool.SubmitTaskGroup(tasks)
+	err = pool.Submit(tasks)
 	if err == nil {
 		t.Error("Expected error due to cyclic dependencies, got nil")
 	}
@@ -367,7 +367,7 @@ func TestIndependentPool_MissingDependencies(t *testing.T) {
 	}
 
 	// Submit should fail due to missing dependency
-	err = pool.SubmitTaskGroup(tasks)
+	err = pool.Submit(tasks)
 	if err == nil {
 		t.Error("Expected error due to missing dependency, got nil")
 	}

@@ -8,6 +8,74 @@ import (
 	"github.com/sasha-s/go-deadlock"
 )
 
+/// Independent Pool Design and Mechanisms
+///
+/// Core Concepts:
+/// - Tasks can depend on other tasks within the same group
+/// - Tasks are executed in parallel when dependencies are met
+/// - Multiple groups can execute concurrently
+/// - Each group represents an independent set of tasks
+///
+/// Task Groups:
+/// 1. Task Group Structure
+///    - Group is a set of tasks with unique IDs
+///    - Tasks can depend on other tasks in the same group
+///    - Groups are isolated - tasks can't depend on tasks in other groups
+///    - Groups are submitted as complete units to validate dependencies
+///
+/// 2. Group Management:
+///    - Groups are validated on submission (cycle detection, missing deps)
+///    - Each group maintains its own execution state and completion tracking
+///    - Groups can execute concurrently with other groups
+///    - Group completion requires all tasks to complete
+///
+/// Task Execution:
+/// 1. Submission Phase:
+///    - Tasks are submitted as part of a group
+///    - Dependencies are validated
+///    - Topological sort determines execution order
+///    - Root tasks (no dependencies) start immediately
+///
+/// 2. Execution Order:
+///    - Root tasks start first
+///    - Tasks start when all dependencies complete
+///    - Multiple tasks can run in parallel within a group
+///    - Different groups execute independently
+///
+/// State Management:
+/// - Groups track completed/pending tasks
+/// - Tasks track execution state and dependencies
+/// - Workers scale based on pending work
+/// - Groups are removed when all tasks complete
+///
+/// Example Flow:
+/// 1. Submit Group A: [A1 -> A2 -> A3]
+///    - A1 starts immediately (no deps)
+///    - A2 waits for A1
+///    - A3 waits for A2
+///
+/// 2. Submit Group B: [B1, B2 -> B3]
+///    - B1 and B2 start immediately (no deps)
+///    - B3 waits for B2
+///    - Group B executes concurrently with Group A
+///
+/// 3. Task Completion:
+///    - When task completes, check dependents
+///    - Start dependent tasks when dependencies met
+///    - Group completes when all tasks done
+///
+/// Error Handling:
+/// - Invalid dependencies rejected on submission
+/// - Failed tasks can retry based on policy
+/// - Group state tracks failed tasks
+/// - Groups can fail if tasks can't complete
+///
+/// Thread Safety:
+/// - Groups isolated from each other
+/// - Task state protected by locks
+/// - Worker pool handles concurrency
+/// - Safe for concurrent group submission
+
 /// TODO: we need to clean up groups and tasks when they are no longer needed
 /// TODO: we need a channel that will be listened to to close a group
 /// TODO: on failure, we can provide the pool's options for retry attempts, we will refuse unlimieted attempts, adding to task tasks is a task failed and group fail which result in the group being removed
@@ -203,8 +271,8 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 	return pool, nil
 }
 
-// SubmitTaskGroup submits a complete group of tasks with dependencies
-func (p *IndependentPool[T, GID, TID]) SubmitTaskGroup(tasks []T) error {
+// Submit submits a complete group of tasks with dependencies
+func (p *IndependentPool[T, GID, TID]) Submit(tasks []T) error {
 	if len(tasks) == 0 {
 		return fmt.Errorf("empty task group")
 	}
@@ -494,12 +562,6 @@ func (p *IndependentPool[T, GID, TID]) Close() error {
 	}
 	p.cancel()
 	return p.pooler.Close()
-}
-
-// Submit is deprecated - use SubmitTaskGroup instead
-// This remains only for compatibility with existing tests and will be removed
-func (p *IndependentPool[T, GID, TID]) Submit(data T) error {
-	return fmt.Errorf("individual task submission is deprecated - use SubmitTaskGroup instead")
 }
 
 // GetGroupStatus returns the status of a task group

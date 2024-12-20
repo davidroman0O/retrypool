@@ -48,7 +48,7 @@ func ExampleIndependent() {
 		{ID: 3, Group: "groupA", Dependencies: []int{2}, Description: "Third task"},
 	}
 
-	if err := dp.SubmitTaskGroup(tasks); err != nil {
+	if err := dp.Submit(tasks); err != nil {
 		log.Printf("Failed to submit task  %v", err)
 	}
 
