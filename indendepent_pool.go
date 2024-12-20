@@ -469,7 +469,7 @@ func (p *IndependentPool[T, GID, TID]) submitTask(task *independentTaskState[T, 
 	task.submitted = true
 	task.mu.Unlock()
 
-	err := p.pooler.SubmitToFreeWorker(task.task)
+	err := p.pooler.Submit(task.task) // after careful reviewing, i remembered that we don't need to execute on a free worker because you know... we already have all the tasks sorted out
 	if err != nil && p.config.OnTaskFailed != nil {
 		p.config.OnTaskFailed(task.task, err)
 	}
