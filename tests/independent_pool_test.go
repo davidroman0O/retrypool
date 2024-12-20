@@ -3,11 +3,10 @@ package tests
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
-
-	"math/rand"
 
 	"github.com/davidroman0O/retrypool"
 )
@@ -54,22 +53,22 @@ func TestIndependentPool_Basic(t *testing.T) {
 	}
 
 	// Simple task without dependencies
-	task := TestTask{
-		ID:      1,
-		GroupID: "group1",
+	tasks := []TestTask{
+		{
+			ID:           1,
+			GroupID:      "group1",
+			Dependencies: []int{},
+		},
 	}
 
-	if err := pool.Submit(task); err != nil {
-		t.Fatalf("Failed to submit task: %v", err)
+	if err := pool.SubmitTaskGroup(tasks); err != nil {
+		t.Fatalf("Failed to submit task group: %v", err)
 	}
 
 	// Wait for completion
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
-		return queueSize > 0 || processingCount > 0
-	}, 100*time.Millisecond)
-
+	err = pool.WaitForGroup(ctx, "group1")
 	if err != nil {
-		t.Fatalf("Error waiting for tasks: %v", err)
+		t.Fatalf("Error waiting for group: %v", err)
 	}
 
 	// Verify task was executed
@@ -97,19 +96,14 @@ func TestIndependentPool_Dependencies(t *testing.T) {
 		{ID: 2, GroupID: "group1", Dependencies: []int{1}},
 	}
 
-	for _, task := range tasks {
-		if err := pool.Submit(task); err != nil {
-			t.Fatalf("Failed to submit task %d: %v", task.ID, err)
-		}
+	if err := pool.SubmitTaskGroup(tasks); err != nil {
+		t.Fatalf("Failed to submit task group: %v", err)
 	}
 
 	// Wait for completion
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
-		return queueSize > 0 || processingCount > 0
-	}, 100*time.Millisecond)
-
+	err = pool.WaitForGroup(ctx, "group1")
 	if err != nil {
-		t.Fatalf("Error waiting for tasks: %v", err)
+		t.Fatalf("Error waiting for group: %v", err)
 	}
 
 	// Verify execution order
@@ -137,27 +131,32 @@ func TestIndependentPool_MultipleGroups(t *testing.T) {
 		t.Fatalf("Failed to create pool: %v", err)
 	}
 
-	// Create tasks in different groups
-	tasks := []TestTask{
+	// Submit first group
+	group1Tasks := []TestTask{
 		{ID: 1, GroupID: "group1", Dependencies: []int{}},
-		{ID: 2, GroupID: "group2", Dependencies: []int{}},
 		{ID: 3, GroupID: "group1", Dependencies: []int{1}},
+	}
+	if err := pool.SubmitTaskGroup(group1Tasks); err != nil {
+		t.Fatalf("Failed to submit group1: %v", err)
+	}
+
+	// Submit second group
+	group2Tasks := []TestTask{
+		{ID: 2, GroupID: "group2", Dependencies: []int{}},
 		{ID: 4, GroupID: "group2", Dependencies: []int{2}},
 	}
-
-	for _, task := range tasks {
-		if err := pool.Submit(task); err != nil {
-			t.Fatalf("Failed to submit task %d: %v", task.ID, err)
-		}
+	if err := pool.SubmitTaskGroup(group2Tasks); err != nil {
+		t.Fatalf("Failed to submit group2: %v", err)
 	}
 
-	// Wait for completion
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
-		return queueSize > 0 || processingCount > 0
-	}, 100*time.Millisecond)
-
+	// Wait for both groups
+	err = pool.WaitForGroup(ctx, "group1")
 	if err != nil {
-		t.Fatalf("Error waiting for tasks: %v", err)
+		t.Fatalf("Error waiting for group1: %v", err)
+	}
+	err = pool.WaitForGroup(ctx, "group2")
+	if err != nil {
+		t.Fatalf("Error waiting for group2: %v", err)
 	}
 
 	// Verify execution order within groups
@@ -170,37 +169,46 @@ func TestIndependentPool_MultipleGroups(t *testing.T) {
 }
 
 func TestIndependentPool_ErrorHandling(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var taskFailed bool
 	worker := &IndependentTestWorker{executionTimes: make(map[int]time.Time)}
 
 	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
 		ctx,
 		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+		retrypool.WithIndependentOnTaskFailed[TestTask](func(task TestTask, err error) {
+			taskFailed = true
+		}),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
 	}
 
 	errTask := fmt.Errorf("task error")
-	task := TestTask{
-		ID:      1,
-		GroupID: "group1",
-		ExecuteFunc: func() error {
-			return errTask
+	tasks := []TestTask{
+		{
+			ID:      1,
+			GroupID: "group1",
+			ExecuteFunc: func() error {
+				return errTask
+			},
 		},
 	}
 
-	if err := pool.Submit(task); err != nil {
-		t.Fatalf("Failed to submit task: %v", err)
+	if err := pool.SubmitTaskGroup(tasks); err != nil {
+		t.Fatalf("Failed to submit task group: %v", err)
 	}
 
-	// Wait for completion
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
-		return queueSize > 0 || processingCount > 0
-	}, 100*time.Millisecond)
+	// Wait for completion with timeout
+	err = pool.WaitForGroup(ctx, "group1")
+	if err == nil {
+		t.Error("Expected error from WaitForGroup, got nil")
+	}
 
-	if err != nil {
-		t.Fatalf("Error waiting for tasks: %v", err)
+	if !taskFailed {
+		t.Error("Task failure callback was not triggered")
 	}
 }
 
@@ -222,9 +230,9 @@ func TestIndependentPool_StressTest(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	errorChan := make(chan error, numGroups*numTasksPerGroup)
+	errorChan := make(chan error, numGroups)
 
-	// Submit tasks across multiple groups with complex dependencies
+	// Submit task groups concurrently
 	for g := 0; g < numGroups; g++ {
 		groupID := fmt.Sprintf("group%d", g)
 		wg.Add(1)
@@ -232,51 +240,49 @@ func TestIndependentPool_StressTest(t *testing.T) {
 		go func(gID string) {
 			defer wg.Done()
 
-			// Create tasks with chain dependencies
+			// Create all tasks for this group
+			tasks := make([]TestTask, numTasksPerGroup)
 			for i := 0; i < numTasksPerGroup; i++ {
-				taskID := i
 				var deps []int
 				if i > 0 {
 					// Each task depends on the previous 1-3 tasks
 					for d := 1; d <= min(3, i); d++ {
-						deps = append(deps, taskID-d)
+						deps = append(deps, i-d)
 					}
 				}
 
-				task := TestTask{
-					ID:           taskID,
+				tasks[i] = TestTask{
+					ID:           i,
 					GroupID:      gID,
 					Dependencies: deps,
 					ExecuteFunc: func() error {
-						// Simulate some work
 						time.Sleep(time.Millisecond * time.Duration(rand.Intn(10)))
 						return nil
 					},
 				}
+			}
 
-				if err := pool.Submit(task); err != nil {
-					errorChan <- fmt.Errorf("failed to submit task %d in group %s: %v", taskID, gID, err)
-				}
+			// Submit the entire group
+			if err := pool.SubmitTaskGroup(tasks); err != nil {
+				errorChan <- fmt.Errorf("failed to submit group %s: %v", gID, err)
+				return
+			}
+
+			// Wait for group completion
+			if err := pool.WaitForGroup(ctx, gID); err != nil {
+				errorChan <- fmt.Errorf("error waiting for group %s: %v", gID, err)
+				return
 			}
 		}(groupID)
 	}
 
-	// Wait for all submissions to complete
+	// Wait for all groups to be submitted and completed
 	wg.Wait()
 	close(errorChan)
 
 	// Check for submission errors
 	for err := range errorChan {
-		t.Errorf("Submission error: %v", err)
-	}
-
-	// Wait for all tasks to complete
-	err = pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
-		return queueSize > 0 || processingCount > 0
-	}, 100*time.Millisecond)
-
-	if err != nil {
-		t.Fatalf("Error waiting for tasks: %v", err)
+		t.Errorf("Group error: %v", err)
 	}
 
 	// Verify execution order for each group
@@ -314,4 +320,55 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func TestIndependentPool_CyclicDependencies(t *testing.T) {
+	ctx := context.Background()
+	worker := &IndependentTestWorker{executionTimes: make(map[int]time.Time)}
+
+	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
+		ctx,
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Create tasks with cyclic dependencies
+	tasks := []TestTask{
+		{ID: 1, GroupID: "group1", Dependencies: []int{3}},
+		{ID: 2, GroupID: "group1", Dependencies: []int{1}},
+		{ID: 3, GroupID: "group1", Dependencies: []int{2}},
+	}
+
+	// Submit should fail due to cyclic dependencies
+	err = pool.SubmitTaskGroup(tasks)
+	if err == nil {
+		t.Error("Expected error due to cyclic dependencies, got nil")
+	}
+}
+
+func TestIndependentPool_MissingDependencies(t *testing.T) {
+	ctx := context.Background()
+	worker := &IndependentTestWorker{executionTimes: make(map[int]time.Time)}
+
+	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
+		ctx,
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Create tasks with missing dependency
+	tasks := []TestTask{
+		{ID: 1, GroupID: "group1", Dependencies: []int{99}}, // 99 doesn't exist
+		{ID: 2, GroupID: "group1", Dependencies: []int{1}},
+	}
+
+	// Submit should fail due to missing dependency
+	err = pool.SubmitTaskGroup(tasks)
+	if err == nil {
+		t.Error("Expected error due to missing dependency, got nil")
+	}
 }

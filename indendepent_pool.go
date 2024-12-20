@@ -3,7 +3,6 @@ package retrypool
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
@@ -11,10 +10,34 @@ import (
 
 /// TODO: we need to clean up groups and tasks when they are no longer needed
 /// TODO: we need a channel that will be listened to to close a group
-/// TODO: to scale and to make it work for real we enforce to submit an array of ALL tasks a group then schedule it
-/// TODO: we should refuse a new array of tasks that belong to a group that is already scheduled
 /// TODO: on failure, we can provide the pool's options for retry attempts, we will refuse unlimieted attempts, adding to task tasks is a task failed and group fail which result in the group being removed
-/// TODO: we should have a soft scalling strategy since we don't have blocking tasks, we just need the group to be scheduled with a correct execution order
+/// TODO: we should have a soft scalling strategy since we don't have blocking tasks, we just need the group to be scheduled with a correct execution order - the current SubmitToFreeworker is completely wrong!!
+
+/// After thinking submitting tasks individually with complex dependency trees could lead to:
+/// - Deadlocks if circular dependencies exist
+/// - Unresolvable pending tasks if dependencies are never submitted
+/// - Nondeterministic execution order between sibling dependencies
+/// - Memory leaks from orphaned tasks in the pending map
+///
+/// The safer approach would be:
+/// - Submit entire task groups at once
+/// - Validate the entire dependency tree before accepting any tasks
+/// - Build a complete execution plan
+/// - Reject additional tasks for groups already being processed
+
+// DependencyGraph represents the complete dependency structure for a task group
+type DependencyGraph[TID comparable] struct {
+	Nodes map[TID]*Node[TID]
+	Order []TID // Topologically sorted execution order
+}
+
+type Node[TID comparable] struct {
+	ID           TID
+	Dependencies []TID
+	Dependents   []TID
+	Visited      bool
+	InProgress   bool // Used for cycle detection
+}
 
 type independentTaskState[T any, GID comparable, TID comparable] struct {
 	mu           deadlock.RWMutex
@@ -28,11 +51,13 @@ type independentTaskState[T any, GID comparable, TID comparable] struct {
 }
 
 type independentTaskGroup[T any, GID comparable, TID comparable] struct {
-	mu        deadlock.RWMutex
-	id        GID
-	tasks     map[TID]*independentTaskState[T, GID, TID]
-	completed map[TID]bool
-	pending   map[TID]*independentTaskState[T, GID, TID]
+	mu           deadlock.RWMutex
+	id           GID
+	tasks        map[TID]*independentTaskState[T, GID, TID]
+	completed    map[TID]bool
+	pending      map[TID]*independentTaskState[T, GID, TID]
+	graph        *DependencyGraph[TID]
+	executedTask map[TID]bool
 }
 
 type IndependentPool[T any, GID comparable, TID comparable] struct {
@@ -80,7 +105,6 @@ func WithIndependentWorkerLimits[T any](min, max int) IndependentPoolOption[T] {
 	}
 }
 
-// Callback options
 func WithIndependentOnTaskSubmitted[T any](cb func(task T)) IndependentPoolOption[T] {
 	return func(c *IndependentConfig[T]) {
 		c.OnTaskSubmitted = cb
@@ -139,10 +163,8 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 	ctx context.Context,
 	opt ...IndependentPoolOption[T],
 ) (*IndependentPool[T, GID, TID], error) {
-
-	// Initialize with defaults
 	cfg := IndependentConfig[T]{
-		minWorkers: 1, // At least one worker
+		minWorkers: 1,
 	}
 
 	for _, o := range opt {
@@ -163,7 +185,7 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 	}
 
 	pool := &IndependentPool[T, GID, TID]{
-		pooler: New[T](ctx, []Worker[T]{worker}),
+		pooler: New[T](ctx, []Worker[T]{worker}, WithAttempts[T](1)),
 		groups: make(map[GID]*independentTaskGroup[T, GID, TID]),
 		config: cfg,
 		ctx:    ctx,
@@ -172,7 +194,6 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 
 	pool.pooler.SetOnTaskSuccess(pool.handleTaskCompletion)
 	pool.pooler.SetOnTaskFailure(func(data T, err error) TaskAction {
-		fmt.Println("Task failed:", err)
 		if pool.config.OnTaskFailed != nil {
 			pool.config.OnTaskFailed(data, err)
 		}
@@ -182,67 +203,164 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 	return pool, nil
 }
 
-func (p *IndependentPool[T, GID, TID]) Submit(data T) error {
-	if p.config.OnTaskSubmitted != nil {
-		p.config.OnTaskSubmitted(data)
+// SubmitTaskGroup submits a complete group of tasks with dependencies
+func (p *IndependentPool[T, GID, TID]) SubmitTaskGroup(tasks []T) error {
+	if len(tasks) == 0 {
+		return fmt.Errorf("empty task group")
 	}
 
-	dtask, ok := any(data).(DependentTask[GID, TID])
+	// Extract group ID from first task
+	dtask, ok := any(tasks[0]).(DependentTask[GID, TID])
 	if !ok {
-		err := fmt.Errorf("data does not implement DependentTask interface")
-		if p.config.OnTaskFailed != nil {
-			p.config.OnTaskFailed(data, err)
-		}
-		return err
+		return fmt.Errorf("tasks must implement DependentTask interface")
 	}
+	groupID := dtask.GetGroupID()
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if _, exists := p.groups[groupID]; exists {
+		p.mu.Unlock()
+		return fmt.Errorf("group %v already exists", groupID)
+	}
 
-	groupID := dtask.GetGroupID()
-	taskID := dtask.GetTaskID()
-	deps := dtask.GetDependencies()
+	// Build and validate dependency graph
+	graph, err := p.buildDependencyGraph(tasks)
+	if err != nil {
+		p.mu.Unlock()
+		return fmt.Errorf("invalid dependency graph: %w", err)
+	}
 
-	log.Printf("DEBUG: Submitting task %v with deps %v", taskID, deps)
+	// Create new group
+	group := &independentTaskGroup[T, GID, TID]{
+		id:           groupID,
+		tasks:        make(map[TID]*independentTaskState[T, GID, TID]),
+		completed:    make(map[TID]bool),
+		pending:      make(map[TID]*independentTaskState[T, GID, TID]),
+		graph:        graph,
+		executedTask: make(map[TID]bool),
+	}
 
-	group, ok := p.groups[groupID]
-	if !ok {
-		group = &independentTaskGroup[T, GID, TID]{
-			id:        groupID,
-			tasks:     make(map[TID]*independentTaskState[T, GID, TID]),
-			completed: make(map[TID]bool),
-			pending:   make(map[TID]*independentTaskState[T, GID, TID]),
+	// Initialize all tasks in the group
+	for _, task := range tasks {
+		dtask := any(task).(DependentTask[GID, TID])
+		taskID := dtask.GetTaskID()
+
+		taskState := &independentTaskState[T, GID, TID]{
+			task:         task,
+			taskID:       taskID,
+			groupID:      groupID,
+			dependencies: dtask.GetDependencies(),
+			completionCh: make(chan struct{}),
 		}
-		p.groups[groupID] = group
-		if p.config.OnGroupCreated != nil {
-			p.config.OnGroupCreated(groupID)
+		group.tasks[taskID] = taskState
+	}
+
+	p.groups[groupID] = group
+	if p.config.OnGroupCreated != nil {
+		p.config.OnGroupCreated(groupID)
+	}
+
+	// Submit initial tasks (those with no dependencies)
+	for _, taskID := range graph.Order {
+		node := graph.Nodes[taskID]
+		if len(node.Dependencies) == 0 {
+			task := group.tasks[taskID]
+			if err := p.submitTask(task); err != nil {
+				p.mu.Unlock()
+				return fmt.Errorf("failed to submit initial task %v: %w", taskID, err)
+			}
 		}
 	}
 
-	task := &independentTaskState[T, GID, TID]{
-		task:         data,
-		taskID:       taskID,
-		groupID:      groupID,
-		dependencies: deps,
-		completionCh: make(chan struct{}),
-	}
-
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	group.tasks[taskID] = task
-
-	if p.canSubmitTask(group, taskID) {
-		log.Printf("DEBUG: Task %v can be submitted immediately", taskID)
-		if p.config.OnTaskStarted != nil {
-			p.config.OnTaskStarted(data)
-		}
-		return p.submitTask(task)
-	}
-
-	log.Printf("DEBUG: Task %v stored in pending", taskID)
-	group.pending[taskID] = task
+	p.mu.Unlock()
 	return nil
+}
+
+func (p *IndependentPool[T, GID, TID]) buildDependencyGraph(tasks []T) (*DependencyGraph[TID], error) {
+	graph := &DependencyGraph[TID]{
+		Nodes: make(map[TID]*Node[TID]),
+	}
+
+	// First pass: Create nodes and validate task IDs are unique
+	for _, task := range tasks {
+		dtask := any(task).(DependentTask[GID, TID])
+		taskID := dtask.GetTaskID()
+
+		if _, exists := graph.Nodes[taskID]; exists {
+			return nil, fmt.Errorf("duplicate task ID: %v", taskID)
+		}
+
+		graph.Nodes[taskID] = &Node[TID]{
+			ID:           taskID,
+			Dependencies: dtask.GetDependencies(),
+		}
+	}
+
+	// Second pass: Validate all dependencies exist and build dependency links
+	for _, task := range tasks {
+		dtask := any(task).(DependentTask[GID, TID])
+		taskID := dtask.GetTaskID()
+		for _, depID := range dtask.GetDependencies() {
+			depNode, exists := graph.Nodes[depID]
+			if !exists {
+				return nil, fmt.Errorf("dependency %v not found for task %v", depID, taskID)
+			}
+			depNode.Dependents = append(depNode.Dependents, taskID)
+		}
+	}
+
+	// Perform topological sort to detect cycles and establish execution order
+	sorted, err := p.topologicalSort(graph)
+	if err != nil {
+		return nil, err
+	}
+	graph.Order = sorted
+
+	return graph, nil
+}
+
+func (p *IndependentPool[T, GID, TID]) topologicalSort(graph *DependencyGraph[TID]) ([]TID, error) {
+	var order []TID
+	visited := make(map[TID]bool)
+	inProgress := make(map[TID]bool)
+
+	var visit func(TID) error
+	visit = func(id TID) error {
+		if inProgress[id] {
+			return fmt.Errorf("cycle detected at task %v", id)
+		}
+		if visited[id] {
+			return nil
+		}
+
+		inProgress[id] = true
+		node := graph.Nodes[id]
+
+		for _, depID := range node.Dependencies {
+			if err := visit(depID); err != nil {
+				return err
+			}
+		}
+
+		delete(inProgress, id)
+		visited[id] = true
+		order = append(order, id)
+		return nil
+	}
+
+	for id := range graph.Nodes {
+		if !visited[id] {
+			if err := visit(id); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Reverse the order to get correct dependency ordering
+	for i := 0; i < len(order)/2; i++ {
+		order[i], order[len(order)-1-i] = order[len(order)-1-i], order[i]
+	}
+
+	return order, nil
 }
 
 func (p *IndependentPool[T, GID, TID]) handleTaskCompletion(data T) {
@@ -251,76 +369,66 @@ func (p *IndependentPool[T, GID, TID]) handleTaskCompletion(data T) {
 	}
 
 	dtask := any(data).(DependentTask[GID, TID])
+	groupID := dtask.GetGroupID()
+	taskID := dtask.GetTaskID()
 
 	p.mu.RLock()
-	group, exists := p.groups[dtask.GetGroupID()]
+	group, exists := p.groups[groupID]
 	if !exists {
 		p.mu.RUnlock()
 		return
 	}
 	p.mu.RUnlock()
 
-	groupID := dtask.GetGroupID()
-	taskID := dtask.GetTaskID()
-	log.Printf("DEBUG: Handling completion of task %v in group %v", taskID, groupID)
-
 	group.mu.Lock()
 	defer group.mu.Unlock()
 
-	if task := group.tasks[taskID]; task != nil {
-		task.mu.Lock()
-		task.completed = true
-		close(task.completionCh)
-		task.mu.Unlock()
-		group.completed[taskID] = true
-		log.Printf("DEBUG: Marked task %v as completed", taskID)
+	task := group.tasks[taskID]
+	if task == nil {
+		return
+	}
 
-		allCompleted := true
-		for _, t := range group.tasks {
-			if !t.completed {
-				allCompleted = false
+	// Mark task as completed
+	task.mu.Lock()
+	task.completed = true
+	close(task.completionCh)
+	task.mu.Unlock()
+	group.completed[taskID] = true
+	group.executedTask[taskID] = true
+
+	// Find and submit tasks whose dependencies are now met
+	node := group.graph.Nodes[taskID]
+	for _, depID := range node.Dependents {
+		depNode := group.graph.Nodes[depID]
+		allDepsComplete := true
+		for _, parentID := range depNode.Dependencies {
+			if !group.completed[parentID] {
+				allDepsComplete = false
 				break
 			}
 		}
-
-		if allCompleted && p.config.OnGroupCompleted != nil {
-			p.config.OnGroupCompleted(groupID)
-		}
-
-		log.Printf("DEBUG: Checking pending tasks, count: %d", len(group.pending))
-		for pendingID, pendingTask := range group.pending {
-			log.Printf("DEBUG: Checking pending task %v", pendingID)
-			if p.canSubmitTask(group, pendingID) {
-				log.Printf("DEBUG: Submitting previously pending task %v", pendingID)
-				delete(group.pending, pendingID)
-				if p.config.OnTaskStarted != nil {
-					p.config.OnTaskStarted(pendingTask.task)
+		if allDepsComplete {
+			depTask := group.tasks[depID]
+			if err := p.submitTask(depTask); err != nil {
+				if p.config.OnTaskFailed != nil {
+					p.config.OnTaskFailed(depTask.task, err)
 				}
-				if err := p.submitTask(pendingTask); err != nil {
-					log.Printf("ERROR: Failed to submit pending task %v: %v", pendingID, err)
-					if p.config.OnTaskFailed != nil {
-						p.config.OnTaskFailed(pendingTask.task, err)
-					}
-				}
-			} else {
-				log.Printf("DEBUG: Pending task %v still not ready", pendingID)
 			}
 		}
 	}
-}
 
-func (p *IndependentPool[T, GID, TID]) canSubmitTask(group *independentTaskGroup[T, GID, TID], taskID TID) bool {
-	task := group.tasks[taskID]
-	if task == nil {
-		return false
-	}
-
-	for _, depID := range task.dependencies {
-		if !group.completed[depID] {
-			return false
+	// Check if group is completed
+	allCompleted := true
+	for _, t := range group.tasks {
+		if !t.completed {
+			allCompleted = false
+			break
 		}
 	}
-	return true
+
+	if allCompleted && p.config.OnGroupCompleted != nil {
+		p.config.OnGroupCompleted(groupID)
+	}
 }
 
 func (p *IndependentPool[T, GID, TID]) submitTask(task *independentTaskState[T, GID, TID]) error {
@@ -354,6 +462,10 @@ func (p *IndependentPool[T, GID, TID]) submitTask(task *independentTaskState[T, 
 		}
 	}
 
+	if p.config.OnTaskStarted != nil {
+		p.config.OnTaskStarted(task.task)
+	}
+
 	task.submitted = true
 	task.mu.Unlock()
 
@@ -364,6 +476,7 @@ func (p *IndependentPool[T, GID, TID]) submitTask(task *independentTaskState[T, 
 	return err
 }
 
+// WaitWithCallback waits for the pool to complete while calling a callback function
 func (p *IndependentPool[T, GID, TID]) WaitWithCallback(
 	ctx context.Context,
 	callback func(queueSize, processingCount, deadTaskCount int) bool,
@@ -372,6 +485,7 @@ func (p *IndependentPool[T, GID, TID]) WaitWithCallback(
 	return p.pooler.WaitWithCallback(ctx, callback, interval)
 }
 
+// Close gracefully shuts down the pool
 func (p *IndependentPool[T, GID, TID]) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -380,4 +494,49 @@ func (p *IndependentPool[T, GID, TID]) Close() error {
 	}
 	p.cancel()
 	return p.pooler.Close()
+}
+
+// Submit is deprecated - use SubmitTaskGroup instead
+// This remains only for compatibility with existing tests and will be removed
+func (p *IndependentPool[T, GID, TID]) Submit(data T) error {
+	return fmt.Errorf("individual task submission is deprecated - use SubmitTaskGroup instead")
+}
+
+// GetGroupStatus returns the status of a task group
+func (p *IndependentPool[T, GID, TID]) GetGroupStatus(groupID GID) (completed, total int, err error) {
+	p.mu.RLock()
+	group, exists := p.groups[groupID]
+	if !exists {
+		p.mu.RUnlock()
+		return 0, 0, fmt.Errorf("group %v not found", groupID)
+	}
+	p.mu.RUnlock()
+
+	group.mu.RLock()
+	defer group.mu.RUnlock()
+
+	total = len(group.tasks)
+	completed = len(group.completed)
+	return completed, total, nil
+}
+
+// WaitForGroup waits for all tasks in a group to complete
+func (p *IndependentPool[T, GID, TID]) WaitForGroup(ctx context.Context, groupID GID) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			completed, total, err := p.GetGroupStatus(groupID)
+			if err != nil {
+				return err
+			}
+			if completed == total {
+				return nil
+			}
+		}
+	}
 }
