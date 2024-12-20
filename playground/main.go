@@ -48,10 +48,8 @@ func ExampleIndependent() {
 		{ID: 3, Group: "groupA", Dependencies: []int{2}, Description: "Third task"},
 	}
 
-	for _, task := range tasks {
-		if err := dp.Submit(task); err != nil {
-			log.Printf("Failed to submit task %d: %v", task.ID, err)
-		}
+	if err := dp.SubmitTaskGroup(tasks); err != nil {
+		log.Printf("Failed to submit task  %v", err)
 	}
 
 	// Wait for all tasks using WaitWithCallback
@@ -86,9 +84,10 @@ func (w *BlockingWorker) Run(ctx context.Context, data BlockingTask) error {
 
 	fmt.Println("\t\t Running Task", data.Group, data.ID, "with deps", data.Dependencies)
 
-	<-time.After(500 * time.Millisecond)
+	// Do some work
+	time.Sleep(time.Second)
 
-	// For tasks 1 and 2, submit next task FIRST before doing anything else
+	// For tasks 1 and 2, create next task
 	if data.ID < 3 {
 		nextID := data.ID + 1
 		nextDone := make(chan struct{})
@@ -98,21 +97,25 @@ func (w *BlockingWorker) Run(ctx context.Context, data BlockingTask) error {
 			Group:        data.Group,
 			Dependencies: []int{data.ID},
 			Pool:         data.Pool,
-			// Description:  fmt.Sprintf("Task %d that creates Task %d", nextID, nextID+1),
-			done: nextDone,
+			done:         nextDone,
 		}
 
-		fmt.Println("\t\t\t Creating Next Task", w.ID, data.Group, nextID, "with deps", data.ID, "...", nextTask.Dependencies)
+		fmt.Printf("\t\t\t Creating Next Task %d with deps %v\n", nextID, nextTask.Dependencies)
 
-		// Submit next task immediately
+		// Submit next task first
 		if err := data.Pool.Submit(nextTask); err != nil {
 			return err
 		}
 
-		<-nextDone
-	}
+		// Signal our completion before waiting for next task
+		close(data.done)
 
-	close(data.done)
+		// Now wait for next task
+		<-nextDone
+	} else {
+		// For the last task, just do work and complete
+		close(data.done)
+	}
 
 	return nil
 }
@@ -155,9 +158,9 @@ func ExampleBlocking() {
 }
 
 func main() {
-	fmt.Println("\nIncdependent Pool Example (tasks run in sequence):")
-	ExampleIndependent()
-	time.Sleep(time.Second) // Give time for logs to flush
+	// fmt.Println("\nIncdependent Pool Example (tasks run in sequence):")
+	// ExampleIndependent()
+	// time.Sleep(time.Second) // Give time for logs to flush
 
 	fmt.Println("\nBlocking Pool Example (tasks wait for others internally):")
 	ExampleBlocking()
