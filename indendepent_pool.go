@@ -76,11 +76,6 @@ import (
 /// - Worker pool handles concurrency
 /// - Safe for concurrent group submission
 
-/// TODO: we need to clean up groups and tasks when they are no longer needed
-/// TODO: we need a channel that will be listened to to close a group
-/// TODO: on failure, we can provide the pool's options for retry attempts, we will refuse unlimieted attempts, adding to task tasks is a task failed and group fail which result in the group being removed
-/// TODO: we should have a soft scalling strategy since we don't have blocking tasks, we just need the group to be scheduled with a correct execution order - the current SubmitToFreeworker is completely wrong!!
-
 /// After thinking submitting tasks individually with complex dependency trees could lead to:
 /// - Deadlocks if circular dependencies exist
 /// - Unresolvable pending tasks if dependencies are never submitted
@@ -137,6 +132,10 @@ type IndependentPool[T any, GID comparable, TID comparable] struct {
 	config IndependentConfig[T]
 }
 
+func (i *IndependentPool[T, GID, TID]) PullDeadTask(id int) (*DeadTask[T], error) {
+	return i.pooler.PullDeadTask(id)
+}
+
 type IndependentConfig[T any] struct {
 	workerFactory WorkerFactory[T]
 	minWorkers    int
@@ -151,13 +150,22 @@ type IndependentConfig[T any] struct {
 	// Group callbacks
 	OnGroupCreated   func(groupID any)
 	OnGroupCompleted func(groupID any)
+	OnGroupRemoved   func(groupID any)
 	// Pool events
 	OnWorkerAdded   func(workerID int)
 	OnWorkerRemoved func(workerID int)
 	OnPoolClosed    func()
+	//
+	options []Option[T]
 }
 
 type IndependentPoolOption[T any] func(*IndependentConfig[T])
+
+func WithIndependentOnDeadTask[T any](handler func(deadTaskIndex int)) IndependentPoolOption[T] {
+	return func(c *IndependentConfig[T]) {
+		c.options = append(c.options, WithOnDeadTask[T](handler))
+	}
+}
 
 func WithIndependentWorkerFactory[T any](factory WorkerFactory[T]) IndependentPoolOption[T] {
 	return func(c *IndependentConfig[T]) {
@@ -178,6 +186,12 @@ func WithIndependentWorkerLimits[T any](min, max int) IndependentPoolOption[T] {
 		}
 		c.minWorkers = min
 		c.maxWorkers = max
+	}
+}
+
+func WithIndependentOnGroupRemoved[T any](cb func(groupID any)) IndependentPoolOption[T] {
+	return func(c *IndependentConfig[T]) {
+		c.OnGroupRemoved = cb
 	}
 }
 
@@ -261,8 +275,10 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 		cfg.OnWorkerAdded(0)
 	}
 
+	cfg.options = append(cfg.options, WithAttempts[T](1))
+
 	pool := &IndependentPool[T, GID, TID]{
-		pooler: New[T](ctx, []Worker[T]{worker}, WithAttempts[T](1)),
+		pooler: New[T](ctx, []Worker[T]{worker}, cfg.options...),
 		groups: make(map[GID]*independentTaskGroup[T, GID, TID]),
 		config: cfg,
 		ctx:    ctx,
@@ -523,8 +539,38 @@ func (p *IndependentPool[T, GID, TID]) handleTaskCompletion(data T) {
 		}
 	}
 
-	if allCompleted && p.config.OnGroupCompleted != nil {
-		p.config.OnGroupCompleted(groupID)
+	if allCompleted {
+		// Trigger completion callback
+		if p.config.OnGroupCompleted != nil {
+			p.config.OnGroupCompleted(groupID)
+		}
+
+		// Clean up the group's internal data first
+		for k := range group.tasks {
+			delete(group.tasks, k)
+		}
+		for k := range group.completed {
+			delete(group.completed, k)
+		}
+		for k := range group.pending {
+			delete(group.pending, k)
+		}
+		for k := range group.executedTask {
+			delete(group.executedTask, k)
+		}
+		group.graph = nil
+
+		// Call removal callback while group still exists in p.groups
+		if p.config.OnGroupRemoved != nil {
+			p.config.OnGroupRemoved(groupID)
+		}
+
+		// Finally remove the group from p.groups
+		group.mu.Unlock()
+		p.mu.Lock()
+		delete(p.groups, groupID)
+		p.mu.Unlock()
+		group.mu.Lock() // Reacquire for deferred unlock
 	}
 }
 
@@ -621,6 +667,14 @@ func (p *IndependentPool[T, GID, TID]) WaitForGroup(ctx context.Context, groupID
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			p.mu.RLock()
+			_, exists := p.groups[groupID]
+			if !exists {
+				// Group not found means it was cleaned up after completion
+				p.mu.RUnlock()
+				return nil
+			}
+			p.mu.RUnlock()
 			completed, total, err := p.GetGroupStatus(groupID)
 			if err != nil {
 				return err

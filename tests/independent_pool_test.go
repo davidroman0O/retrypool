@@ -2,9 +2,11 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -370,5 +372,205 @@ func TestIndependentPool_MissingDependencies(t *testing.T) {
 	err = pool.Submit(tasks)
 	if err == nil {
 		t.Error("Expected error due to missing dependency, got nil")
+	}
+}
+
+func TestIndependentPool_WorkerScaling(t *testing.T) {
+	ctx := context.Background()
+	worker := &IndependentTestWorker{executionTimes: make(map[int]time.Time)}
+
+	workerAddedCount := 0
+	workerRemovedCount := 0
+
+	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
+		ctx,
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+		retrypool.WithIndependentWorkerLimits[TestTask](1, 5),
+		retrypool.WithIndependentOnWorkerAdded[TestTask](func(workerID int) {
+			workerAddedCount++
+		}),
+		retrypool.WithIndependentOnWorkerRemoved[TestTask](func(workerID int) {
+			workerRemovedCount++
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Create tasks that will force worker scaling
+	tasks := make([]TestTask, 10)
+	for i := 0; i < 10; i++ {
+		tasks[i] = TestTask{
+			ID:      i,
+			GroupID: "group1",
+			ExecuteFunc: func() error {
+				time.Sleep(100 * time.Millisecond)
+				return nil
+			},
+		}
+	}
+
+	if err := pool.Submit(tasks); err != nil {
+		t.Fatalf("Failed to submit tasks: %v", err)
+	}
+
+	err = pool.WaitForGroup(ctx, "group1")
+	if err != nil {
+		t.Fatalf("Error waiting for group: %v", err)
+	}
+
+	if workerAddedCount == 0 {
+		t.Error("No workers were added during scaling")
+	}
+
+	if err := pool.Close(); err != nil {
+		t.Fatalf("Failed to close pool: %v", err)
+	}
+}
+
+func TestIndependentPool_GroupCallbacks(t *testing.T) {
+	ctx := context.Background()
+	worker := &IndependentTestWorker{executionTimes: make(map[int]time.Time)}
+
+	var groupsCreated, groupsCompleted int
+	var mu sync.Mutex
+
+	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
+		ctx,
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] { return worker }),
+		retrypool.WithIndependentOnGroupCreated[TestTask](func(groupID any) {
+			mu.Lock()
+			groupsCreated++
+			mu.Unlock()
+		}),
+		retrypool.WithIndependentOnGroupCompleted[TestTask](func(groupID any) {
+			mu.Lock()
+			groupsCompleted++
+			mu.Unlock()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Submit multiple groups
+	groups := []string{"group1", "group2", "group3"}
+	for _, gid := range groups {
+		tasks := []TestTask{
+			{ID: 1, GroupID: gid},
+			{ID: 2, GroupID: gid, Dependencies: []int{1}},
+		}
+
+		if err := pool.Submit(tasks); err != nil {
+			t.Fatalf("Failed to submit group %s: %v", gid, err)
+		}
+	}
+
+	// Wait for all groups
+	for _, gid := range groups {
+		err = pool.WaitForGroup(ctx, gid)
+		if err != nil {
+			t.Fatalf("Error waiting for group %s: %v", gid, err)
+		}
+	}
+
+	mu.Lock()
+	if groupsCreated != len(groups) {
+		t.Errorf("Expected %d groups created, got %d", len(groups), groupsCreated)
+	}
+	if groupsCompleted != len(groups) {
+		t.Errorf("Expected %d groups completed, got %d", len(groups), groupsCompleted)
+	}
+	mu.Unlock()
+}
+
+func TestIndependentPool_TaskFailureHandling(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var failureCount atomic.Int32
+	var completionCount atomic.Int32
+	var deadTaskCount atomic.Int32
+
+	var pool *retrypool.IndependentPool[TestTask, string, int]
+
+	pool, err := retrypool.NewIndependentPool[TestTask, string, int](
+		ctx,
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[TestTask] {
+			return &IndependentTestWorker{executionTimes: make(map[int]time.Time)}
+		}),
+		retrypool.WithIndependentOnTaskFailed[TestTask](func(task TestTask, err error) {
+			failureCount.Add(1)
+			t.Logf("Task %d failed and moved to dead tasks: %v", task.ID, err)
+		}),
+		retrypool.WithIndependentOnTaskCompleted[TestTask](func(task TestTask) {
+			completionCount.Add(1)
+			t.Logf("Task %d completed", task.ID)
+		}),
+		retrypool.WithIndependentOnDeadTask[TestTask](func(deadTaskIndex int) {
+			deadTaskCount.Add(1)
+			task, err := pool.PullDeadTask(deadTaskIndex)
+			if err != nil {
+				t.Errorf("Failed to pull dead task: %v", err)
+				return
+			}
+			t.Logf("dead task %d", task.Data.ID)
+		}),
+	)
+
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	expectedError := errors.New("intentional failure")
+
+	tasks := []TestTask{
+		{
+			ID:      1,
+			GroupID: "group1",
+			ExecuteFunc: func() error {
+				return expectedError
+			},
+		},
+		{
+			ID:           2,
+			GroupID:      "group1",
+			Dependencies: []int{1},
+			ExecuteFunc: func() error {
+				t.Error("Task 2 should never execute since task 1 failed")
+				return nil
+			},
+		},
+	}
+
+	if err := pool.Submit(tasks); err != nil {
+		t.Fatalf("Failed to submit tasks: %v", err)
+	}
+
+	err = pool.WaitWithCallback(
+		ctx,
+		func(queueSize, processingCount, deadTaskCount int) bool {
+			t.Logf("Status: Queue=%d Processing=%d Dead=%d Failures=%d Completions=%d",
+				queueSize, processingCount, deadTaskCount,
+				failureCount.Load(), completionCount.Load())
+			return queueSize > 0 || processingCount > 0
+		},
+		100*time.Millisecond,
+	)
+
+	if err != nil {
+		t.Fatalf("WaitWithCallback failed: %v", err)
+	}
+
+	if failures := failureCount.Load(); failures != 1 {
+		t.Errorf("Expected 1 failure, got %d", failures)
+	}
+
+	if dead := deadTaskCount.Load(); dead != 1 {
+		t.Errorf("Expected 1 dead task, got %d", dead)
+	}
+
+	if completions := completionCount.Load(); completions != 0 {
+		t.Errorf("Expected 0 completions (all tasks should fail), got %d", completions)
 	}
 }

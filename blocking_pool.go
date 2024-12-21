@@ -64,13 +64,10 @@ import (
 /// - Blocked: Waiting for child task
 /// - Completed: Task finished successfully
 
-/// TODO: we need to clean up groups and tasks when they are no longer needed
-/// TODO: we need a channel that will be listened to to close a group
-/// TODO: we need to limit active pools but scale workers in each pool as needed
-
 // BlockingConfig holds basic config - each active group gets its own pool of workers
 type BlockingConfig[T any] struct {
-	workerFactory  WorkerFactory[T]
+	workerFactory WorkerFactory[T]
+	// You always starts with 1 pool but you can define the maximum amount the BP can have at all time
 	maxActivePools int // Maximum number of active pools (one per group)
 	// Task callbacks
 	OnTaskSubmitted func(task T)
@@ -80,6 +77,7 @@ type BlockingConfig[T any] struct {
 	// Group/Pool callbacks
 	OnGroupCreated   func(groupID any)
 	OnGroupCompleted func(groupID any)
+	OnGroupRemoved   func(groupID any)
 	OnPoolCreated    func(groupID any)
 	OnPoolDestroyed  func(groupID any)
 	OnWorkerAdded    func(groupID any, workerID int)
@@ -139,6 +137,13 @@ func WithBlockingMaxActivePools[T any](max int) BlockingPoolOption[T] {
 }
 
 // All the callback setters
+
+func WithBlockingOnGroupRemoved[T any](cb func(groupID any)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnGroupRemoved = cb
+	}
+}
+
 func WithBlockingOnTaskSubmitted[T any](cb func(task T)) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
 		c.OnTaskSubmitted = cb
@@ -498,6 +503,15 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 		if p.config.OnGroupCompleted != nil {
 			p.config.OnGroupCompleted(groupID)
 		}
+
+		// Clean up group data by removing it from groups
+		delete(p.groups, groupID)
+
+		// Trigger group removal callback
+		if p.config.OnGroupRemoved != nil {
+			p.config.OnGroupRemoved(groupID)
+		}
+
 		p.mu.Unlock()
 	}
 }
