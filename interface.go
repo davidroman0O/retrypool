@@ -43,10 +43,6 @@ type Pooler[T any] interface {
 	// SubmitToFreeWorker attempts to submit a task to a free worker
 	SubmitToFreeWorker(taskData T, options ...TaskOption[T]) error
 
-	// Allocate creates and submits a new task using the internal sync.Pool. The fn callback
-	// can be used to populate the task's data before enqueueing. Optional TaskOptions can modify the task's behavior.
-	// Allocate(fn func(val *T), options ...TaskOption[T]) error
-
 	// Submit allows submitting data directly as a task without pre-allocation. Optional TaskOptions can modify the task's behavior.
 	Submit(data T, options ...TaskOption[T]) error
 

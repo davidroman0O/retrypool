@@ -906,57 +906,6 @@ func WithRunningCb[T any](cb func()) TaskOption[T] {
 	}
 }
 
-// Allocate creates and submits a new task using the internal sync.Pool
-func (p *Pool[T]) Allocate(fn func(val *T), options ...TaskOption[T]) error {
-	p.logger.Debug(p.ctx, "Allocating new task")
-
-	if p.availableWorkers.Load() == 0 {
-		switch p.config.noWorkerPolicy {
-		case NoWorkerPolicyAddToDeadTasks:
-			p.logger.Warn(p.ctx, "No workers available, adding task to dead tasks")
-			p.metrics.DeadTasks.Add(1)
-			t := p.taskPool.Get().(*Task[T])
-			*t = Task[T]{}
-			fn(&t.data)
-			t.deadReason = "No workers available"
-			p.addDeadTask(t)
-			return nil
-		case NoWorkerPolicyReject:
-			p.logger.Warn(p.ctx, "No workers available")
-			return ErrNoWorkersAvailable
-		}
-	}
-
-	if p.config.maxQueueSize > 0 && p.metrics.TasksSubmitted.Load()-p.metrics.TasksSucceeded.Load()-p.DeadTaskCount() >= int64(p.config.maxQueueSize) {
-		p.logger.Warn(p.ctx, "Max queue size exceeded")
-		return ErrMaxQueueSizeExceeded
-	}
-
-	if p.limiter != nil {
-		if !p.limiter.Allow() {
-			p.logger.Warn(p.ctx, "Rate limit exceeded")
-			return ErrRateLimitExceeded
-		}
-	}
-
-	t := p.taskPool.Get().(*Task[T])
-	*t = Task[T]{state: TaskStateCreated}
-	fn(&t.data)
-	p.logger.Debug(p.ctx, "Task data assigned", "task_data", t.data)
-
-	for _, option := range options {
-		option(t)
-	}
-
-	if err := p.TransitionTaskState(t, TaskStatePending, "Allocated"); err != nil {
-		return err
-	}
-
-	p.metrics.TasksSubmitted.Add(1)
-	p.UpdateTotalQueueSize(1)
-	return p.submitTask(t)
-}
-
 // Submit allows the developer to send data directly without pre-allocation.
 func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 
