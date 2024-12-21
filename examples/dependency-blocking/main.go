@@ -76,6 +76,9 @@ func main() {
 	dp, err := retrypool.NewBlockingPool[task, string, int](
 		ctx,
 		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[task] { return &worker{} }),
+		retrypool.WithBlockingOnGroupRemoved[task](func(groupID any) {
+			fmt.Println("Group", groupID, "is done")
+		}),
 	)
 	if err != nil {
 		log.Fatalf("Failed to create pool: %v", err)

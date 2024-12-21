@@ -40,6 +40,9 @@ func main() {
 			return &worker{}
 		}),
 		retrypool.WithIndependentDependencyMode[task](retrypool.ReverseMode),
+		retrypool.WithIndependentOnGroupRemoved[task](func(groupID any) {
+			log.Println("Group removed:", groupID)
+		}),
 	)
 	if err != nil {
 		panic(err)

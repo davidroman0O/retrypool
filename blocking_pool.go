@@ -79,6 +79,7 @@ type BlockingConfig[T any] struct {
 	// Group/Pool callbacks
 	OnGroupCreated   func(groupID any)
 	OnGroupCompleted func(groupID any)
+	OnGroupRemoved   func(groupID any)
 	OnPoolCreated    func(groupID any)
 	OnPoolDestroyed  func(groupID any)
 	OnWorkerAdded    func(groupID any, workerID int)
@@ -138,6 +139,13 @@ func WithBlockingMaxActivePools[T any](max int) BlockingPoolOption[T] {
 }
 
 // All the callback setters
+
+func WithBlockingOnGroupRemoved[T any](cb func(groupID any)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnGroupRemoved = cb
+	}
+}
+
 func WithBlockingOnTaskSubmitted[T any](cb func(task T)) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
 		c.OnTaskSubmitted = cb
@@ -497,6 +505,15 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 		if p.config.OnGroupCompleted != nil {
 			p.config.OnGroupCompleted(groupID)
 		}
+
+		// Clean up group data by removing it from groups
+		delete(p.groups, groupID)
+
+		// Trigger group removal callback
+		if p.config.OnGroupRemoved != nil {
+			p.config.OnGroupRemoved(groupID)
+		}
+
 		p.mu.Unlock()
 	}
 }
