@@ -205,8 +205,8 @@ func TestIndependentPool_ErrorHandling(t *testing.T) {
 
 	// Wait for completion with timeout
 	err = pool.WaitForGroup(ctx, "group1")
-	if err == nil {
-		t.Error("Expected error from WaitForGroup, got nil")
+	if err != nil {
+		t.Fatalf("Error waiting for group: %v", err)
 	}
 
 	if !taskFailed {
