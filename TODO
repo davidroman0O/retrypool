@@ -1,0 +1,5 @@
+
+[ ] - More tests
+[ ] - check for data retention and leakage
+[ ] - Examples
+[ ] - Implement an helper to use the DependecyPool for the same API as that: https://github.com/Azure/go-workflow
