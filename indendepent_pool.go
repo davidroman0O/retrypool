@@ -88,8 +88,6 @@ import (
 /// - Build a complete execution plan
 /// - Reject additional tasks for groups already being processed
 
-/// TODO: we need to clean up groups and tasks when they are no longer needed
-
 // DependencyGraph represents the complete dependency structure for a task group
 type DependencyGraph[TID comparable] struct {
 	Nodes map[TID]*Node[TID]

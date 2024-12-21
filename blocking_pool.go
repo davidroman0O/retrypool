@@ -64,8 +64,6 @@ import (
 /// - Blocked: Waiting for child task
 /// - Completed: Task finished successfully
 
-/// TODO: we need to clean up groups and tasks when they are no longer needed
-
 // BlockingConfig holds basic config - each active group gets its own pool of workers
 type BlockingConfig[T any] struct {
 	workerFactory WorkerFactory[T]
