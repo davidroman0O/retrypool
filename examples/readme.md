@@ -18,3 +18,5 @@
 16. [Testing Concurrency and Data Race Prevention](./concurrency/): Create a high-concurrency scenario to test for data races and ensure thread safety.
 17. [Graceful Shutdown and Cleanup](./shutdown/): Demonstrate how to gracefully shut down the pool and ensure all tasks are completed or properly terminated.
 18. [Error Handling and Specific Error Cases](./error-handling/): Explore how the pool handles specific errors like `ErrPoolClosed` or `ErrMaxQueueSizeExceeded`.
+19. [Independent dependency pool](./dependency-independent/): Dependent tasks executed in the right order, useful for data processing.
+20. [Blocking dependency pool](./dependency-blocking/): Task that require a blocking mechanism (blocking a worker) by waiting another task, useful for workflow engines.

@@ -241,6 +241,10 @@ The following examples demonstrate various use cases and features:
   - [Testing Concurrency and Data Race Prevention](./examples/concurrency/)
   - [Graceful Shutdown and Cleanup](./examples/shutdown/)
 
+- Specialized Pools
+  - [Independent dependency pool](./examples/dependency-independent/)
+  - [Blocking dependency pool](./examples/dependency-blocking/)
+
 ## Documentation
 
 For detailed API documentation and more examples, visit:
