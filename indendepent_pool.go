@@ -76,11 +76,6 @@ import (
 /// - Worker pool handles concurrency
 /// - Safe for concurrent group submission
 
-/// TODO: we need to clean up groups and tasks when they are no longer needed
-/// TODO: we need a channel that will be listened to to close a group
-/// TODO: on failure, we can provide the pool's options for retry attempts, we will refuse unlimieted attempts, adding to task tasks is a task failed and group fail which result in the group being removed
-/// TODO: we should have a soft scalling strategy since we don't have blocking tasks, we just need the group to be scheduled with a correct execution order - the current SubmitToFreeworker is completely wrong!!
-
 /// After thinking submitting tasks individually with complex dependency trees could lead to:
 /// - Deadlocks if circular dependencies exist
 /// - Unresolvable pending tasks if dependencies are never submitted
@@ -92,6 +87,11 @@ import (
 /// - Validate the entire dependency tree before accepting any tasks
 /// - Build a complete execution plan
 /// - Reject additional tasks for groups already being processed
+
+/// TODO: we need to clean up groups and tasks when they are no longer needed
+/// TODO: we need a channel that will be listened to to close a group
+/// TODO: on failure, we can provide the pool's options for retry attempts, we will refuse unlimieted attempts, adding to task tasks is a task failed and group fail which result in the group being removed
+/// TODO: we should have a soft scalling strategy since we don't have blocking tasks, we just need the group to be scheduled with a correct execution order - the current SubmitToFreeworker is completely wrong!!
 
 // DependencyGraph represents the complete dependency structure for a task group
 type DependencyGraph[TID comparable] struct {
@@ -137,6 +137,10 @@ type IndependentPool[T any, GID comparable, TID comparable] struct {
 	config IndependentConfig[T]
 }
 
+func (i *IndependentPool[T, GID, TID]) PullDeadTask(id int) (*DeadTask[T], error) {
+	return i.pooler.PullDeadTask(id)
+}
+
 type IndependentConfig[T any] struct {
 	workerFactory WorkerFactory[T]
 	minWorkers    int
@@ -155,9 +159,17 @@ type IndependentConfig[T any] struct {
 	OnWorkerAdded   func(workerID int)
 	OnWorkerRemoved func(workerID int)
 	OnPoolClosed    func()
+	//
+	options []Option[T]
 }
 
 type IndependentPoolOption[T any] func(*IndependentConfig[T])
+
+func WithIndependentOnDeadTask[T any](handler func(deadTaskIndex int)) IndependentPoolOption[T] {
+	return func(c *IndependentConfig[T]) {
+		c.options = append(c.options, WithOnDeadTask[T](handler))
+	}
+}
 
 func WithIndependentWorkerFactory[T any](factory WorkerFactory[T]) IndependentPoolOption[T] {
 	return func(c *IndependentConfig[T]) {
@@ -261,8 +273,10 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 		cfg.OnWorkerAdded(0)
 	}
 
+	cfg.options = append(cfg.options, WithAttempts[T](1))
+
 	pool := &IndependentPool[T, GID, TID]{
-		pooler: New[T](ctx, []Worker[T]{worker}, WithAttempts[T](1)),
+		pooler: New[T](ctx, []Worker[T]{worker}, cfg.options...),
 		groups: make(map[GID]*independentTaskGroup[T, GID, TID]),
 		config: cfg,
 		ctx:    ctx,

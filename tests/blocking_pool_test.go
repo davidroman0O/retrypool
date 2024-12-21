@@ -409,3 +409,150 @@ func TestBlockingPool_StressTest(t *testing.T) {
 
 	t.Logf("Stress test completed successfully")
 }
+
+// blockingTaskCallback for testing callbacks
+type blockingTaskCallback struct {
+	ID      int
+	GroupID string
+}
+
+func (t blockingTaskCallback) GetDependencies() []int { return nil }
+func (t blockingTaskCallback) GetGroupID() string     { return t.GroupID }
+func (t blockingTaskCallback) GetTaskID() int         { return t.ID }
+
+// blockingSimpleWorkerCalblack just executes tasks without blocking behavior
+type blockingSimpleWorkerCalblack struct {
+	executionCount atomic.Int32
+}
+
+func (w *blockingSimpleWorkerCalblack) Run(ctx context.Context, task blockingTaskCallback) error {
+	w.executionCount.Add(1)
+	time.Sleep(50 * time.Millisecond) // Small delay to simulate work
+	return nil
+}
+
+func TestBlockingPool_TaskCallbacks(t *testing.T) {
+	ctx := context.Background()
+	worker := &blockingSimpleWorkerCalblack{}
+
+	var submitted, started, completed atomic.Int32
+
+	pool, err := retrypool.NewBlockingPool[blockingTaskCallback, string, int](
+		ctx,
+		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[blockingTaskCallback] { return worker }),
+		retrypool.WithBlockingOnTaskSubmitted[blockingTaskCallback](func(task blockingTaskCallback) {
+			submitted.Add(1)
+			t.Logf("Task %d submitted", task.ID)
+		}),
+		retrypool.WithBlockingOnTaskStarted[blockingTaskCallback](func(task blockingTaskCallback) {
+			started.Add(1)
+			t.Logf("Task %d started", task.ID)
+		}),
+		retrypool.WithBlockingOnTaskCompleted[blockingTaskCallback](func(task blockingTaskCallback) {
+			completed.Add(1)
+			t.Logf("Task %d completed", task.ID)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	task := blockingTaskCallback{
+		ID:      1,
+		GroupID: "group1",
+	}
+
+	if err := pool.Submit(task); err != nil {
+		t.Fatalf("Failed to submit task: %v", err)
+	}
+
+	// Wait for task completion with monitoring
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	err = pool.WaitWithCallback(ctx,
+		func(queueSize, processingCount, deadTaskCount int) bool {
+			t.Logf("Status: Queue=%d Processing=%d Dead=%d Submitted=%d Started=%d Completed=%d",
+				queueSize, processingCount, deadTaskCount,
+				submitted.Load(), started.Load(), completed.Load())
+			return queueSize > 0 || processingCount > 0
+		},
+		100*time.Millisecond,
+	)
+
+	if err != nil {
+		t.Fatalf("Error waiting for task: %v", err)
+	}
+
+	// Verify callback counts
+	if s := submitted.Load(); s != 1 {
+		t.Errorf("Expected 1 submission, got %d", s)
+	}
+	if s := started.Load(); s != 1 {
+		t.Errorf("Expected 1 start, got %d", s)
+	}
+	if c := completed.Load(); c != 1 {
+		t.Errorf("Expected 1 completion, got %d", c)
+	}
+
+	// Verify worker actually executed the task
+	if e := worker.executionCount.Load(); e != 1 {
+		t.Errorf("Expected worker to execute task once, got %d executions", e)
+	}
+}
+
+func TestBlockingPool_PoolEvents(t *testing.T) {
+	ctx := context.Background()
+	worker := &BlockingWorker{executionTimes: make(map[int]time.Time)}
+
+	var poolsCreated int
+	var mu sync.Mutex
+
+	pool, err := retrypool.NewBlockingPool[BlockingTask, string, int](
+		ctx,
+		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[BlockingTask] { return worker }),
+		retrypool.WithBlockingMaxActivePools[BlockingTask](2), // Allow 2 pools to run concurrently
+		retrypool.WithBlockingOnPoolCreated[BlockingTask](func(groupID any) {
+			mu.Lock()
+			poolsCreated++
+			mu.Unlock()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Create tasks for multiple groups to trigger pool creation/destruction
+	groups := []string{"group1", "group2"}
+	doneChans := make([]chan struct{}, len(groups))
+
+	for i, gid := range groups {
+		doneChans[i] = make(chan struct{})
+		task := BlockingTask{
+			ID:      i + 1,
+			GroupID: gid,
+			Pool:    pool,
+			done:    doneChans[i],
+			sleep:   50 * time.Millisecond,
+		}
+
+		if err := pool.Submit(task); err != nil {
+			t.Fatalf("Failed to submit task for group %s: %v", gid, err)
+		}
+	}
+
+	// Wait for all tasks
+	for i, done := range doneChans {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timeout waiting for group %s", groups[i])
+		}
+	}
+
+	mu.Lock()
+	if poolsCreated == 0 {
+		t.Error("No pools were created")
+	}
+	mu.Unlock()
+}

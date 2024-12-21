@@ -67,6 +67,7 @@ import (
 /// TODO: we need to clean up groups and tasks when they are no longer needed
 /// TODO: we need a channel that will be listened to to close a group
 /// TODO: we need to limit active pools but scale workers in each pool as needed
+/// TODO: we need a scaling strategy for pools
 
 // BlockingConfig holds basic config - each active group gets its own pool of workers
 type BlockingConfig[T any] struct {
