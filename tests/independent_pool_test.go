@@ -574,3 +574,113 @@ func TestIndependentPool_TaskFailureHandling(t *testing.T) {
 		t.Errorf("Expected 0 completions (all tasks should fail), got %d", completions)
 	}
 }
+
+// FailureTask implements DependentTask and can be configured to fail
+type FailureTask struct {
+	ID           int
+	GroupID      string
+	Dependencies []int
+	ShouldFail   bool
+}
+
+func (t FailureTask) GetDependencies() []int { return t.Dependencies }
+func (t FailureTask) GetGroupID() string     { return t.GroupID }
+func (t FailureTask) GetTaskID() int         { return t.ID }
+
+// FailureWorker tracks task execution and failures
+type FailureWorker struct {
+	executedTasks atomic.Int32
+	failedTasks   atomic.Int32
+}
+
+func (w *FailureWorker) Run(ctx context.Context, task FailureTask) error {
+	w.executedTasks.Add(1)
+	if task.ShouldFail {
+		w.failedTasks.Add(1)
+		return errors.New("task failed as configured")
+	}
+	return nil
+}
+
+func TestIndependentPool_TaskFailureRemoveHandling(t *testing.T) {
+	ctx := context.Background()
+	worker := &FailureWorker{}
+
+	var taskFailures atomic.Int32
+	var deadTasks atomic.Int32
+	var groupRemovals atomic.Int32
+
+	pool, err := retrypool.NewIndependentPool[FailureTask, string, int](
+		ctx,
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[FailureTask] { return worker }),
+		retrypool.WithIndependentOnTaskFailed[FailureTask](func(task FailureTask, err error) {
+			taskFailures.Add(1)
+		}),
+		retrypool.WithIndependentOnDeadTask[FailureTask](func(deadTaskIndex int) {
+			deadTasks.Add(1)
+		}),
+		retrypool.WithIndependentOnGroupRemoved[FailureTask](func(groupID any, tasks []FailureTask) {
+			groupRemovals.Add(1)
+		}),
+	)
+
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Create a chain of tasks where Task 1 fails and Task 2 depends on it
+	tasks := []FailureTask{
+		{
+			ID:         1,
+			GroupID:    "group1",
+			ShouldFail: true,
+		},
+		{
+			ID:           2,
+			GroupID:      "group1",
+			Dependencies: []int{1}, // Depends on the failing task
+		},
+	}
+
+	if err := pool.Submit(tasks); err != nil {
+		t.Fatalf("Failed to submit tasks: %v", err)
+	}
+
+	// Wait for completion with timeout
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	err = pool.WaitWithCallback(
+		ctx,
+		func(queueSize, processingCount, deadTaskCount int) bool {
+			t.Logf("Queue: %d, Processing: %d, Dead: %d", queueSize, processingCount, deadTaskCount)
+			return queueSize > 0 || processingCount > 0
+		},
+		100*time.Millisecond,
+	)
+
+	if err != nil {
+		t.Fatalf("Error waiting for tasks: %v", err)
+	}
+
+	// Verify outcomes
+	if executed := worker.executedTasks.Load(); executed != 1 {
+		t.Errorf("Expected 1 task execution (failing task), got %d", executed)
+	}
+
+	if failed := taskFailures.Load(); failed != 1 {
+		t.Errorf("Expected 1 task failure callback, got %d", failed)
+	}
+
+	if dead := deadTasks.Load(); dead != 1 {
+		t.Errorf("Expected 1 dead task, got %d", dead)
+	}
+
+	if removals := groupRemovals.Load(); removals != 1 {
+		t.Errorf("Expected 1 group removal, got %d", removals)
+	}
+
+	if err := pool.Close(); err != nil {
+		t.Fatalf("Failed to close pool: %v", err)
+	}
+}

@@ -1,2 +1,2 @@
-
+[ ] - Add unit tests for failure and cleanup detection in Blocking and Independent Pools
 [ ] - Implement an helper to use the DependecyPool for the same API as that: https://github.com/Azure/go-workflow

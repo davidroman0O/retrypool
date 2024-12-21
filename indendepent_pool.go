@@ -69,6 +69,8 @@ import (
 /// - Failed tasks can retry based on policy
 /// - Group state tracks failed tasks
 /// - Groups can fail if tasks can't complete
+/// - When the group fail, the task that failed goes into the deadtasks so please clean it up yourself
+/// - Use the OnGroupRemoved callback to know when a group is removed and get the list of tasks
 ///
 /// Thread Safety:
 /// - Groups isolated from each other
@@ -150,7 +152,7 @@ type IndependentConfig[T any] struct {
 	// Group callbacks
 	OnGroupCreated   func(groupID any)
 	OnGroupCompleted func(groupID any)
-	OnGroupRemoved   func(groupID any)
+	OnGroupRemoved   func(groupID any, tasks []T)
 	// Pool events
 	OnWorkerAdded   func(workerID int)
 	OnWorkerRemoved func(workerID int)
@@ -189,7 +191,7 @@ func WithIndependentWorkerLimits[T any](min, max int) IndependentPoolOption[T] {
 	}
 }
 
-func WithIndependentOnGroupRemoved[T any](cb func(groupID any)) IndependentPoolOption[T] {
+func WithIndependentOnGroupRemoved[T any](cb func(groupID any, tasks []T)) IndependentPoolOption[T] {
 	return func(c *IndependentConfig[T]) {
 		c.OnGroupRemoved = cb
 	}
@@ -290,7 +292,27 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 		if pool.config.OnTaskFailed != nil {
 			pool.config.OnTaskFailed(data, err)
 		}
-		return TaskActionRetry
+
+		if dt, ok := any(data).(DependentTask[GID, TID]); ok {
+			groupID := dt.GetGroupID()
+
+			// Clean up group data
+			pool.mu.Lock()
+			if group, exists := pool.groups[groupID]; exists {
+				// Call removal callback if set
+				if pool.config.OnGroupRemoved != nil {
+					tasks := make([]T, 0, len(group.tasks))
+					for _, task := range group.tasks {
+						tasks = append(tasks, task.task)
+					}
+					pool.config.OnGroupRemoved(groupID, tasks)
+				}
+				// Delete group from memory
+				delete(pool.groups, groupID)
+			}
+			pool.mu.Unlock()
+		}
+		return TaskActionAddToDeadTasks
 	})
 
 	return pool, nil
@@ -562,7 +584,11 @@ func (p *IndependentPool[T, GID, TID]) handleTaskCompletion(data T) {
 
 		// Call removal callback while group still exists in p.groups
 		if p.config.OnGroupRemoved != nil {
-			p.config.OnGroupRemoved(groupID)
+			tasks := make([]T, 0, len(group.tasks))
+			for _, task := range group.tasks {
+				tasks = append(tasks, task.task)
+			}
+			p.config.OnGroupRemoved(groupID, tasks)
 		}
 
 		// Finally remove the group from p.groups
