@@ -65,11 +65,11 @@ func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
 			return err
 		}
 
-		// Signal our completion before waiting for next task
-		close(task.done)
-
 		// Now wait for next task
 		<-nextDone
+
+		// Signal our completion before waiting for next task
+		close(task.done)
 	} else {
 		// For the last task, just signal completion
 		close(task.done)

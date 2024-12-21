@@ -89,9 +89,6 @@ import (
 /// - Reject additional tasks for groups already being processed
 
 /// TODO: we need to clean up groups and tasks when they are no longer needed
-/// TODO: we need a channel that will be listened to to close a group
-/// TODO: on failure, we can provide the pool's options for retry attempts, we will refuse unlimieted attempts, adding to task tasks is a task failed and group fail which result in the group being removed
-/// TODO: we should have a soft scalling strategy since we don't have blocking tasks, we just need the group to be scheduled with a correct execution order - the current SubmitToFreeworker is completely wrong!!
 
 // DependencyGraph represents the complete dependency structure for a task group
 type DependencyGraph[TID comparable] struct {
