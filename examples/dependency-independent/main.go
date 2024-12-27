@@ -40,7 +40,7 @@ func main() {
 			return &worker{}
 		}),
 		retrypool.WithIndependentDependencyMode[task](retrypool.ReverseMode),
-		retrypool.WithIndependentOnGroupRemoved[task](func(groupID any) {
+		retrypool.WithIndependentOnGroupRemoved[task](func(groupID any, tasks []task) {
 			log.Println("Group removed:", groupID)
 		}),
 	)

@@ -76,7 +76,7 @@ func main() {
 	dp, err := retrypool.NewBlockingPool[task, string, int](
 		ctx,
 		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[task] { return &worker{} }),
-		retrypool.WithBlockingOnGroupRemoved[task](func(groupID any) {
+		retrypool.WithBlockingOnGroupRemoved[task](func(groupID any, tasks []task) {
 			fmt.Println("Group", groupID, "is done")
 		}),
 	)

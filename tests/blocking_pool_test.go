@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -555,4 +556,154 @@ func TestBlockingPool_PoolEvents(t *testing.T) {
 		t.Error("No pools were created")
 	}
 	mu.Unlock()
+}
+
+// BlockingFailureTask implements DependentTask and tracks failure state
+type BlockingFailureTask struct {
+	ID           int
+	GroupID      string
+	Dependencies []int
+	ShouldFail   bool
+	Pool         *retrypool.BlockingPool[BlockingFailureTask, string, int]
+	Done         chan struct{}
+}
+
+func (t BlockingFailureTask) GetDependencies() []int { return t.Dependencies }
+func (t BlockingFailureTask) GetGroupID() string     { return t.GroupID }
+func (t BlockingFailureTask) GetTaskID() int         { return t.ID }
+
+// BlockingFailureWorker tracks task execution and failures
+type BlockingFailureWorker struct {
+	executedTasks atomic.Int32
+	failedTasks   atomic.Int32
+}
+
+func (w *BlockingFailureWorker) Run(ctx context.Context, task BlockingFailureTask) error {
+	w.executedTasks.Add(1)
+
+	// Check for failure condition first
+	if task.ShouldFail {
+		w.failedTasks.Add(1)
+		close(task.Done) // Signal completion before failing
+		return errors.New("task failed as configured")
+	}
+
+	// For tasks 1, create and submit next task
+	if task.ID == 1 {
+		nextID := task.ID + 1
+		nextDone := make(chan struct{})
+
+		nextTask := BlockingFailureTask{
+			ID:           nextID,
+			GroupID:      task.GroupID,
+			Dependencies: []int{task.ID},
+			Pool:         task.Pool,
+			Done:         nextDone,
+			ShouldFail:   true, // Task 2 will fail
+		}
+
+		// Submit next task first
+		if err := task.Pool.Submit(nextTask); err != nil {
+			return err
+		}
+
+		// Wait for next task
+		<-nextDone
+
+		// Signal our completion
+		close(task.Done)
+
+		// Propagate failure from task 2
+		return errors.New("propagated failure from task 2")
+	}
+
+	// For any other tasks, just signal completion
+	close(task.Done)
+	return nil
+}
+
+func TestBlockingPool_ChainFailureHandling(t *testing.T) {
+	ctx := context.Background()
+	worker := &BlockingFailureWorker{}
+
+	var taskFailures atomic.Int32
+	var groupRemovals atomic.Int32
+
+	pool, err := retrypool.NewBlockingPool[BlockingFailureTask, string, int](
+		ctx,
+		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[BlockingFailureTask] { return worker }),
+		retrypool.WithBlockingMaxActivePools[BlockingFailureTask](1),
+		retrypool.WithBlockingOnTaskFailed[BlockingFailureTask](func(task BlockingFailureTask, err error) {
+			taskFailures.Add(1)
+			t.Logf("Task %d failed: %v", task.ID, err)
+		}),
+		retrypool.WithBlockingOnTaskCompleted(func(task BlockingFailureTask) {
+			t.Logf("Task %d completed", task.ID)
+		}),
+		retrypool.WithBlockingOnGroupRemoved[BlockingFailureTask](func(groupID any, tasks []BlockingFailureTask) {
+			groupRemovals.Add(1)
+			t.Logf("Group %v removed", groupID)
+		}),
+	)
+
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Create first task that will trigger the chain
+	done := make(chan struct{})
+	firstTask := BlockingFailureTask{
+		ID:         1,
+		GroupID:    "group1",
+		Pool:       pool,
+		Done:       done,
+		ShouldFail: false,
+	}
+
+	if err := pool.Submit(firstTask); err != nil {
+		t.Fatalf("Failed to submit first task: %v", err)
+	}
+
+	// Wait for chain completion/failure with timeout
+	select {
+	case <-done:
+		t.Log("Task chain completed/failed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for task chain")
+	}
+
+	// Wait for cleanup
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	err = pool.WaitWithCallback(
+		ctx,
+		func(queueSize, processingCount, deadTaskCount int) bool {
+			t.Logf("Queue: %d, Processing: %d, Dead: %d", queueSize, processingCount, deadTaskCount)
+			return queueSize > 0 || processingCount > 0
+		},
+		100*time.Millisecond,
+	)
+
+	if err != nil {
+		t.Fatalf("Error waiting for tasks: %v", err)
+	}
+
+	// Verify outcomes
+	if executed := worker.executedTasks.Load(); executed != 2 {
+		t.Errorf("Expected 2 task executions (tasks 1 and 2), got %d", executed)
+	}
+
+	if failed := taskFailures.Load(); failed != 2 {
+		t.Errorf("Expected 2 task failure callback, got %d", failed)
+	}
+
+	if removals := groupRemovals.Load(); removals != 1 {
+		t.Errorf("Expected 1 group removal, got %d", removals)
+	}
+
+	// Close pool
+	if err := pool.Close(); err != nil {
+		t.Fatalf("Failed to close pool: %v", err)
+	}
 }

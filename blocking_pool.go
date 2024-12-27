@@ -76,8 +76,9 @@ type BlockingConfig[T any] struct {
 	OnTaskFailed    func(task T, err error)
 	// Group/Pool callbacks
 	OnGroupCreated   func(groupID any)
-	OnGroupCompleted func(groupID any)
-	OnGroupRemoved   func(groupID any)
+	OnGroupCompleted func(groupID any, tasks []T)
+	OnGroupFailed    func(groupID any, tasks []T)
+	OnGroupRemoved   func(groupID any, tasks []T)
 	OnPoolCreated    func(groupID any)
 	OnPoolDestroyed  func(groupID any)
 	OnWorkerAdded    func(groupID any, workerID int)
@@ -138,9 +139,15 @@ func WithBlockingMaxActivePools[T any](max int) BlockingPoolOption[T] {
 
 // All the callback setters
 
-func WithBlockingOnGroupRemoved[T any](cb func(groupID any)) BlockingPoolOption[T] {
+func WithBlockingOnGroupRemoved[T any](cb func(groupID any, tasks []T)) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
 		c.OnGroupRemoved = cb
+	}
+}
+
+func WithBlockingOnGroupFailed[T any](cb func(groupID any, tasks []T)) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.OnGroupFailed = cb
 	}
 }
 
@@ -174,7 +181,7 @@ func WithBlockingOnGroupCreated[T any](cb func(groupID any)) BlockingPoolOption[
 	}
 }
 
-func WithBlockingOnGroupCompleted[T any](cb func(groupID any)) BlockingPoolOption[T] {
+func WithBlockingOnGroupCompleted[T any](cb func(groupID any, tasks []T)) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
 		c.OnGroupCompleted = cb
 	}
@@ -257,6 +264,36 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 		p.handleTaskCompletion(groupID, data)
 	})
 
+	// Add failure handler to trigger group cleanup
+	pool.SetOnTaskFailure(func(data T, err error) TaskAction {
+		if p.config.OnTaskFailed != nil {
+			p.config.OnTaskFailed(data, err)
+		}
+
+		// Get group's tasks without holding the pool lock
+		var tasks []T
+		p.mu.Lock()
+		group := p.groups[groupID]
+		if group != nil {
+			group.mu.Lock()
+			for _, taskState := range group.tasks {
+				tasks = append(tasks, taskState.task)
+			}
+			group.mu.Unlock()
+		}
+		p.mu.Unlock()
+
+		// Call callbacks before acquiring any locks
+		if p.config.OnGroupFailed != nil {
+			p.config.OnGroupFailed(groupID, tasks)
+		}
+
+		// Now handle the cleanup
+		p.cleanupGroup(groupID, tasks)
+
+		return TaskActionRemove
+	})
+
 	if p.config.OnPoolCreated != nil {
 		p.config.OnPoolCreated(groupID)
 	}
@@ -266,6 +303,55 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 	}
 
 	return pool, nil
+}
+
+// cleanupGroup handles group cleanup with proper lock ordering
+func (p *BlockingPool[T, GID, TID]) cleanupGroup(groupID GID, tasks []T) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// First check if the group still exists
+	if _, exists := p.groups[groupID]; !exists {
+		return // Group already cleaned up
+	}
+
+	// Call removal callback before cleanup
+	if p.config.OnGroupRemoved != nil {
+		p.config.OnGroupRemoved(groupID, tasks)
+	}
+
+	// Clean up group data
+	delete(p.groups, groupID)
+
+	// Clean up pool
+	if _, exists := p.pools[groupID]; exists {
+		delete(p.pools, groupID)
+		delete(p.activeGroups, groupID)
+
+		if p.config.OnPoolDestroyed != nil {
+			p.config.OnPoolDestroyed(groupID)
+		}
+
+		// Handle next pending group if any
+		if len(p.pendingGroups) > 0 {
+			nextGroupID := p.pendingGroups[0]
+			p.pendingGroups = p.pendingGroups[1:]
+
+			// Only attempt to create pool if group still exists
+			if nextGroup := p.groups[nextGroupID]; nextGroup != nil {
+				if newPool, err := p.createPoolForGroup(nextGroupID); err == nil {
+					p.pools[nextGroupID] = newPool
+					p.activeGroups[nextGroupID] = struct{}{}
+					nextGroup.hasPool = true
+				} else {
+					// If pool creation fails, move this group to end of pending queue
+					p.pendingGroups = append(p.pendingGroups, nextGroupID)
+				}
+			}
+			// If group doesn't exist or pool creation failed, just continue with cleanup
+
+		}
+	}
 }
 
 // assignPoolToGroup either creates a new pool or reuses an available one
@@ -494,22 +580,32 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 
 	if allComplete {
 		p.mu.Lock()
+		// Get all tasks before cleanup
+		var tasks []T
+		for _, taskState := range group.tasks {
+			tasks = append(tasks, taskState.task)
+		}
+
 		// Release pool and activate next group
 		if err := p.releaseGroupPool(groupID); err != nil {
 			p.mu.Unlock()
 			return
 		}
 
-		if p.config.OnGroupCompleted != nil {
-			p.config.OnGroupCompleted(groupID)
+		if p.config.OnGroupRemoved != nil {
+			tasks := make([]T, 0, len(group.tasks))
+			for _, task := range group.tasks {
+				tasks = append(tasks, task.task)
+			}
+			p.config.OnGroupRemoved(groupID, tasks)
 		}
 
 		// Clean up group data by removing it from groups
 		delete(p.groups, groupID)
 
-		// Trigger group removal callback
+		// Trigger group removal callback with tasks
 		if p.config.OnGroupRemoved != nil {
-			p.config.OnGroupRemoved(groupID)
+			p.config.OnGroupRemoved(groupID, tasks)
 		}
 
 		p.mu.Unlock()
