@@ -266,6 +266,14 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 	return pool, nil
 }
 
+// Scale the amount of parallel pools that can be active at the same time
+func (p *BlockingPool[T, GID, TID]) SetActivePools(max int) {
+	if max < 1 {
+		max = 1
+	}
+	p.config.maxActivePools = max
+}
+
 // createPoolForGroup creates a new worker pool for a group
 func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], error) {
 	p.config.logger.Debug(p.ctx, "Creating new pool for group", "group_id", groupID)
