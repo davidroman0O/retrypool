@@ -1,7 +1,12 @@
 package retrypool
 
-type DependentTask[GID comparable, TID comparable] interface {
+type IndependentDependentTask[GID comparable, TID comparable] interface {
 	GetDependencies() []TID
+	GetGroupID() GID
+	GetTaskID() TID
+}
+
+type BlockingDependentTask[GID comparable, TID comparable] interface {
 	GetGroupID() GID
 	GetTaskID() TID
 }

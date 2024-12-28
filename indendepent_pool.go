@@ -293,7 +293,7 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 			pool.config.OnTaskFailed(data, err)
 		}
 
-		if dt, ok := any(data).(DependentTask[GID, TID]); ok {
+		if dt, ok := any(data).(IndependentDependentTask[GID, TID]); ok {
 			groupID := dt.GetGroupID()
 
 			// Clean up group data
@@ -325,7 +325,7 @@ func (p *IndependentPool[T, GID, TID]) Submit(tasks []T) error {
 	}
 
 	// Extract group ID from first task
-	dtask, ok := any(tasks[0]).(DependentTask[GID, TID])
+	dtask, ok := any(tasks[0]).(IndependentDependentTask[GID, TID])
 	if !ok {
 		return fmt.Errorf("tasks must implement DependentTask interface")
 	}
@@ -356,7 +356,7 @@ func (p *IndependentPool[T, GID, TID]) Submit(tasks []T) error {
 
 	// Initialize all tasks in the group
 	for _, task := range tasks {
-		dtask := any(task).(DependentTask[GID, TID])
+		dtask := any(task).(IndependentDependentTask[GID, TID])
 		taskID := dtask.GetTaskID()
 
 		taskState := &independentTaskState[T, GID, TID]{
@@ -397,7 +397,7 @@ func (p *IndependentPool[T, GID, TID]) buildDependencyGraph(tasks []T) (*Depende
 
 	// First pass: Create nodes and validate task IDs are unique
 	for _, task := range tasks {
-		dtask := any(task).(DependentTask[GID, TID])
+		dtask := any(task).(IndependentDependentTask[GID, TID])
 		taskID := dtask.GetTaskID()
 
 		if _, exists := graph.Nodes[taskID]; exists {
@@ -422,7 +422,7 @@ func (p *IndependentPool[T, GID, TID]) buildDependencyGraph(tasks []T) (*Depende
 
 	// Second pass: Build dependency links
 	for _, task := range tasks {
-		dtask := any(task).(DependentTask[GID, TID])
+		dtask := any(task).(IndependentDependentTask[GID, TID])
 		taskID := dtask.GetTaskID()
 		declaredDeps := dtask.GetDependencies()
 
@@ -503,7 +503,7 @@ func (p *IndependentPool[T, GID, TID]) handleTaskCompletion(data T) {
 		p.config.OnTaskCompleted(data)
 	}
 
-	dtask := any(data).(DependentTask[GID, TID])
+	dtask := any(data).(IndependentDependentTask[GID, TID])
 	groupID := dtask.GetGroupID()
 	taskID := dtask.GetTaskID()
 

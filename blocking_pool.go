@@ -556,7 +556,7 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 		p.config.OnTaskSubmitted(data)
 	}
 
-	dtask, ok := any(data).(DependentTask[GID, TID])
+	dtask, ok := any(data).(BlockingDependentTask[GID, TID])
 	if !ok {
 		p.config.logger.Error(p.ctx, "Task does not implement DependentTask interface")
 		return fmt.Errorf("task does not implement DependentTask interface")
@@ -646,7 +646,7 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 		p.config.OnTaskCompleted(data)
 	}
 
-	dtask := any(data).(DependentTask[GID, TID])
+	dtask := any(data).(BlockingDependentTask[GID, TID])
 	taskID := dtask.GetTaskID()
 
 	p.mu.RLock()
