@@ -839,3 +839,91 @@ func (p *BlockingPool[T, GID, TID]) Close() error {
 	p.config.logger.Info(p.ctx, "Blocking pool closed successfully")
 	return firstErr
 }
+
+// BlockingRequestResponse manages the lifecycle of a task request and its response
+type BlockingRequestResponse[T any, R any, GID comparable, TID comparable] struct {
+	groupID     GID            // The group ID
+	taskID      TID            // The task ID
+	Request     T              // The request data
+	done        chan struct{}  // Channel to signal completion
+	response    R              // Stores the successful response
+	err         error          // Stores any error that occurred
+	mu          deadlock.Mutex // Protects response and err
+	isCompleted bool           // Indicates if request is completed
+}
+
+// NewBlockingRequestResponse creates a new BlockingRequestResponse instance
+func NewBlockingRequestResponse[T any, R any, GID comparable, TID comparable](request T, gid GID, tid TID) *BlockingRequestResponse[T, R, GID, TID] {
+	return &BlockingRequestResponse[T, R, GID, TID]{
+		Request: request,
+		done:    make(chan struct{}),
+		groupID: gid,
+		taskID:  tid,
+	}
+}
+
+func (rr BlockingRequestResponse[T, R, GID, TID]) GetGroupID() GID {
+	return rr.groupID
+}
+
+func (rr BlockingRequestResponse[T, R, GID, TID]) GetTaskID() TID {
+	return rr.taskID
+}
+
+// Complete safely marks the request as complete with a response
+func (rr *BlockingRequestResponse[T, R, GID, TID]) Complete(response R) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+
+	if !rr.isCompleted {
+		rr.response = response
+		rr.isCompleted = true
+		close(rr.done)
+	}
+}
+
+// CompleteWithError safely marks the request as complete with an error
+func (rr *BlockingRequestResponse[T, R, GID, TID]) CompleteWithError(err error) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+
+	if !rr.isCompleted {
+		rr.err = err
+		rr.isCompleted = true
+		close(rr.done)
+	}
+}
+
+// Done returns a channel that's closed when the request is complete
+func (rr *BlockingRequestResponse[T, R, GID, TID]) Done() <-chan struct{} {
+	return rr.done
+}
+
+// Err returns any error that occurred during the request
+func (rr *BlockingRequestResponse[T, R, GID, TID]) Err() error {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	return rr.err
+}
+
+// Wait waits for the request to complete and returns the response and any error
+func (rr *BlockingRequestResponse[T, R, GID, TID]) Wait(ctx context.Context) (R, error) {
+	select {
+	case <-rr.done:
+		rr.mu.Lock()
+		defer rr.mu.Unlock()
+		return rr.response, rr.err
+	case <-ctx.Done():
+		rr.mu.Lock()
+		defer rr.mu.Unlock()
+		var zero R
+		if !rr.isCompleted {
+			rr.err = ctx.Err()
+			rr.isCompleted = true
+			close(rr.done)
+			return zero, rr.err
+		} else {
+			return rr.response, rr.err
+		}
+	}
+}
