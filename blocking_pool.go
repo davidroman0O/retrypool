@@ -271,7 +271,9 @@ func (p *BlockingPool[T, GID, TID]) SetActivePools(max int) {
 	if max < 1 {
 		max = 1
 	}
+	p.mu.Lock()
 	p.config.maxActivePools = max
+	p.mu.Unlock()
 }
 
 // createPoolForGroup creates a new worker pool for a group
