@@ -25,18 +25,18 @@ func (t MemoryLeakTask) GetDependencies() []int { return t.Dependencies }
 func (t MemoryLeakTask) GetGroupID() string     { return t.GroupID }
 func (t MemoryLeakTask) GetTaskID() int         { return t.ID }
 
-type MemoryLeakWorker struct {
+type MemoryLeakWorkerBlockingPool struct {
 	executionTimes map[int]time.Time
 	mu             sync.Mutex
 }
 
-func NewMemoryLeakWorker() *MemoryLeakWorker {
-	return &MemoryLeakWorker{
+func NewMemoryLeakWorkerBlockingPool() *MemoryLeakWorkerBlockingPool {
+	return &MemoryLeakWorkerBlockingPool{
 		executionTimes: make(map[int]time.Time),
 	}
 }
 
-func (w *MemoryLeakWorker) Run(ctx context.Context, task MemoryLeakTask) error {
+func (w *MemoryLeakWorkerBlockingPool) Run(ctx context.Context, task MemoryLeakTask) error {
 	w.mu.Lock()
 	w.executionTimes[task.ID] = time.Now()
 	w.mu.Unlock()
@@ -85,7 +85,6 @@ func getMemStats() runtime.MemStats {
 // TestBlockingPoolMemoryLeak tests the BlockingPool for memory leaks
 func TestBlockingPoolMemoryLeak(t *testing.T) {
 	ctx := context.Background()
-	worker := NewMemoryLeakWorker()
 
 	// Track removed groups to verify cleanup
 	var removedGroups sync.Map
@@ -95,7 +94,7 @@ func TestBlockingPoolMemoryLeak(t *testing.T) {
 
 	pool, err = retrypool.NewBlockingPool[MemoryLeakTask, string, int](
 		ctx,
-		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[MemoryLeakTask] { return worker }),
+		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[MemoryLeakTask] { return NewMemoryLeakWorkerBlockingPool() }),
 		retrypool.WithBlockingMaxActivePools[MemoryLeakTask](2),
 		retrypool.WithBlockingOnTaskCompleted[MemoryLeakTask](func(task MemoryLeakTask) {
 			t.Logf("Task completed - Group: %s, ID: %d", task.GroupID, task.ID)
@@ -215,41 +214,98 @@ func TestBlockingPoolMemoryLeak(t *testing.T) {
 	t.Logf("Memory growth: %d bytes", finalStats.HeapAlloc-initialStats.HeapAlloc)
 }
 
-// TestIndependentPoolMemoryLeak tests the IndependentPool for memory leaks
+type MemoryLeakWorker struct {
+	executedTasks     map[string]bool
+	executedTasksLock sync.RWMutex
+}
+
+func NewMemoryLeakWorker() *MemoryLeakWorker {
+	return &MemoryLeakWorker{
+		executedTasks: make(map[string]bool),
+	}
+}
+
+func (w *MemoryLeakWorker) Run(ctx context.Context, task MemoryLeakTask) error {
+	// Create task key for tracking
+	taskKey := fmt.Sprintf("%s-%d", task.GroupID, task.ID)
+
+	// Safely track execution
+	w.executedTasksLock.Lock()
+	w.executedTasks[taskKey] = true
+	w.executedTasksLock.Unlock()
+
+	// Simulate some work with the data to ensure it's properly allocated
+	if len(task.Data) > 0 {
+		// Do some trivial work with the data to ensure it's properly handled
+		_ = task.Data[0]
+	}
+
+	// Return nil to indicate success
+	return nil
+}
+
 func TestIndependentPoolMemoryLeak(t *testing.T) {
 	ctx := context.Background()
-	worker := &MemoryLeakWorker{}
 
 	var removedGroups sync.Map
+	var processedTasks sync.Map
 	var groupsWithDeadTasks sync.Map
 	var pool *retrypool.IndependentPool[MemoryLeakTask, string, int]
 	var err error
 
 	pool, err = retrypool.NewIndependentPool[MemoryLeakTask, string, int](
 		ctx,
-		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[MemoryLeakTask] { return worker }),
+		retrypool.WithIndependentWorkerFactory(func() retrypool.Worker[MemoryLeakTask] { return NewMemoryLeakWorker() }),
+		retrypool.WithIndependentOnTaskSubmitted[MemoryLeakTask](func(task MemoryLeakTask) {
+			t.Logf("Task submitted - Group: %s, ID: %d", task.GroupID, task.ID)
+		}),
+		retrypool.WithIndependentOnTaskStarted[MemoryLeakTask](func(task MemoryLeakTask) {
+			t.Logf("Task started - Group: %s, ID: %d", task.GroupID, task.ID)
+		}),
+		retrypool.WithIndependentOnTaskCompleted[MemoryLeakTask](func(task MemoryLeakTask) {
+			t.Logf("Task completed - Group: %s, ID: %d", task.GroupID, task.ID)
+			processedTasks.Store(fmt.Sprintf("%s-%d", task.GroupID, task.ID), true)
+		}),
+		retrypool.WithIndependentOnTaskFailed[MemoryLeakTask](func(task MemoryLeakTask, err error) {
+			t.Logf("Task failed - Group: %s, ID: %d, Error: %v", task.GroupID, task.ID, err)
+		}),
+		retrypool.WithIndependentOnGroupCreated[MemoryLeakTask](func(groupID any) {
+			t.Logf("Group created: %v", groupID)
+		}),
 		retrypool.WithIndependentOnGroupRemoved[MemoryLeakTask](func(groupID any, tasks []MemoryLeakTask) {
-			removedGroups.Store(groupID, true)
+			if _, exists := removedGroups.LoadOrStore(groupID, true); !exists {
+				t.Logf("Group %v removed for the first time", groupID)
+			} else {
+				t.Logf("WARNING: Group %v removed again!", groupID)
+			}
 		}),
 		retrypool.WithIndependentOnDeadTask[MemoryLeakTask](func(deadTaskIndex int) {
-			// Track groups that had dead tasks
 			task, err := pool.PullDeadTask(deadTaskIndex)
 			if err == nil {
+				t.Logf("Dead task found - Group: %s, ID: %d", task.Data.GroupID, task.Data.ID)
 				groupsWithDeadTasks.Store(task.Data.GroupID, true)
 			}
+		}),
+		retrypool.WithIndependentOnWorkerAdded[MemoryLeakTask](func(workerID int) {
+			t.Logf("Worker added: %d", workerID)
+		}),
+		retrypool.WithIndependentOnWorkerRemoved[MemoryLeakTask](func(workerID int) {
+			t.Logf("Worker removed: %d", workerID)
 		}),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
 	}
 
-	// Record initial memory state
 	initialStats := getMemStats()
+	t.Logf("Initial memory state: %+v", initialStats)
 
-	// Number of groups to create and submit
 	const numGroups = 100
 	const tasksPerGroup = 10
 	const dataSize = 1024 * 1024 // 1MB of data per task
+
+	t.Logf("Starting task submission - Groups: %d, Tasks per group: %d, Data size: %d bytes",
+		numGroups, tasksPerGroup, dataSize)
 
 	// Submit groups with tasks
 	for i := 0; i < numGroups; i++ {
@@ -271,30 +327,50 @@ func TestIndependentPoolMemoryLeak(t *testing.T) {
 		if err := pool.Submit(tasks); err != nil {
 			t.Fatalf("Failed to submit tasks for group %s: %v", groupID, err)
 		}
+		t.Logf("Submitted group %s with %d tasks", groupID, len(tasks))
 	}
 
-	// Wait for all groups to complete
+	// Wait for all groups with progress updates
 	deadline := time.Now().Add(30 * time.Second)
+	lastUpdate := time.Now()
+	updateInterval := time.Second
 	for time.Now().Before(deadline) {
-		count := 0
+		removedCount := 0
 		removedGroups.Range(func(_, _ interface{}) bool {
-			count++
+			removedCount++
 			return true
 		})
 
-		if count == numGroups {
+		processedCount := 0
+		processedTasks.Range(func(_, _ interface{}) bool {
+			processedCount++
+			return true
+		})
+
+		deadTaskCount := 0
+		groupsWithDeadTasks.Range(func(_, _ interface{}) bool {
+			deadTaskCount++
+			return true
+		})
+
+		if time.Since(lastUpdate) >= updateInterval {
+			t.Logf("Progress - Removed groups: %d/%d, Processed tasks: %d/%d, Groups with dead tasks: %d",
+				removedCount, numGroups, processedCount, numGroups*tasksPerGroup, deadTaskCount)
+			lastUpdate = time.Now()
+		}
+
+		if removedCount == numGroups {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Force garbage collection
+	t.Log("Forcing garbage collection...")
 	runtime.GC()
 
-	// Get final memory stats
 	finalStats := getMemStats()
 
-	// Verify all groups were removed
 	removedCount := 0
 	removedGroups.Range(func(_, _ interface{}) bool {
 		removedCount++
@@ -305,21 +381,21 @@ func TestIndependentPoolMemoryLeak(t *testing.T) {
 		t.Errorf("Expected %d groups to be removed, but got %d", numGroups, removedCount)
 	}
 
-	// Check for significant memory growth
 	memoryGrowth := finalStats.HeapAlloc - initialStats.HeapAlloc
-	t.Logf("Memory growth: %d bytes", memoryGrowth)
+	t.Logf("Memory growth before close: %d bytes", memoryGrowth)
 
-	// Close the pool
+	t.Log("Closing pool...")
 	if err := pool.Close(); err != nil {
 		t.Fatalf("Failed to close pool: %v", err)
 	}
 
-	// Additional verification after pool closure
+	t.Log("Final garbage collection...")
 	runtime.GC()
 	postCloseStats := getMemStats()
 
-	// Log memory metrics
-	t.Logf("Initial heap: %d bytes", initialStats.HeapAlloc)
-	t.Logf("Final heap: %d bytes", finalStats.HeapAlloc)
-	t.Logf("Post-close heap: %d bytes", postCloseStats.HeapAlloc)
+	t.Logf("Memory metrics:")
+	t.Logf("  Initial heap: %d bytes", initialStats.HeapAlloc)
+	t.Logf("  Final heap: %d bytes", finalStats.HeapAlloc)
+	t.Logf("  Post-close heap: %d bytes", postCloseStats.HeapAlloc)
+	t.Logf("  Total growth: %d bytes", postCloseStats.HeapAlloc-initialStats.HeapAlloc)
 }
