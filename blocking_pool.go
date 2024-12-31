@@ -99,6 +99,7 @@ type blockingTaskState[T any, GID comparable, TID comparable] struct {
 	groupID      GID
 	completed    bool
 	completionCh chan struct{}
+	options      []TaskOption[T]
 }
 
 // blockingTaskGroup manages tasks that share the same GroupID
@@ -274,6 +275,44 @@ func (p *BlockingPool[T, GID, TID]) SetActivePools(max int) {
 	p.mu.Lock()
 	p.config.maxActivePools = max
 	p.mu.Unlock()
+}
+
+// Get all the metrics of all pools
+func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() MetricsSnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var metrics MetricsSnapshot
+	for _, pool := range p.pools {
+		poolMetrics := pool.GetMetricsSnapshot()
+		metrics.TasksSubmitted += poolMetrics.TasksSubmitted
+		metrics.TasksProcessed += poolMetrics.TasksProcessed
+		metrics.DeadTasks += poolMetrics.DeadTasks
+	}
+	return metrics
+}
+
+func (p *BlockingPool[T, GID, TID]) RangeWorkerQueues(f func(workerID int, queueSize int64) bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, pool := range p.pools {
+		pool.RangeWorkerQueues(f)
+	}
+}
+
+func (p *BlockingPool[T, GID, TID]) RangeWorkers(f func(workerID int, worker Worker[T]) bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, pool := range p.pools {
+		pool.RangeWorkers(f)
+	}
+}
+
+func (p *BlockingPool[T, GID, TID]) RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, pool := range p.pools {
+		pool.RangeTaskQueues(f)
+	}
 }
 
 // createPoolForGroup creates a new worker pool for a group
@@ -479,7 +518,7 @@ func (p *BlockingPool[T, GID, TID]) releaseGroupPool(groupID GID) error {
 
 				// Submit all pending tasks
 				for _, task := range pendingTasks {
-					if err := newPool.SubmitToFreeWorker(task, WithBounceRetry[T]()); err != nil {
+					if err := newPool.SubmitToFreeWorker(task); err != nil {
 						p.config.logger.Error(p.ctx, "Failed to submit pending task",
 							"group_id", nextGroupID,
 							"error", err)
@@ -558,8 +597,27 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 	return nil
 }
 
+type submitConfig struct {
+	queueNotification     *QueuedNotification
+	processedNotification *ProcessedNotification
+}
+
+type SubmitOption[T any] func(*submitConfig)
+
+func WithBlockingQueueNotification[T any](notification *QueuedNotification) SubmitOption[T] {
+	return func(c *submitConfig) {
+		c.queueNotification = notification
+	}
+}
+
+func WithBlockingProcessedNotification[T any](notification *ProcessedNotification) SubmitOption[T] {
+	return func(c *submitConfig) {
+		c.processedNotification = notification
+	}
+}
+
 // Submit handles task submission, managing group pools as needed
-func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
+func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error {
 	p.config.logger.Debug(p.ctx, "Processing task submission")
 
 	if p.config.OnTaskSubmitted != nil {
@@ -578,6 +636,22 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 	p.config.logger.Debug(p.ctx, "Task details",
 		"group_id", groupID,
 		"task_id", taskID)
+
+	opts := []TaskOption[T]{
+		WithBounceRetry[T](),
+	}
+
+	cfg := submitConfig{}
+	for _, o := range opt {
+		o(&cfg)
+	}
+
+	if cfg.queueNotification != nil {
+		opts = append(opts, WithQueuedNotification[T](cfg.queueNotification))
+	}
+	if cfg.processedNotification != nil {
+		opts = append(opts, WithProcessedNotification[T](cfg.processedNotification))
+	}
 
 	p.mu.Lock()
 	group, exists := p.groups[groupID]
@@ -612,6 +686,7 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 		taskID:       taskID,
 		groupID:      groupID,
 		completionCh: make(chan struct{}),
+		options:      opts,
 	}
 
 	group.mu.Lock()
@@ -645,7 +720,7 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 	p.config.logger.Debug(p.ctx, "Submitting task to pool",
 		"group_id", groupID,
 		"task_id", taskID)
-	return pool.SubmitToFreeWorker(task.task, WithBounceRetry[T]())
+	return pool.SubmitToFreeWorker(task.task, opts...)
 }
 
 // handleTaskCompletion processes task completion

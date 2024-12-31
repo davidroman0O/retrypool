@@ -1148,6 +1148,16 @@ func (p *Pool[T]) RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool)
 	p.taskQueues.range_(f)
 }
 
+func (p *Pool[T]) RangeWorkers(f func(workerID int, worker Worker[T]) bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id, worker := range p.workers {
+		if !f(id, worker.worker) {
+			break
+		}
+	}
+}
+
 func (p *Pool[T]) UpdateTotalQueueSize(delta int64) {
 	newSize := p.totalQueueSize.Add(delta)
 	if newSize < 0 {
