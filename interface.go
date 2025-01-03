@@ -20,7 +20,7 @@ type Pooler[T any] interface {
 	GetMetricsSnapshot() MetricsSnapshot
 
 	// NewWorkerID returns a new unique worker ID.
-	NewWorkerID() int
+	// NewWorkerID() int
 
 	// Add adds a new worker to the pool. If a queue is not provided, a new one will be created.
 	Add(worker Worker[T], queue TaskQueue[T]) error

@@ -200,6 +200,16 @@ func (tq *taskQueues[T]) range_(f func(id int, q TaskQueue[T]) bool) {
 	}
 }
 
+func (tq *taskQueues[T]) metrics() map[int]int {
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
+	m := make(map[int]int, len(tq.queues))
+	for id, q := range tq.queues {
+		m[id] = q.Length()
+	}
+	return m
+}
+
 // Pool manages a set of workers and tasks
 type Pool[T any] struct {
 	workers               map[int]*workerState[T]
@@ -326,20 +336,27 @@ type MetricsSnapshot struct {
 	TasksSucceeded int64
 	TasksFailed    int64
 	DeadTasks      int64
+	Queues         map[int]int
 }
 
 func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	metrics := p.taskQueues.metrics()
+
 	return MetricsSnapshot{
 		TasksSubmitted: p.metrics.TasksSubmitted.Load(),
 		TasksProcessed: p.metrics.TasksProcessed.Load(),
 		TasksSucceeded: p.metrics.TasksSucceeded.Load(),
 		TasksFailed:    p.metrics.TasksFailed.Load(),
 		DeadTasks:      p.metrics.DeadTasks.Load(),
+		Queues:         metrics,
 	}
 }
 
-// NewWorkerID generates a new worker ID
-func (p *Pool[T]) NewWorkerID() int {
+// newWorkerID generates a new worker ID
+func (p *Pool[T]) newWorkerID() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	workerID := p.nextWorkerID
