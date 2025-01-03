@@ -281,7 +281,9 @@ func (p *BlockingPool[T, GID, TID]) SetActivePools(max int) {
 func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() MetricsSnapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	var metrics MetricsSnapshot
+	var metrics MetricsSnapshot = MetricsSnapshot{
+		Queues: map[int]int{},
+	}
 	for _, pool := range p.pools {
 		poolMetrics := pool.GetMetricsSnapshot()
 		metrics.TasksSubmitted += poolMetrics.TasksSubmitted
