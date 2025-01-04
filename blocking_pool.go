@@ -308,11 +308,8 @@ func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() BlockingMetricsSnapshot
 			GroupID:         groupID,
 			MetricsSnapshot: poolMetrics,
 		})
-
-		// pp.Println(groupID, poolMetrics)
 	}
 
-	// pp.Println(metrics)
 	return metrics
 }
 
