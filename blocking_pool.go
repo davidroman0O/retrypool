@@ -290,7 +290,11 @@ func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() MetricsSnapshot {
 		metrics.TasksProcessed += poolMetrics.TasksProcessed
 		metrics.DeadTasks += poolMetrics.DeadTasks
 		for q, m := range poolMetrics.Queues {
-			metrics.Queues[q] += m
+			if _, exists := metrics.Queues[q]; !exists {
+				metrics.Queues[q] = m
+			} else {
+				metrics.Queues[q] += m
+			}
 		}
 	}
 	return metrics
