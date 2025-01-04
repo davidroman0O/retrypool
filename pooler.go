@@ -330,30 +330,36 @@ func (p *Pool[T]) SetOnTaskAttempt(handler func(task *Task[T], workerID int)) {
 	p.config.onTaskAttempt = handler
 }
 
-type MetricsSnapshot struct {
+type MetricsSnapshot[T any] struct {
 	TasksSubmitted int64
 	TasksProcessed int64
 	TasksSucceeded int64
 	TasksFailed    int64
 	DeadTasks      int64
 	TaskQueues     map[int]int
-	Workers        map[int64]bool
+	Workers        map[int]State[T]
 }
 
-func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot {
+func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot[T] {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	metrics := p.taskQueues.metrics()
 
-	return MetricsSnapshot{
+	workers := map[int]State[T]{}
+	p.RangeWorkers(func(workerID int, state State[T]) bool {
+		workers[workerID] = state
+		return true
+	})
+
+	return MetricsSnapshot[T]{
 		TasksSubmitted: p.metrics.TasksSubmitted.Load(),
 		TasksProcessed: p.metrics.TasksProcessed.Load(),
 		TasksSucceeded: p.metrics.TasksSucceeded.Load(),
 		TasksFailed:    p.metrics.TasksFailed.Load(),
 		DeadTasks:      p.metrics.DeadTasks.Load(),
 		TaskQueues:     metrics,
-		// Workers:        p.availableWorkers.Load(),
+		Workers:        workers,
 	}
 }
 

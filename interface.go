@@ -17,7 +17,7 @@ type Pooler[T any] interface {
 	SetOnTaskAttempt(handler func(task *Task[T], workerID int))
 
 	// GetMetricsSnapshot returns a snapshot of the current pool metrics.
-	GetMetricsSnapshot() MetricsSnapshot
+	GetMetricsSnapshot() MetricsSnapshot[T]
 
 	// NewWorkerID returns a new unique worker ID.
 	// NewWorkerID() int

@@ -278,27 +278,42 @@ func (p *BlockingPool[T, GID, TID]) SetActivePools(max int) {
 	p.mu.Unlock()
 }
 
+type GroupMetricSnapshot[T any, GID comparable] struct {
+	GroupID GID
+	MetricsSnapshot[T]
+}
+
+type BlockingMetricsSnapshot[T any, GID comparable] struct {
+	TotalTasksSubmitted int64
+	TotalTasksProcessed int64
+	TotalTasksSucceeded int64
+	TotalTasksFailed    int64
+	TotalDeadTasks      int64
+	Metrics             []GroupMetricSnapshot[T, GID]
+}
+
 // Get all the metrics of all pools
-func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() MetricsSnapshot {
+func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() BlockingMetricsSnapshot[T, GID] {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	var metrics MetricsSnapshot = MetricsSnapshot{
-		TaskQueues: map[int]int{},
+	var metrics BlockingMetricsSnapshot[T, GID] = BlockingMetricsSnapshot[T, GID]{
+		Metrics: []GroupMetricSnapshot[T, GID]{},
 	}
 	for groupID, pool := range p.pools {
 		poolMetrics := pool.GetMetricsSnapshot()
-		metrics.TasksSubmitted += poolMetrics.TasksSubmitted
-		metrics.TasksProcessed += poolMetrics.TasksProcessed
-		metrics.DeadTasks += poolMetrics.DeadTasks
-		for q, m := range poolMetrics.TaskQueues {
-			if _, exists := metrics.TaskQueues[q]; !exists {
-				metrics.TaskQueues[q] = m
-			} else {
-				metrics.TaskQueues[q] += m
-			}
-		}
+		metrics.TotalTasksSubmitted += poolMetrics.TasksSubmitted
+		metrics.TotalTasksProcessed += poolMetrics.TasksProcessed
+		metrics.TotalDeadTasks += poolMetrics.DeadTasks
+
+		metrics.Metrics = append(metrics.Metrics, GroupMetricSnapshot[T, GID]{
+			GroupID:         groupID,
+			MetricsSnapshot: poolMetrics,
+		})
+
 		pp.Println(groupID, poolMetrics)
 	}
+
+	pp.Println(metrics)
 	return metrics
 }
 
