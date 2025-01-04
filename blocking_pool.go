@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/k0kubun/pp/v3"
 	"github.com/sasha-s/go-deadlock"
 )
 
@@ -284,7 +285,7 @@ func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() MetricsSnapshot {
 	var metrics MetricsSnapshot = MetricsSnapshot{
 		Queues: map[int]int{},
 	}
-	for _, pool := range p.pools {
+	for groupID, pool := range p.pools {
 		poolMetrics := pool.GetMetricsSnapshot()
 		metrics.TasksSubmitted += poolMetrics.TasksSubmitted
 		metrics.TasksProcessed += poolMetrics.TasksProcessed
@@ -296,6 +297,7 @@ func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() MetricsSnapshot {
 				metrics.Queues[q] += m
 			}
 		}
+		pp.Println(groupID, poolMetrics)
 	}
 	return metrics
 }
