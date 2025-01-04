@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/k0kubun/pp/v3"
 	"github.com/sasha-s/go-deadlock"
 )
 
@@ -310,10 +309,10 @@ func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() BlockingMetricsSnapshot
 			MetricsSnapshot: poolMetrics,
 		})
 
-		pp.Println(groupID, poolMetrics)
+		// pp.Println(groupID, poolMetrics)
 	}
 
-	pp.Println(metrics)
+	// pp.Println(metrics)
 	return metrics
 }
 
