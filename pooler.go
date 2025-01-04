@@ -337,7 +337,7 @@ type MetricsSnapshot struct {
 	TasksFailed    int64
 	DeadTasks      int64
 	TaskQueues     map[int]int
-	Workers        int64
+	Workers        map[int64]bool
 }
 
 func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot {
@@ -353,7 +353,7 @@ func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot {
 		TasksFailed:    p.metrics.TasksFailed.Load(),
 		DeadTasks:      p.metrics.DeadTasks.Load(),
 		TaskQueues:     metrics,
-		Workers:        p.availableWorkers.Load(),
+		// Workers:        p.availableWorkers.Load(),
 	}
 }
 
@@ -1167,11 +1167,17 @@ func (p *Pool[T]) RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool)
 	p.taskQueues.range_(f)
 }
 
-func (p *Pool[T]) RangeWorkers(f func(workerID int, worker Worker[T]) bool) {
+func (p *Pool[T]) RangeWorkers(f func(workerID int, state State[T]) bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for id, worker := range p.workers {
-		if !f(id, worker.worker) {
+		state := State[T]{
+			ID:      id,
+			Paused:  worker.paused.Load(),
+			Removed: worker.removed.Load(),
+			HasTask: worker.currentTask != nil,
+		}
+		if !f(id, state) {
 			break
 		}
 	}
@@ -1897,6 +1903,13 @@ type workerState[T any] struct {
 	methodsCache map[string]*reflect.Value
 	done         chan struct{}
 	logger       Logger
+}
+
+type State[T any] struct {
+	ID      int
+	Paused  bool
+	Removed bool
+	HasTask bool
 }
 
 // Add adds a new worker to the pool

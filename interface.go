@@ -78,5 +78,5 @@ type Pooler[T any] interface {
 	RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool)
 
 	// RangeWorkers iterates over each worker. If the callback returns false, iteration stops.
-	RangeWorkers(f func(workerID int, worker Worker[T]) bool)
+	RangeWorkers(f func(workerID int, state State[T]) bool)
 }

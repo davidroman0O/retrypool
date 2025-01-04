@@ -297,7 +297,6 @@ func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() MetricsSnapshot {
 				metrics.TaskQueues[q] += m
 			}
 		}
-		metrics.Workers += poolMetrics.Workers
 		pp.Println(groupID, poolMetrics)
 	}
 	return metrics
@@ -311,7 +310,7 @@ func (p *BlockingPool[T, GID, TID]) RangeWorkerQueues(f func(workerID int, queue
 	}
 }
 
-func (p *BlockingPool[T, GID, TID]) RangeWorkers(f func(workerID int, worker Worker[T]) bool) {
+func (p *BlockingPool[T, GID, TID]) RangeWorkers(f func(workerID int, state State[T]) bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, pool := range p.pools {
