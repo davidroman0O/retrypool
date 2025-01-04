@@ -347,7 +347,7 @@ func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot[T] {
 	metrics := p.taskQueues.metrics()
 
 	workers := map[int]State[T]{}
-	p.RangeWorkers(func(workerID int, state State[T]) bool {
+	p.rangeWorkers(func(workerID int, state State[T]) bool {
 		workers[workerID] = state
 		return true
 	})
@@ -1176,6 +1176,10 @@ func (p *Pool[T]) RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool)
 func (p *Pool[T]) RangeWorkers(f func(workerID int, state State[T]) bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.rangeWorkers(f)
+}
+
+func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
 	for id, worker := range p.workers {
 		state := State[T]{
 			ID:      id,
