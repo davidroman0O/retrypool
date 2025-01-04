@@ -283,20 +283,21 @@ func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() MetricsSnapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	var metrics MetricsSnapshot = MetricsSnapshot{
-		Queues: map[int]int{},
+		TaskQueues: map[int]int{},
 	}
 	for groupID, pool := range p.pools {
 		poolMetrics := pool.GetMetricsSnapshot()
 		metrics.TasksSubmitted += poolMetrics.TasksSubmitted
 		metrics.TasksProcessed += poolMetrics.TasksProcessed
 		metrics.DeadTasks += poolMetrics.DeadTasks
-		for q, m := range poolMetrics.Queues {
-			if _, exists := metrics.Queues[q]; !exists {
-				metrics.Queues[q] = m
+		for q, m := range poolMetrics.TaskQueues {
+			if _, exists := metrics.TaskQueues[q]; !exists {
+				metrics.TaskQueues[q] = m
 			} else {
-				metrics.Queues[q] += m
+				metrics.TaskQueues[q] += m
 			}
 		}
+		metrics.Workers += poolMetrics.Workers
 		pp.Println(groupID, poolMetrics)
 	}
 	return metrics

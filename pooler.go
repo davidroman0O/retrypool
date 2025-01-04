@@ -336,7 +336,8 @@ type MetricsSnapshot struct {
 	TasksSucceeded int64
 	TasksFailed    int64
 	DeadTasks      int64
-	Queues         map[int]int
+	TaskQueues     map[int]int
+	Workers        int64
 }
 
 func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot {
@@ -351,7 +352,8 @@ func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot {
 		TasksSucceeded: p.metrics.TasksSucceeded.Load(),
 		TasksFailed:    p.metrics.TasksFailed.Load(),
 		DeadTasks:      p.metrics.DeadTasks.Load(),
-		Queues:         metrics,
+		TaskQueues:     metrics,
+		Workers:        p.availableWorkers.Load(),
 	}
 }
 
