@@ -70,8 +70,8 @@ type BlockingConfig[T any] struct {
 	logger        Logger
 	workerFactory WorkerFactory[T]
 	// You always starts with 1 pool but you can define the maximum amount the BP can have at all time
-	maxActivePools    int // Maximum number of active pools (one per group)
-	maxWorkersPerPool int // Maximum number of workers per pool
+	maxConcurrentPools          int // Maximum number of active pools (one per group)
+	maxConcurrentWorkersPerPool int // Maximum number of workers per pool
 	// Task callbacks
 	OnTaskSubmitted func(task T)
 	OnTaskStarted   func(task T)
@@ -137,7 +137,7 @@ func WithBlockingMaxActivePools[T any](max int) BlockingPoolOption[T] {
 		if max < 1 {
 			max = 1
 		}
-		c.maxActivePools = max
+		c.maxConcurrentPools = max
 	}
 }
 
@@ -229,7 +229,7 @@ func WithBlockingOnPoolClosed[T any](cb func()) BlockingPoolOption[T] {
 
 func WithBlockingMaxWorkersPerPool[T any](max int) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
-		c.maxWorkersPerPool = max
+		c.maxConcurrentWorkersPerPool = max
 	}
 }
 
@@ -239,9 +239,9 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 	opt ...BlockingPoolOption[T],
 ) (*BlockingPool[T, GID, TID], error) {
 	cfg := BlockingConfig[T]{
-		logger:            NewLogger(slog.LevelDebug),
-		maxActivePools:    1,  // Default to one active pool
-		maxWorkersPerPool: -1, // unlimited workers per pool
+		logger:                      NewLogger(slog.LevelDebug),
+		maxConcurrentPools:          1,  // Default to one active pool
+		maxConcurrentWorkersPerPool: -1, // unlimited workers per pool
 	}
 
 	cfg.logger.Disable()
@@ -251,7 +251,7 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 	}
 
 	cfg.logger.Info(ctx, "Creating new BlockingPool",
-		"max_active_pools", cfg.maxActivePools,
+		"max_active_pools", cfg.maxConcurrentPools,
 		"has_worker_factory", cfg.workerFactory != nil)
 
 	if cfg.workerFactory == nil {
@@ -276,12 +276,24 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 }
 
 // Scale the amount of parallel pools that can be active at the same time
-func (p *BlockingPool[T, GID, TID]) SetActivePools(max int) {
+func (p *BlockingPool[T, GID, TID]) SetConcurrentPools(max int) {
 	if max < 1 {
 		max = 1
 	}
 	p.mu.Lock()
-	p.config.maxActivePools = max
+	p.config.maxConcurrentPools = max
+	p.mu.Unlock()
+}
+
+// Scale the amount of workers that can be active at the same time on each pool
+func (p *BlockingPool[T, GID, TID]) SetConcurrentWorkers(max int) {
+	if max == 0 {
+		max = -1
+	} else if max < 0 {
+		max = -1
+	}
+	p.mu.Lock()
+	p.config.maxConcurrentWorkersPerPool = max
 	p.mu.Unlock()
 }
 
@@ -466,11 +478,11 @@ func (p *BlockingPool[T, GID, TID]) assignPoolToGroup(groupID GID) error {
 	}
 
 	// Create new pool if under limit
-	if len(p.activeGroups) < p.config.maxActivePools {
+	if len(p.activeGroups) < p.config.maxConcurrentPools {
 		p.config.logger.Debug(p.ctx, "Creating new pool for group",
 			"group_id", groupID,
 			"active_pools", len(p.activeGroups),
-			"max_pools", p.config.maxActivePools)
+			"max_pools", p.config.maxConcurrentPools)
 
 		pool, err := p.createPoolForGroup(groupID)
 		if err != nil {
@@ -594,11 +606,11 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 	}
 
 	// Apply maxWorkersPerPool limit if set
-	if p.config.maxWorkersPerPool > 0 && desired > p.config.maxWorkersPerPool {
-		desired = p.config.maxWorkersPerPool
+	if p.config.maxConcurrentWorkersPerPool > 0 && desired > p.config.maxConcurrentWorkersPerPool {
+		desired = p.config.maxConcurrentWorkersPerPool
 		p.config.logger.Debug(p.ctx, "Desired workers capped by maxWorkersPerPool",
 			"group_id", groupID,
-			"max_workers", p.config.maxWorkersPerPool)
+			"max_workers", p.config.maxConcurrentWorkersPerPool)
 	}
 
 	p.config.logger.Debug(p.ctx, "Worker scaling metrics",
@@ -606,7 +618,7 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 		"queued_tasks", queued,
 		"processing_tasks", processing,
 		"desired_workers", desired,
-		"max_workers_per_pool", p.config.maxWorkersPerPool)
+		"max_workers_per_pool", p.config.maxConcurrentWorkersPerPool)
 
 	currentWorkers := len(pool.GetFreeWorkers())
 	if currentWorkers < desired {
