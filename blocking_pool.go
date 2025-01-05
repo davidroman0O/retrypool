@@ -70,7 +70,8 @@ type BlockingConfig[T any] struct {
 	logger        Logger
 	workerFactory WorkerFactory[T]
 	// You always starts with 1 pool but you can define the maximum amount the BP can have at all time
-	maxActivePools int // Maximum number of active pools (one per group)
+	maxActivePools    int // Maximum number of active pools (one per group)
+	maxWorkersPerPool int // Maximum number of workers per pool
 	// Task callbacks
 	OnTaskSubmitted func(task T)
 	OnTaskStarted   func(task T)
@@ -226,14 +227,21 @@ func WithBlockingOnPoolClosed[T any](cb func()) BlockingPoolOption[T] {
 	}
 }
 
+func WithBlockingMaxWorkersPerPool[T any](max int) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.maxWorkersPerPool = max
+	}
+}
+
 // NewBlockingPool constructs a BlockingPool with the given options.
 func NewBlockingPool[T any, GID comparable, TID comparable](
 	ctx context.Context,
 	opt ...BlockingPoolOption[T],
 ) (*BlockingPool[T, GID, TID], error) {
 	cfg := BlockingConfig[T]{
-		logger:         NewLogger(slog.LevelDebug),
-		maxActivePools: 1, // Default to one active pool
+		logger:            NewLogger(slog.LevelDebug),
+		maxActivePools:    1,  // Default to one active pool
+		maxWorkersPerPool: -1, // unlimited workers per pool
 	}
 
 	cfg.logger.Disable()
@@ -585,11 +593,20 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 		desired++
 	}
 
+	// Apply maxWorkersPerPool limit if set
+	if p.config.maxWorkersPerPool > 0 && desired > p.config.maxWorkersPerPool {
+		desired = p.config.maxWorkersPerPool
+		p.config.logger.Debug(p.ctx, "Desired workers capped by maxWorkersPerPool",
+			"group_id", groupID,
+			"max_workers", p.config.maxWorkersPerPool)
+	}
+
 	p.config.logger.Debug(p.ctx, "Worker scaling metrics",
 		"group_id", groupID,
 		"queued_tasks", queued,
 		"processing_tasks", processing,
-		"desired_workers", desired)
+		"desired_workers", desired,
+		"max_workers_per_pool", p.config.maxWorkersPerPool)
 
 	currentWorkers := len(pool.GetFreeWorkers())
 	if currentWorkers < desired {
