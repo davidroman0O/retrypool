@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/k0kubun/pp/v3"
 	"github.com/sasha-s/go-deadlock"
 )
 
@@ -316,7 +315,7 @@ func (p *BlockingPool[T, GID, TID]) trySubmitCachedTasks(groupID GID) {
 	for _, task := range currentTasks {
 		err := pool.SubmitToFreeWorker(task)
 		if err != nil {
-			pp.Println(pool.GetMetricsSnapshot(), pool.GetFreeWorkers())
+			// pp.Println(pool.GetMetricsSnapshot(), pool.GetFreeWorkers())
 			// If still no workers available, keep in cache
 			remainingTasks = append(remainingTasks, task)
 		}
@@ -715,7 +714,7 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 		}
 	}
 
-	pp.Println(pool.GetMetricsSnapshot())
+	// pp.Println(pool.GetMetricsSnapshot())
 
 	return nil
 }

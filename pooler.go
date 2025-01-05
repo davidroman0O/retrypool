@@ -1182,6 +1182,23 @@ func (p *Pool[T]) RangeWorkers(f func(workerID int, state State[T]) bool) {
 func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
 	for id, worker := range p.workers {
 
+		hasCurrentTask := false
+		worker.mu.Lock()
+		if worker.currentTask != nil {
+			hasCurrentTask = true
+		}
+		worker.mu.Unlock()
+
+		var data T
+
+		if hasCurrentTask {
+			worker.currentTask.mu.Lock()
+			if worker.currentTask != nil {
+				data = worker.currentTask.data
+			}
+			worker.currentTask.mu.Unlock()
+		}
+
 		worker.mu.Lock()
 		state := State[T]{
 			ID:      id,
@@ -1190,9 +1207,10 @@ func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
 			HasTask: worker.currentTask != nil,
 		}
 
-		// if state.HasTask {
-		// 	state.Data = worker.currentTask.GetData()
-		// }
+		if hasCurrentTask {
+			state.Data = data
+		}
+
 		worker.mu.Unlock()
 		if !f(id, state) {
 			break
