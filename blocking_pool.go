@@ -318,6 +318,7 @@ func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() BlockingMetricsSnapshot
 	var metrics BlockingMetricsSnapshot[T, GID] = BlockingMetricsSnapshot[T, GID]{
 		Metrics: []GroupMetricSnapshot[T, GID]{},
 	}
+
 	for groupID, pool := range p.pools {
 		poolMetrics := pool.GetMetricsSnapshot()
 		metrics.TotalTasksSubmitted += poolMetrics.TasksSubmitted
