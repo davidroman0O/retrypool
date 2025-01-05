@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/k0kubun/pp/v3"
 	"github.com/sasha-s/go-deadlock"
 )
 
@@ -123,6 +124,8 @@ type BlockingPool[T any, GID comparable, TID comparable] struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	config        BlockingConfig[T]
+	cachedTasks   map[GID][]T // Store tasks that can't be immediately submitted
+	cacheMu       deadlock.RWMutex
 }
 
 // Configuration options
@@ -244,7 +247,7 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 		maxConcurrentWorkersPerPool: -1, // unlimited workers per pool
 	}
 
-	cfg.logger.Disable()
+	// cfg.logger.Disable()
 
 	for _, o := range opt {
 		o(&cfg)
@@ -269,10 +272,66 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 		config:        cfg,
 		ctx:           ctx,
 		cancel:        cancel,
+		cachedTasks:   make(map[GID][]T),
 	}
 
 	cfg.logger.Info(ctx, "BlockingPool created successfully")
 	return pool, nil
+}
+
+func (p *BlockingPool[T, GID, TID]) cacheTask(groupID GID, task T) {
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+
+	p.config.logger.Debug(p.ctx, "Caching task for later submission",
+		"group_id", groupID)
+
+	p.cachedTasks[groupID] = append(p.cachedTasks[groupID], task)
+}
+
+func (p *BlockingPool[T, GID, TID]) trySubmitCachedTasks(groupID GID) {
+	p.cacheMu.Lock()
+	cached, exists := p.cachedTasks[groupID]
+	if !exists || len(cached) == 0 {
+		p.cacheMu.Unlock()
+		return
+	}
+
+	p.config.logger.Debug(p.ctx, "Attempting to submit cached tasks",
+		"group_id", groupID,
+		"cached_count", len(cached))
+
+	pool := p.pools[groupID]
+	if pool == nil {
+		p.cacheMu.Unlock()
+		return
+	}
+
+	var remainingTasks []T
+	currentTasks := cached
+	p.cachedTasks[groupID] = nil // Clear before unlocking
+	p.cacheMu.Unlock()
+
+	// Try to submit tasks from cache
+	for _, task := range currentTasks {
+		err := pool.SubmitToFreeWorker(task)
+		if err != nil {
+			pp.Println(pool.GetMetricsSnapshot(), pool.GetFreeWorkers())
+			// If still no workers available, keep in cache
+			remainingTasks = append(remainingTasks, task)
+		}
+	}
+
+	// If any tasks couldn't be submitted, cache them again
+	if len(remainingTasks) > 0 {
+		p.cacheMu.Lock()
+		p.cachedTasks[groupID] = append(p.cachedTasks[groupID], remainingTasks...)
+		p.cacheMu.Unlock()
+	}
+
+	p.config.logger.Debug(p.ctx, "Cached task submission attempt completed",
+		"group_id", groupID,
+		"remaining_tasks", len(remainingTasks))
 }
 
 // Scale the amount of parallel pools that can be active at the same time
@@ -611,7 +670,8 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 		desired = p.config.maxConcurrentWorkersPerPool
 		p.config.logger.Debug(p.ctx, "Desired workers capped by maxWorkersPerPool",
 			"group_id", groupID,
-			"max_workers", p.config.maxConcurrentWorkersPerPool)
+			"max_workers", p.config.maxConcurrentWorkersPerPool,
+			"desired_workers", desired)
 	}
 
 	p.config.logger.Debug(p.ctx, "Worker scaling metrics",
@@ -621,7 +681,16 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 		"desired_workers", desired,
 		"max_workers_per_pool", p.config.maxConcurrentWorkersPerPool)
 
-	currentWorkers := len(pool.GetFreeWorkers())
+	workers, err := pool.Workers()
+	if err != nil {
+		p.config.logger.Error(p.ctx, "Failed to get workers from pool",
+			"group_id", groupID,
+			"error", err)
+		return err
+	}
+	currentWorkers := len(workers)
+
+	// currentWorkers := len(pool.GetFreeWorkers())
 	if currentWorkers < desired {
 		toAdd := desired - currentWorkers
 		p.config.logger.Info(p.ctx, "Scaling up workers",
@@ -645,6 +714,8 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 				"worker_number", currentWorkers+i+1)
 		}
 	}
+
+	pp.Println(pool.GetMetricsSnapshot())
 
 	return nil
 }
@@ -772,7 +843,19 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error
 	p.config.logger.Debug(p.ctx, "Submitting task to pool",
 		"group_id", groupID,
 		"task_id", taskID)
-	return pool.SubmitToFreeWorker(task.task, opts...)
+
+	if err := pool.SubmitToFreeWorker(task.task, opts...); err != nil {
+		if err == ErrNoWorkersAvailable {
+			p.cacheTask(groupID, data)
+		} else {
+			p.config.logger.Error(p.ctx, "Failed to submit task to pool",
+				"group_id", groupID,
+				"task_id", taskID,
+				"error", err)
+			return fmt.Errorf("failed to submit task: %w", err)
+		}
+	}
+	return nil
 }
 
 // handleTaskCompletion processes task completion
@@ -782,6 +865,9 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 	if p.config.OnTaskCompleted != nil {
 		p.config.OnTaskCompleted(data)
 	}
+
+	// Try to submit any cached tasks after completion
+	p.trySubmitCachedTasks(groupID)
 
 	dtask := any(data).(BlockingDependentTask[GID, TID])
 	taskID := dtask.GetTaskID()

@@ -1181,12 +1181,19 @@ func (p *Pool[T]) RangeWorkers(f func(workerID int, state State[T]) bool) {
 
 func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
 	for id, worker := range p.workers {
+
+		worker.mu.Lock()
 		state := State[T]{
 			ID:      id,
 			Paused:  worker.paused.Load(),
 			Removed: worker.removed.Load(),
 			HasTask: worker.currentTask != nil,
 		}
+
+		// if state.HasTask {
+		// 	state.Data = worker.currentTask.GetData()
+		// }
+		worker.mu.Unlock()
 		if !f(id, state) {
 			break
 		}
@@ -1920,6 +1927,7 @@ type State[T any] struct {
 	Paused  bool
 	Removed bool
 	HasTask bool
+	Data    T
 }
 
 // Add adds a new worker to the pool
@@ -2721,6 +2729,10 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 	if err := p.TransitionTaskState(task, TaskStateCompleted, "Task succeeded"); err != nil {
 		p.logger.Error(p.ctx, "Failed to transition task state", "error", err)
 	}
+
+	state.mu.Lock()
+	state.currentTask = nil
+	state.mu.Unlock()
 
 	p.logger.Debug(p.ctx, "Checking task success callback", "has_callback", p.config.onTaskSuccess != nil)
 
