@@ -87,6 +87,8 @@ type BlockingConfig[T any] struct {
 	OnWorkerAdded    func(groupID any, workerID int)
 	OnWorkerRemoved  func(groupID any, workerID int)
 	OnPoolClosed     func()
+
+	getData func(T) interface{}
 }
 
 // BlockingPoolOption is a functional option for configuring the blocking pool
@@ -232,6 +234,12 @@ func WithBlockingOnPoolClosed[T any](cb func()) BlockingPoolOption[T] {
 func WithBlockingMaxWorkersPerPool[T any](max int) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
 		c.maxConcurrentWorkersPerPool = max
+	}
+}
+
+func WithBlockingGetData[T any](cb func(T) interface{}) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.getData = cb
 	}
 }
 
@@ -422,10 +430,21 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 	worker := p.workerFactory()
 	p.config.logger.Debug(p.ctx, "Created initial worker for group", "group_id", groupID)
 
-	// Create pool with synchronous mode and single retry
-	pool := New[T](p.ctx, []Worker[T]{worker},
+	options := []Option[T]{
 		WithAttempts[T](1),
-		WithLogger[T](p.config.logger))
+		WithLogger[T](p.config.logger),
+	}
+
+	if p.config.getData != nil {
+		options = append(options, WithGetData[T](p.config.getData))
+	}
+
+	// Create pool with synchronous mode and single retry
+	pool := New[T](
+		p.ctx,
+		[]Worker[T]{worker},
+		options...,
+	)
 
 	// Set completion handler
 	pool.SetOnTaskSuccess(func(data T) {
@@ -1129,6 +1148,8 @@ func (rr *BlockingRequestResponse[T, R, GID, TID]) CompleteWithError(err error) 
 
 // Done returns a channel that's closed when the request is complete
 func (rr *BlockingRequestResponse[T, R, GID, TID]) Done() <-chan struct{} {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
 	return rr.done
 }
 

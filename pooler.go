@@ -1190,26 +1190,26 @@ func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
 	for id, worker := range p.workers {
 
 		hasCurrentTask := false
-		worker.mu.Lock()
-		if worker.currentTask != nil {
-			hasCurrentTask = true
+		if p.getData != nil {
+			worker.mu.Lock()
+			if worker.currentTask != nil {
+				hasCurrentTask = true
+			}
+			worker.mu.Unlock()
 		}
-		worker.mu.Unlock()
 
 		var data interface{}
 
-		if hasCurrentTask {
-			worker.mu.Lock()
-			worker.currentTask.mu.Lock()
-			if worker.currentTask != nil {
-				if p.getData != nil {
+		if p.getData != nil {
+			if hasCurrentTask {
+				worker.mu.Lock()
+				worker.currentTask.mu.Lock()
+				if worker.currentTask != nil {
 					data = p.getData(worker.currentTask.data)
-				} else {
-					data = worker.currentTask.data
 				}
+				worker.currentTask.mu.Unlock()
+				worker.mu.Unlock()
 			}
-			worker.currentTask.mu.Unlock()
-			worker.mu.Unlock()
 		}
 
 		worker.mu.Lock()
@@ -1220,8 +1220,10 @@ func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
 			HasTask: worker.currentTask != nil,
 		}
 
-		if hasCurrentTask {
-			state.Data = data
+		if p.getData != nil {
+			if hasCurrentTask {
+				state.Data = data
+			}
 		}
 
 		worker.mu.Unlock()
