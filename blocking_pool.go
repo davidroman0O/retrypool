@@ -123,7 +123,7 @@ type BlockingPool[T any, GID comparable, TID comparable] struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	config        BlockingConfig[T]
-	cachedTasks   map[GID][]T // Store tasks that can't be immediately submitted
+	cachedTasks   map[GID][]*blockingTaskState[T, GID, TID] // Store tasks that can't be immediately submitted
 	cacheMu       deadlock.RWMutex
 }
 
@@ -271,24 +271,29 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 		config:        cfg,
 		ctx:           ctx,
 		cancel:        cancel,
-		cachedTasks:   make(map[GID][]T),
+		cachedTasks:   make(map[GID][]*blockingTaskState[T, GID, TID]),
 	}
 
 	cfg.logger.Info(ctx, "BlockingPool created successfully")
 	return pool, nil
 }
 
-func (p *BlockingPool[T, GID, TID]) cacheTask(groupID GID, task T) {
+func (p *BlockingPool[T, GID, TID]) cacheTaskState(groupID GID, state *blockingTaskState[T, GID, TID]) {
 	p.cacheMu.Lock()
 	defer p.cacheMu.Unlock()
 
-	p.config.logger.Debug(p.ctx, "Caching task for later submission",
-		"group_id", groupID)
+	p.config.logger.Debug(p.ctx, "Caching task state for later submission",
+		"group_id", groupID,
+		"task_id", state.taskID)
 
-	p.cachedTasks[groupID] = append(p.cachedTasks[groupID], task)
+	if p.cachedTasks == nil {
+		p.cachedTasks = make(map[GID][]*blockingTaskState[T, GID, TID])
+	}
+	p.cachedTasks[groupID] = append(p.cachedTasks[groupID], state)
 }
 
-func (p *BlockingPool[T, GID, TID]) trySubmitCachedTasks(groupID GID) {
+// Try to submit cached task states
+func (p *BlockingPool[T, GID, TID]) trySubmitCachedStates(groupID GID) {
 	p.cacheMu.Lock()
 	cached, exists := p.cachedTasks[groupID]
 	if !exists || len(cached) == 0 {
@@ -306,31 +311,25 @@ func (p *BlockingPool[T, GID, TID]) trySubmitCachedTasks(groupID GID) {
 		return
 	}
 
-	var remainingTasks []T
-	currentTasks := cached
+	var remainingStates []*blockingTaskState[T, GID, TID]
+	currentStates := cached
 	p.cachedTasks[groupID] = nil // Clear before unlocking
 	p.cacheMu.Unlock()
 
-	// Try to submit tasks from cache
-	for _, task := range currentTasks {
-		err := pool.SubmitToFreeWorker(task)
+	// Try to submit cached states
+	for _, state := range currentStates {
+		err := pool.SubmitToFreeWorker(state.task, state.options...)
 		if err != nil {
-			// pp.Println(pool.GetMetricsSnapshot(), pool.GetFreeWorkers())
-			// If still no workers available, keep in cache
-			remainingTasks = append(remainingTasks, task)
+			remainingStates = append(remainingStates, state)
 		}
 	}
 
-	// If any tasks couldn't be submitted, cache them again
-	if len(remainingTasks) > 0 {
+	// Cache any states that couldn't be submitted
+	if len(remainingStates) > 0 {
 		p.cacheMu.Lock()
-		p.cachedTasks[groupID] = append(p.cachedTasks[groupID], remainingTasks...)
+		p.cachedTasks[groupID] = append(p.cachedTasks[groupID], remainingStates...)
 		p.cacheMu.Unlock()
 	}
-
-	p.config.logger.Debug(p.ctx, "Cached task submission attempt completed",
-		"group_id", groupID,
-		"remaining_tasks", len(remainingTasks))
 }
 
 // Scale the amount of parallel pools that can be active at the same time
@@ -748,37 +747,37 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error
 
 	dtask, ok := any(data).(BlockingDependentTask[GID, TID])
 	if !ok {
-		p.config.logger.Error(p.ctx, "Task does not implement DependentTask interface")
 		return fmt.Errorf("task does not implement DependentTask interface")
 	}
 
 	groupID := dtask.GetGroupID()
 	taskID := dtask.GetTaskID()
 
-	p.config.logger.Debug(p.ctx, "Task details",
-		"group_id", groupID,
-		"task_id", taskID)
-
-	opts := []TaskOption[T]{
-		WithBounceRetry[T](),
+	// Create task state with all metadata
+	state := &blockingTaskState[T, GID, TID]{
+		task:         data,
+		taskID:       taskID,
+		groupID:      groupID,
+		completionCh: make(chan struct{}),
+		options:      []TaskOption[T]{WithBounceRetry[T]()},
 	}
 
+	// Add any additional options
 	cfg := submitConfig{}
 	for _, o := range opt {
 		o(&cfg)
 	}
 
 	if cfg.queueNotification != nil {
-		opts = append(opts, WithQueuedNotification[T](cfg.queueNotification))
+		state.options = append(state.options, WithQueuedNotification[T](cfg.queueNotification))
 	}
 	if cfg.processedNotification != nil {
-		opts = append(opts, WithProcessedNotification[T](cfg.processedNotification))
+		state.options = append(state.options, WithProcessedNotification[T](cfg.processedNotification))
 	}
 
 	p.mu.Lock()
 	group, exists := p.groups[groupID]
 	if !exists {
-		p.config.logger.Debug(p.ctx, "Creating new group", "group_id", groupID)
 		group = &blockingTaskGroup[T, GID, TID]{
 			id:        groupID,
 			tasks:     make(map[TID]*blockingTaskState[T, GID, TID]),
@@ -791,70 +790,62 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error
 			p.config.OnGroupCreated(groupID)
 		}
 
-		// Try to assign a pool if not at limit
+		// If group needs a pool, add to pending
+		isPending := false
+		for _, pendingID := range p.pendingGroups {
+			if pendingID == groupID {
+				isPending = true
+				break
+			}
+		}
+
+		if !isPending {
+			p.config.logger.Debug(p.ctx, "Adding group to pending queue",
+				"group_id", groupID)
+			p.pendingGroups = append(p.pendingGroups, groupID)
+		}
+
+		// Try to assign a pool if possible
 		if err := p.assignPoolToGroup(groupID); err != nil {
-			// Group will remain in pending state
+			// Cache the task state and return
+			p.cacheTaskState(groupID, state)
 			p.mu.Unlock()
-			p.config.logger.Error(p.ctx, "Failed to assign pool to group",
-				"group_id", groupID,
-				"error", err)
-			return fmt.Errorf("failed to assign pool: %w", err)
+			return nil
 		}
 	}
 
-	// Create task state
-	task := &blockingTaskState[T, GID, TID]{
-		task:         data,
-		taskID:       taskID,
-		groupID:      groupID,
-		completionCh: make(chan struct{}),
-		options:      opts,
-	}
-
+	// Store task state in group
 	group.mu.Lock()
-	group.tasks[taskID] = task
+	group.tasks[taskID] = state
 	group.mu.Unlock()
 
-	// If group has no pool yet, just store the task
+	// If group has no pool, cache the task state
 	if !group.hasPool {
-		p.config.logger.Debug(p.ctx, "Group has no pool, task queued for later processing",
-			"group_id", groupID,
-			"task_id", taskID)
+		p.cacheTaskState(groupID, state)
 		p.mu.Unlock()
 		return nil
 	}
 
 	pool := p.pools[groupID]
-	// Need to scale workers?
 	if err := p.scaleWorkersIfNeeded(groupID); err != nil {
 		p.mu.Unlock()
-		p.config.logger.Error(p.ctx, "Failed to scale workers",
-			"group_id", groupID,
-			"error", err)
 		return fmt.Errorf("failed to scale workers: %w", err)
 	}
-	p.mu.Unlock()
 
 	if p.config.OnTaskStarted != nil {
 		p.config.OnTaskStarted(data)
 	}
 
-	p.config.logger.Debug(p.ctx, "Submitting task to pool",
-		"group_id", groupID,
-		"task_id", taskID)
-
-	if err := pool.SubmitToFreeWorker(task.task, opts...); err != nil {
-		if err == ErrNoWorkersAvailable {
-			p.cacheTask(groupID, data)
-		} else {
-			p.config.logger.Error(p.ctx, "Failed to submit task to pool",
-				"group_id", groupID,
-				"task_id", taskID,
-				"error", err)
-			return fmt.Errorf("failed to submit task: %w", err)
-		}
+	// Try to submit with complete state and options
+	err := pool.SubmitToFreeWorker(state.task, state.options...)
+	if err == ErrNoWorkersAvailable {
+		p.cacheTaskState(groupID, state)
+		p.mu.Unlock()
+		return nil
 	}
-	return nil
+
+	p.mu.Unlock()
+	return err
 }
 
 // handleTaskCompletion processes task completion
@@ -865,8 +856,26 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 		p.config.OnTaskCompleted(data)
 	}
 
-	// Try to submit any cached tasks after completion
-	p.trySubmitCachedTasks(groupID)
+	// Check pending groups first
+	p.mu.Lock()
+	if len(p.activeGroups) < p.config.maxConcurrentPools && len(p.pendingGroups) > 0 {
+		nextGroupID := p.pendingGroups[0]
+		p.pendingGroups = p.pendingGroups[1:]
+
+		if nextGroup := p.groups[nextGroupID]; nextGroup != nil {
+			if err := p.assignPoolToGroup(nextGroupID); err == nil {
+				// Pool assigned successfully, try to submit its cached states
+				p.trySubmitCachedStates(nextGroupID)
+			} else {
+				// If pool assignment failed, put group back in pending queue
+				p.pendingGroups = append(p.pendingGroups, nextGroupID)
+			}
+		}
+	}
+	p.mu.Unlock()
+
+	// Try to submit cached states for the completing group
+	p.trySubmitCachedStates(groupID)
 
 	dtask := any(data).(BlockingDependentTask[GID, TID])
 	taskID := dtask.GetTaskID()
