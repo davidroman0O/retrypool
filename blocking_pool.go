@@ -610,15 +610,15 @@ func (p *BlockingPool[T, GID, TID]) releaseGroupPool(groupID GID) error {
 
 				// Get tasks that need to be submitted
 				nextGroup.mu.Lock()
-				pendingTasks := make([]T, 0, len(nextGroup.tasks))
+				pendingTasks := []*blockingTaskState[T, GID, TID]{}
 				for _, taskState := range nextGroup.tasks {
-					pendingTasks = append(pendingTasks, taskState.task)
+					pendingTasks = append(pendingTasks, taskState)
 				}
 				nextGroup.mu.Unlock()
 
 				// Submit all pending tasks
 				for _, task := range pendingTasks {
-					if err := newPool.SubmitToFreeWorker(task); err != nil {
+					if err := newPool.SubmitToFreeWorker(task.task, task.options...); err != nil {
 						p.config.logger.Error(p.ctx, "Failed to submit pending task",
 							"group_id", nextGroupID,
 							"error", err)
