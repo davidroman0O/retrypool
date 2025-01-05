@@ -828,3 +828,115 @@ func TestBlockingPool_TreeTasks(t *testing.T) {
 		t.Fatalf("Failed to close pool: %v", err)
 	}
 }
+
+// TreeNonLinearTask implements BlockingDependentTask for testing
+type TreeNonLinearTask struct {
+	ID           int
+	GroupID      string
+	Dependencies []int
+	Done         chan struct{}
+}
+
+func (t TreeNonLinearTask) GetDependencies() []int { return t.Dependencies }
+func (t TreeNonLinearTask) GetGroupID() string     { return t.GroupID }
+func (t TreeNonLinearTask) GetTaskID() int         { return t.ID }
+
+// TreeNonLinearWorker implements Worker
+type TreeNonLinearWorker struct {
+	executionTimes map[int]time.Time
+	mu             sync.Mutex
+	pool           *retrypool.BlockingPool[TreeNonLinearTask, string, int]
+}
+
+func (w *TreeNonLinearWorker) Run(ctx context.Context, task TreeNonLinearTask) error {
+	w.mu.Lock()
+	w.executionTimes[task.ID] = time.Now()
+	w.mu.Unlock()
+
+	fmt.Printf("Running Task %d\n", task.ID)
+
+	// If this is the root task, submit all dependent tasks
+	if task.ID == 1 {
+		// Submit 10 dependent tasks
+		for i := 2; i <= 11; i++ {
+			childDone := make(chan struct{})
+			childTask := TreeNonLinearTask{
+				ID:           i,
+				GroupID:      task.GroupID,
+				Dependencies: []int{1}, // All depend on task 1
+				Done:         childDone,
+			}
+			if err := w.pool.Submit(childTask); err != nil {
+				return fmt.Errorf("failed to submit dependent task %d: %v", i, err)
+			}
+		}
+		// we won't wait for it
+	}
+
+	close(task.Done)
+	fmt.Printf("Task %d completed\n", task.ID)
+
+	return nil
+}
+
+func TestBlockingPool_TreeNonLinearTasks(t *testing.T) {
+	ctx := context.Background()
+
+	var pool *retrypool.BlockingPool[TreeNonLinearTask, string, int]
+
+	var err error
+	pool, err = retrypool.NewBlockingPool[TreeNonLinearTask, string, int](
+		ctx,
+		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[TreeNonLinearTask] {
+			return &TreeNonLinearWorker{pool: pool, executionTimes: make(map[int]time.Time)}
+		}),
+		retrypool.WithBlockingMaxWorkersPerPool[TreeNonLinearTask](2), // we should have 1 for the root and 1 for the children
+		retrypool.WithBlockingMaxActivePools[TreeNonLinearTask](1),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Submit root task
+	done := make(chan struct{})
+	rootTask := TreeNonLinearTask{
+		ID:      1,
+		GroupID: "tree1",
+		Done:    done,
+	}
+
+	if err := pool.Submit(rootTask); err != nil {
+		t.Fatalf("Failed to submit root task: %v", err)
+	}
+
+	// Wait for completion
+	select {
+	case <-done:
+		t.Log("All tasks completed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for tasks")
+	}
+
+	// // Verify execution times
+	// worker.mu.Lock()
+	// rootTime := worker.executionTimes[1]
+
+	// // All dependent tasks must execute after root
+	// for id := 2; id <= 11; id++ {
+	// 	childTime, exists := worker.executionTimes[id]
+	// 	if !exists {
+	// 		t.Errorf("Task %d was not executed", id)
+	// 		continue
+	// 	}
+	// 	if childTime.Before(rootTime) {
+	// 		t.Errorf("Task %d executed before root task", id)
+	// 	}
+	// }
+	// worker.mu.Unlock()
+
+	pp.Println(pool.GetMetricsSnapshot())
+
+	if err := pool.Close(); err != nil {
+		t.Fatalf("Failed to close pool: %v", err)
+	}
+}
