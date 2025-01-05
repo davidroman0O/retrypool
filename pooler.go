@@ -236,6 +236,7 @@ type Pool[T any] struct {
 	stateMetrics          *stateMetrics
 	workerQueues          map[int]*atomic.Int64
 	queueMu               sync.RWMutex
+	getData               func(T) interface{}
 }
 
 // New initializes the Pool with given workers and options
@@ -379,6 +380,12 @@ type Option[T any] func(*Pool[T])
 func WithLogger[T any](logger Logger) Option[T] {
 	return func(p *Pool[T]) {
 		p.logger = logger
+	}
+}
+
+func WithGetData[T any](getData func(T) interface{}) Option[T] {
+	return func(p *Pool[T]) {
+		p.getData = getData
 	}
 }
 
@@ -1189,13 +1196,17 @@ func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
 		}
 		worker.mu.Unlock()
 
-		var data T
+		var data interface{}
 
 		if hasCurrentTask {
 			worker.mu.Lock()
 			worker.currentTask.mu.Lock()
 			if worker.currentTask != nil {
-				data = worker.currentTask.data
+				if p.getData != nil {
+					data = p.getData(worker.currentTask.data)
+				} else {
+					data = worker.currentTask.data
+				}
 			}
 			worker.currentTask.mu.Unlock()
 			worker.mu.Unlock()
@@ -1947,7 +1958,7 @@ type State[T any] struct {
 	Paused  bool
 	Removed bool
 	HasTask bool
-	Data    T
+	Data    interface{}
 }
 
 // Add adds a new worker to the pool
