@@ -1193,9 +1193,11 @@ func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
 
 		if hasCurrentTask {
 			worker.currentTask.mu.Lock()
+			worker.mu.Lock()
 			if worker.currentTask != nil {
 				data = worker.currentTask.data
 			}
+			worker.mu.Unlock()
 			worker.currentTask.mu.Unlock()
 		}
 
