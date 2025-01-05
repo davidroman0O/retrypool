@@ -3130,6 +3130,8 @@ func (rr *RequestResponse[T, R]) CompleteWithError(err error) {
 
 // Done returns a channel that's closed when the request is complete
 func (rr *RequestResponse[T, R]) Done() <-chan struct{} {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
 	return rr.done
 }
 
