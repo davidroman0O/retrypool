@@ -64,13 +64,20 @@ type Data struct {
 
 func (w *APIWorker) Run(ctx context.Context, rr *retrypool.RequestResponse[Data, error]) error {
 	client := &http.Client{}
-	payload, err := json.Marshal(rr.Request.Payload)
+	var p interface{}
+	var url string
+	rr.ConsultRequest(func(d Data) {
+		p = d.Payload
+		url = d.URL
+	})
+
+	payload, err := json.Marshal(p)
 	if err != nil {
 		rr.CompleteWithError(fmt.Errorf("error marshaling payload: %w", err))
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", rr.Request.URL, bytes.NewBuffer(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(payload))
 	if err != nil {
 		rr.CompleteWithError(fmt.Errorf("error creating request: %w", err))
 		return err
@@ -124,7 +131,9 @@ func main() {
 		retrypool.WithMaxDelay[*retrypool.RequestResponse[Data, error]](5*time.Second),
 		retrypool.WithMaxJitter[*retrypool.RequestResponse[Data, error]](500*time.Millisecond),
 		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[Data, error]](func(data *retrypool.RequestResponse[Data, error], err error) retrypool.TaskAction {
-			log.Printf("Task failed (URL: %s): %v", data.Request.URL, err)
+			data.ConsultRequest(func(d Data) {
+				log.Printf("Task failed (URL: %s): %v", d.URL, err)
+			})
 			return retrypool.TaskActionRetry
 		}),
 	)

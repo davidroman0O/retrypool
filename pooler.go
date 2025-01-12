@@ -3101,7 +3101,7 @@ func (n *QueuedNotification) Done() <-chan struct{} {
 
 // RequestResponse manages the lifecycle of a task request and its response
 type RequestResponse[T any, R any] struct {
-	Request     T              // The request data
+	request     T              // The request data
 	done        chan struct{}  // Channel to signal completion
 	response    R              // Stores the successful response
 	err         error          // Stores any error that occurred
@@ -3112,9 +3112,16 @@ type RequestResponse[T any, R any] struct {
 // NewRequestResponse creates a new RequestResponse instance
 func NewRequestResponse[T any, R any](request T) *RequestResponse[T, R] {
 	return &RequestResponse[T, R]{
-		Request: request,
+		request: request,
 		done:    make(chan struct{}),
 	}
+}
+
+// Safely consults the request data
+func (rr *RequestResponse[T, R]) ConsultRequest(fn func(T)) {
+	rr.mu.Lock()
+	fn(rr.request)
+	rr.mu.Unlock()
 }
 
 // Complete safely marks the request as complete with a response
