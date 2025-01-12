@@ -3159,11 +3159,9 @@ func (rr *RequestResponse[T, R]) CompleteWithError(err error) {
 
 // Done returns a channel that's closed when the request is complete
 func (rr *RequestResponse[T, R]) Done() <-chan struct{} {
-	var done chan struct{}
 	rr.mu.RLock()
-	done = rr.done
-	rr.mu.RUnlock()
-	return done
+	defer rr.mu.RUnlock()
+	return rr.done
 }
 
 // Err returns any error that occurred during the request
@@ -3177,13 +3175,9 @@ func (rr *RequestResponse[T, R]) Err() error {
 
 // Wait waits for the request to complete and returns the response and any error
 func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
-	var done chan struct{}
-	rr.mu.RLock()
-	done = rr.done
-	rr.mu.RUnlock()
 
 	select {
-	case <-done:
+	case <-rr.done:
 		var err error
 		var response R
 		rr.mu.RLock()
