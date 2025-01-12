@@ -3118,10 +3118,11 @@ func NewRequestResponse[T any, R any](request T) *RequestResponse[T, R] {
 }
 
 // Safely consults the request data
-func (rr *RequestResponse[T, R]) ConsultRequest(fn func(T)) {
+func (rr *RequestResponse[T, R]) ConsultRequest(fn func(T) error) error {
 	rr.mu.Lock()
-	fn(rr.request)
+	err := fn(rr.request)
 	rr.mu.Unlock()
+	return err
 }
 
 // Complete safely marks the request as complete with a response

@@ -25,8 +25,9 @@ func (w *ResponseWorker) Run(ctx context.Context, data *retrypool.RequestRespons
 	time.Sleep(time.Millisecond * 200)
 
 	var id int
-	data.ConsultRequest(func(rd RequestData) {
+	data.ConsultRequest(func(rd RequestData) error {
 		id = rd.ID
+		return nil
 	})
 
 	// Simulate an error for a specific ID
@@ -70,8 +71,9 @@ func main() {
 		// Submit the request to the pool
 		err := pool.Submit(req)
 		if err != nil {
-			req.ConsultRequest(func(rd RequestData) {
+			req.ConsultRequest(func(rd RequestData) error {
 				fmt.Printf("Error submitting request ID %d: %v\n", rd.ID, err)
+				return nil
 			})
 			continue
 		}
@@ -86,12 +88,14 @@ func main() {
 
 			resp, err := r.Wait(ctx)
 			if err != nil {
-				r.ConsultRequest(func(rd RequestData) {
+				r.ConsultRequest(func(rd RequestData) error {
 					fmt.Printf("Request ID %d failed: %v\n", rd.ID, err)
+					return nil
 				})
 			} else {
-				r.ConsultRequest(func(rd RequestData) {
+				r.ConsultRequest(func(rd RequestData) error {
 					fmt.Printf("Request ID %d succeeded: %s\n", rd.ID, resp.Result)
+					return nil
 				})
 			}
 		}(req)

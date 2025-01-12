@@ -66,9 +66,10 @@ func (w *APIWorker) Run(ctx context.Context, rr *retrypool.RequestResponse[Data,
 	client := &http.Client{}
 	var p interface{}
 	var url string
-	rr.ConsultRequest(func(d Data) {
+	rr.ConsultRequest(func(d Data) error {
 		p = d.Payload
 		url = d.URL
+		return nil
 	})
 
 	payload, err := json.Marshal(p)
@@ -131,8 +132,9 @@ func main() {
 		retrypool.WithMaxDelay[*retrypool.RequestResponse[Data, error]](5*time.Second),
 		retrypool.WithMaxJitter[*retrypool.RequestResponse[Data, error]](500*time.Millisecond),
 		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[Data, error]](func(data *retrypool.RequestResponse[Data, error], err error) retrypool.TaskAction {
-			data.ConsultRequest(func(d Data) {
+			data.ConsultRequest(func(d Data) error {
 				log.Printf("Task failed (URL: %s): %v", d.URL, err)
+				return nil
 			})
 			return retrypool.TaskActionRetry
 		}),
