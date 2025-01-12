@@ -3101,12 +3101,12 @@ func (n *QueuedNotification) Done() <-chan struct{} {
 
 // RequestResponse manages the lifecycle of a task request and its response
 type RequestResponse[T any, R any] struct {
-	request     T              // The request data
-	done        chan struct{}  // Channel to signal completion
-	response    R              // Stores the successful response
-	err         error          // Stores any error that occurred
-	mu          deadlock.Mutex // Protects response and err
-	isCompleted bool           // Indicates if request is completed
+	request     T                // The request data
+	done        chan struct{}    // Channel to signal completion
+	response    R                // Stores the successful response
+	err         error            // Stores any error that occurred
+	mu          deadlock.RWMutex // Protects response and err
+	isCompleted bool             // Indicates if request is completed
 }
 
 // NewRequestResponse creates a new RequestResponse instance
@@ -3126,60 +3126,91 @@ func (rr *RequestResponse[T, R]) ConsultRequest(fn func(T)) {
 
 // Complete safely marks the request as complete with a response
 func (rr *RequestResponse[T, R]) Complete(response R) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
+	var completed bool
+	rr.mu.RLock()
+	completed = rr.isCompleted
+	rr.mu.RUnlock()
 
-	if !rr.isCompleted {
+	if !completed {
+		rr.mu.Lock()
 		rr.response = response
 		rr.isCompleted = true
 		close(rr.done)
+		rr.mu.Unlock()
 	}
 }
 
 // CompleteWithError safely marks the request as complete with an error
 func (rr *RequestResponse[T, R]) CompleteWithError(err error) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
+	var completed bool
+	rr.mu.RLock()
+	completed = rr.isCompleted
+	rr.mu.RUnlock()
 
-	if !rr.isCompleted {
+	if !completed {
+		rr.mu.Lock()
 		rr.err = err
 		rr.isCompleted = true
 		close(rr.done)
+		rr.mu.Unlock()
 	}
 }
 
 // Done returns a channel that's closed when the request is complete
 func (rr *RequestResponse[T, R]) Done() <-chan struct{} {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	return rr.done
+	var done chan struct{}
+	rr.mu.RLock()
+	done = rr.done
+	rr.mu.RUnlock()
+	return done
 }
 
 // Err returns any error that occurred during the request
 func (rr *RequestResponse[T, R]) Err() error {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	return rr.err
+	var err error
+	rr.mu.RLock()
+	err = rr.err
+	rr.mu.RUnlock()
+	return err
 }
 
 // Wait waits for the request to complete and returns the response and any error
 func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
+	var done chan struct{}
+	rr.mu.RLock()
+	done = rr.done
+	rr.mu.RUnlock()
+
 	select {
-	case <-rr.done:
-		rr.mu.Lock()
-		defer rr.mu.Unlock()
-		return rr.response, rr.err
+	case <-done:
+		var err error
+		var response R
+		rr.mu.RLock()
+		response = rr.response
+		err = rr.err
+		rr.mu.RUnlock()
+		return response, err
 	case <-ctx.Done():
-		rr.mu.Lock()
-		defer rr.mu.Unlock()
-		var zero R
-		if !rr.isCompleted {
+		var completed bool
+		rr.mu.RLock()
+		completed = rr.isCompleted
+		rr.mu.RUnlock()
+		if !completed {
+			var zero R
+			rr.mu.Lock()
 			rr.err = ctx.Err()
 			rr.isCompleted = true
 			close(rr.done)
-			return zero, rr.err
+			rr.mu.Unlock()
+			return zero, ctx.Err()
 		} else {
-			return rr.response, rr.err
+			var err error
+			var response R
+			rr.mu.RLock()
+			response = rr.response
+			err = rr.err
+			rr.mu.RUnlock()
+			return response, err
 		}
 	}
 }
