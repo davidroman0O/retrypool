@@ -1,4 +1,4 @@
-[ ] - RangeTasks is missing
+[x] - RangeTasks is missing
 QueueSize
 ProcessingCount
 DeadTaskCount
@@ -6,3 +6,7 @@ GetWorkerCount
 Info
 [ ] - Add unit tests for failure and cleanup detection in Blocking and Independent Pools
 [ ] - Implement an helper to use the DependecyPool for the same API as that: https://github.com/Azure/go-workflow
+
+
+[ ] - Change design to gather metrics, we should have a channel - make a snapshot and return cached 
+

@@ -127,6 +127,10 @@ type BlockingPool[T any, GID comparable, TID comparable] struct {
 	config        BlockingConfig[T]
 	cachedTasks   map[GID][]*blockingTaskState[T, GID, TID] // Store tasks that can't be immediately submitted
 	cacheMu       deadlock.RWMutex
+
+	snapshotMu     deadlock.RWMutex // Protects access to the snapshot
+	snapshotGroups map[GID]MetricsSnapshot[T]
+	snapshot       BlockingMetricsSnapshot[T, GID]
 }
 
 // Configuration options
@@ -271,15 +275,16 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 
 	ctx, cancel := context.WithCancel(ctx)
 	pool := &BlockingPool[T, GID, TID]{
-		pools:         make(map[GID]Pooler[T]),
-		workerFactory: cfg.workerFactory,
-		groups:        make(map[GID]*blockingTaskGroup[T, GID, TID]),
-		activeGroups:  make(map[GID]struct{}),
-		pendingGroups: make([]GID, 0),
-		config:        cfg,
-		ctx:           ctx,
-		cancel:        cancel,
-		cachedTasks:   make(map[GID][]*blockingTaskState[T, GID, TID]),
+		pools:          make(map[GID]Pooler[T]),
+		workerFactory:  cfg.workerFactory,
+		groups:         make(map[GID]*blockingTaskGroup[T, GID, TID]),
+		activeGroups:   make(map[GID]struct{}),
+		pendingGroups:  make([]GID, 0),
+		config:         cfg,
+		ctx:            ctx,
+		cancel:         cancel,
+		cachedTasks:    make(map[GID][]*blockingTaskState[T, GID, TID]),
+		snapshotGroups: make(map[GID]MetricsSnapshot[T]),
 	}
 
 	cfg.logger.Info(ctx, "BlockingPool created successfully")
@@ -376,27 +381,10 @@ type BlockingMetricsSnapshot[T any, GID comparable] struct {
 	Metrics             []GroupMetricSnapshot[T, GID]
 }
 
-// Get all the metrics of all pools
-func (p *BlockingPool[T, GID, TID]) GetMetricsSnapshot() BlockingMetricsSnapshot[T, GID] {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	var metrics BlockingMetricsSnapshot[T, GID] = BlockingMetricsSnapshot[T, GID]{
-		Metrics: []GroupMetricSnapshot[T, GID]{},
-	}
-
-	for groupID, pool := range p.pools {
-		poolMetrics := pool.GetMetricsSnapshot()
-		metrics.TotalTasksSubmitted += poolMetrics.TasksSubmitted
-		metrics.TotalTasksProcessed += poolMetrics.TasksProcessed
-		metrics.TotalDeadTasks += poolMetrics.DeadTasks
-
-		metrics.Metrics = append(metrics.Metrics, GroupMetricSnapshot[T, GID]{
-			GroupID:         groupID,
-			MetricsSnapshot: poolMetrics,
-		})
-	}
-
-	return metrics
+func (p *BlockingPool[T, GID, TID]) GetSnapshot() BlockingMetricsSnapshot[T, GID] {
+	p.snapshotMu.RLock()
+	defer p.snapshotMu.RUnlock()
+	return p.snapshot
 }
 
 func (p *BlockingPool[T, GID, TID]) RangeWorkerQueues(f func(workerID int, queueSize int64) bool) {
@@ -423,6 +411,22 @@ func (p *BlockingPool[T, GID, TID]) RangeTaskQueues(f func(workerID int, queue T
 	}
 }
 
+func (p *BlockingPool[T, GID, TID]) calculateMetricsSnapshot() {
+	snapshot := BlockingMetricsSnapshot[T, GID]{}
+	for id, metric := range p.snapshotGroups {
+		snapshot.TotalTasksSubmitted += metric.TasksSubmitted
+		snapshot.TotalTasksProcessed += metric.TasksProcessed
+		snapshot.TotalTasksSucceeded += metric.TasksSucceeded
+		snapshot.TotalTasksFailed += metric.TasksFailed
+		snapshot.TotalDeadTasks += metric.DeadTasks
+		snapshot.Metrics = append(snapshot.Metrics, GroupMetricSnapshot[T, GID]{
+			GroupID:         id,
+			MetricsSnapshot: metric,
+		})
+	}
+	p.snapshot = snapshot
+}
+
 // createPoolForGroup creates a new worker pool for a group
 func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], error) {
 	p.config.logger.Debug(p.ctx, "Creating new pool for group", "group_id", groupID)
@@ -438,6 +442,17 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 	if p.config.getData != nil {
 		options = append(options, WithGetData[T](p.config.getData))
 	}
+
+	options = append(
+		options,
+		WithSnapshotInterval[T](time.Second),
+		WithSnapshots[T](),
+		WithSnapshotCallback[T](func(ms MetricsSnapshot[T]) {
+			p.snapshotMu.Lock()
+			p.snapshotGroups[groupID] = ms
+			p.calculateMetricsSnapshot()
+			p.snapshotMu.Unlock()
+		}))
 
 	// Create pool with synchronous mode and single retry
 	pool := New[T](
@@ -1034,17 +1049,10 @@ func (p *BlockingPool[T, GID, TID]) WaitWithCallback(
 			return ctx.Err()
 		case <-ticker.C:
 			p.mu.RLock()
-			queued := 0
-			processing := 0
-			deadTasks := 0
+			queued := int(p.snapshot.TotalTasksSubmitted - p.snapshot.TotalTasksProcessed)
+			processing := int(p.snapshot.TotalTasksProcessed - p.snapshot.TotalTasksSucceeded - p.snapshot.TotalTasksFailed)
+			deadTasks := int(p.snapshot.TotalDeadTasks)
 
-			// Sum metrics across all active pools
-			for _, pool := range p.pools {
-				metrics := pool.GetMetricsSnapshot()
-				queued += int(metrics.TasksSubmitted - metrics.TasksProcessed)
-				processing += int(pool.ProcessingCount())
-				deadTasks += int(metrics.DeadTasks)
-			}
 			p.mu.RUnlock()
 
 			p.config.logger.Debug(p.ctx, "Pool metrics",

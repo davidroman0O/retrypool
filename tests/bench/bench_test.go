@@ -87,7 +87,7 @@ func TestThroughput(t *testing.T) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				metrics := pool.GetMetricsSnapshot() // on the old code it's `metrics := pool.Metrics()`
+				metrics := pool.GetSnapshot() // on the old code it's `metrics := pool.Metrics()`
 				t.Logf("Tasks processed: %d, Tasks submitted: %d, Tasks succeeded: %d, Dead tasks: %d, Queues: %v", metrics.TasksProcessed, metrics.TasksSubmitted, metrics.TasksSucceeded, metrics.DeadTasks, metrics.TaskQueues)
 			}
 		}

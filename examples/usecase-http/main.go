@@ -170,7 +170,7 @@ func main() {
 	})
 
 	// Get metrics snapshot
-	metrics := pool.GetMetricsSnapshot()
+	metrics := pool.GetSnapshot()
 	fmt.Printf("Final metrics - Submitted: %d, Processed: %d, Succeeded: %d, Failed: %d, Dead: %d\n",
 		metrics.TasksSubmitted, metrics.TasksProcessed, metrics.TasksSucceeded,
 		metrics.TasksFailed, metrics.DeadTasks)

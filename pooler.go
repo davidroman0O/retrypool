@@ -25,6 +25,13 @@ import (
 /// - Pause: won't accept new tasks, queue tasks are redistributed to other workers (if zero workers then to deadtasks), finish current task (might be retried or go to deadtasks), out of any operations, paused while triggering OnPause
 /// - Resume: accept new tasks, queue is open again, continue processing, resumed while triggering OnResume
 /// - Remove: no more new tasks, queue tasks are redistribute to other workers (if zero workers then to deadtasks), finish current task (might be retried or go to deadtasks), out of any operations, removed from the Pool while triggering OnRemove
+///
+/// Snapshot:
+/// - Goal is to prevent the user from having to call the metrics functions all the time and reducing the number of locks and increasing the performance a little bit
+/// - controlled by one goroutine to update a local cache
+/// - only return the cache
+/// - can be enabled or disabled, can be set to a custom interval, can have a custom callback
+///
 
 // Initialize deadlock detection
 func init() {
@@ -235,8 +242,13 @@ type Pool[T any] struct {
 	logger                Logger
 	stateMetrics          *stateMetrics
 	workerQueues          map[int]*atomic.Int64
-	queueMu               sync.RWMutex
-	getData               func(T) interface{}
+	queueMu               deadlock.RWMutex
+	// (optional) Expressing how we should return the data of the task the user is giving
+	getData func(T) interface{}
+
+	metricsSnapshot MetricsSnapshot[T] // Cached snapshot of metrics
+	snapshotMu      deadlock.RWMutex   // Protects access to the snapshot
+	snapshotTicker  *time.Ticker       // Ticker for periodic updates
 }
 
 // New initializes the Pool with given workers and options
@@ -286,6 +298,15 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 		if err != nil {
 			pool.logger.Error(ctx, "Failed to add worker", "error", err)
 		}
+	}
+
+	// Start snapshot updater if enabled
+	if pool.config.snapshotEnabled {
+		interval := pool.config.snapshotInterval
+		if interval <= 0 {
+			interval = time.Second // Default interval
+		}
+		pool.StartMetricsUpdater(interval)
 	}
 
 	// In synchronous mode, we want the Pool to have ONE goroutine but it manage ALL the workers and ALL the same rules
@@ -341,14 +362,11 @@ type MetricsSnapshot[T any] struct {
 	Workers        map[int]State[T]
 }
 
-func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot[T] {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+func (p *Pool[T]) calculateMetricsSnapshot() MetricsSnapshot[T] {
 	metrics := p.taskQueues.metrics()
 
 	workers := map[int]State[T]{}
-	p.rangeWorkers(func(workerID int, state State[T]) bool {
+	p.RangeWorkers(func(workerID int, state State[T]) bool {
 		workers[workerID] = state
 		return true
 	})
@@ -364,6 +382,37 @@ func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot[T] {
 	}
 }
 
+func (p *Pool[T]) StartMetricsUpdater(interval time.Duration) {
+	p.snapshotTicker = time.NewTicker(interval)
+	go func() {
+		for range p.snapshotTicker.C {
+			snapshot := p.calculateMetricsSnapshot()
+
+			// Store the snapshot
+			p.snapshotMu.Lock()
+			p.metricsSnapshot = snapshot
+			p.snapshotMu.Unlock()
+
+			// Trigger the callback if set
+			if p.config.onSnapshot != nil {
+				p.config.onSnapshot(snapshot)
+			}
+		}
+	}()
+}
+
+func (p *Pool[T]) StopMetricsUpdater() {
+	if p.snapshotTicker != nil {
+		p.snapshotTicker.Stop()
+	}
+}
+
+func (p *Pool[T]) GetSnapshot() MetricsSnapshot[T] {
+	p.snapshotMu.RLock()
+	defer p.snapshotMu.RUnlock()
+	return p.metricsSnapshot
+}
+
 // newWorkerID generates a new worker ID
 func (p *Pool[T]) newWorkerID() int {
 	p.mu.Lock()
@@ -375,6 +424,27 @@ func (p *Pool[T]) newWorkerID() int {
 
 // Option type for configuring the Pool
 type Option[T any] func(*Pool[T])
+
+// WithSnapshotInterval sets the interval for periodic snapshots
+func WithSnapshots[T any]() Option[T] {
+	return func(p *Pool[T]) {
+		p.config.snapshotEnabled = true
+	}
+}
+
+// WithSnapshotInterval sets the interval for periodic snapshots
+func WithSnapshotInterval[T any](interval time.Duration) Option[T] {
+	return func(p *Pool[T]) {
+		p.config.snapshotInterval = interval
+	}
+}
+
+// WithSnapshotCallback sets a callback for snapshot updates
+func WithSnapshotCallback[T any](callback func(MetricsSnapshot[T])) Option[T] {
+	return func(p *Pool[T]) {
+		p.config.onSnapshot = callback
+	}
+}
 
 // WithLogger sets the logger for the pool and all its components
 func WithLogger[T any](logger Logger) Option[T] {
@@ -604,6 +674,10 @@ type Config[T any] struct {
 	noWorkerPolicy NoWorkerPolicy
 	loopTicker     time.Duration
 	async          bool
+
+	snapshotEnabled  bool                     // Enable or disable snapshots
+	snapshotInterval time.Duration            // Interval for periodic updates
+	onSnapshot       func(MetricsSnapshot[T]) // Optional callback on snapshot update
 }
 
 // newDefaultConfig initializes default configurations

@@ -822,7 +822,7 @@ func TestBlockingPool_TreeTasks(t *testing.T) {
 	// }
 	// worker.mu.Unlock()
 
-	pp.Println(pool.GetMetricsSnapshot())
+	pp.Println(pool.GetSnapshot())
 
 	if err := pool.Close(); err != nil {
 		t.Fatalf("Failed to close pool: %v", err)
@@ -934,7 +934,7 @@ func TestBlockingPool_TreeNonLinearTasks(t *testing.T) {
 	// }
 	// worker.mu.Unlock()
 
-	pp.Println(pool.GetMetricsSnapshot())
+	pp.Println(pool.GetSnapshot())
 
 	if err := pool.Close(); err != nil {
 		t.Fatalf("Failed to close pool: %v", err)

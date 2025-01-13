@@ -55,7 +55,7 @@ func main() {
 	go func() {
 		for {
 			time.Sleep(time.Second * 2)
-			failedTasks := pool.GetMetricsSnapshot().TasksFailed
+			failedTasks := pool.GetSnapshot().TasksFailed
 			if failedTasks > 3 {
 				policyMu.Lock()
 				fmt.Println("Adjusting retry policy to use exponential backoff.")
