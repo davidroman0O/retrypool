@@ -244,11 +244,14 @@ type Pool[T any] struct {
 	workerQueues          map[int]*atomic.Int64
 	queueMu               deadlock.RWMutex
 	// (optional) Expressing how we should return the data of the task the user is giving
-	getData func(T) interface{}
+	// getData func(T) interface{}
 
-	metricsSnapshot MetricsSnapshot[T] // Cached snapshot of metrics
-	snapshotMu      deadlock.RWMutex   // Protects access to the snapshot
-	snapshotTicker  *time.Ticker       // Ticker for periodic updates
+	workersSnapshotMu deadlock.RWMutex   // Protects access to the workers snapshot
+	metricsSnapshot   MetricsSnapshot[T] // Cached snapshot of general metrics
+
+	workersSnapshot map[int]WorkerSnapshot[T] // Cached snapshot of workers
+	snapshotMu      deadlock.RWMutex          // Protects access to the snapshot
+	snapshotTicker  *time.Ticker              // Ticker for periodic updates
 }
 
 // New initializes the Pool with given workers and options
@@ -267,6 +270,7 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 		deadTaskNotifications: make(chan int, 1000), // todo: make this configurable
 		stateMetrics:          newStateMetrics(),
 		workerQueues:          make(map[int]*atomic.Int64),
+		workersSnapshot:       make(map[int]WorkerSnapshot[T]),
 	}
 
 	pool.logger.Disable()
@@ -359,14 +363,14 @@ type MetricsSnapshot[T any] struct {
 	TasksFailed    int64
 	DeadTasks      int64
 	TaskQueues     map[int]int
-	Workers        map[int]State[T]
+	Workers        map[int]WorkerSnapshot[T]
 }
 
 func (p *Pool[T]) calculateMetricsSnapshot() MetricsSnapshot[T] {
 	metrics := p.taskQueues.metrics()
 
-	workers := map[int]State[T]{}
-	p.RangeWorkers(func(workerID int, state State[T]) bool {
+	workers := map[int]WorkerSnapshot[T]{}
+	p.RangeWorkers(func(workerID int, state WorkerSnapshot[T]) bool {
 		workers[workerID] = state
 		return true
 	})
@@ -453,11 +457,12 @@ func WithLogger[T any](logger Logger) Option[T] {
 	}
 }
 
-func WithGetData[T any](getData func(T) interface{}) Option[T] {
-	return func(p *Pool[T]) {
-		p.getData = getData
-	}
-}
+// That was a bad idea
+// func WithGetData[T any](getData func(T) interface{}) Option[T] {
+// 	return func(p *Pool[T]) {
+// 		p.getData = getData
+// 	}
+// }
 
 // WithAttempts sets the maximum number of attempts
 func WithAttempts[T any](attempts int) Option[T] {
@@ -746,6 +751,7 @@ type Metrics struct {
 // Task represents a task in the pool
 type Task[T any] struct {
 	mu                deadlock.Mutex
+	metadata          map[string]any // `retrypool`'s design doesn't allow to access to `data` directly, so we need to store the metadata
 	data              T
 	retries           int
 	totalDuration     time.Duration
@@ -770,10 +776,10 @@ type Task[T any] struct {
 	stateHistory      []*TaskStateTransition[T]
 }
 
-func (t *Task[T]) GetData() T {
+func (t *Task[T]) GetMetadata() interface{} {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.data
+	return t.metadata
 }
 
 func (t *Task[T]) GetAttemptedWorkers() []int {
@@ -947,6 +953,13 @@ type DeadTask[T any] struct {
 
 // TaskOption functions for configuring individual tasks
 type TaskOption[T any] func(*Task[T])
+
+// WithMetadata sets metadata for the task
+func WithMetadata[T any](metadata map[string]any) TaskOption[T] {
+	return func(t *Task[T]) {
+		t.metadata = metadata
+	}
+}
 
 // WithImmediateRetry allows the submitted task to retry immediately
 func WithImmediateRetry[T any]() TaskOption[T] {
@@ -1254,57 +1267,19 @@ func (p *Pool[T]) RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool)
 	p.taskQueues.range_(f)
 }
 
-func (p *Pool[T]) RangeWorkers(f func(workerID int, state State[T]) bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *Pool[T]) RangeWorkers(f func(workerID int, state WorkerSnapshot[T]) bool) {
 	p.rangeWorkers(f)
 }
 
-func (p *Pool[T]) rangeWorkers(f func(workerID int, state State[T]) bool) {
-	for id, worker := range p.workers {
-
-		hasCurrentTask := false
-		if p.getData != nil {
-			worker.mu.Lock()
-			if worker.currentTask != nil {
-				hasCurrentTask = true
-			}
-			worker.mu.Unlock()
-		}
-
-		var data interface{}
-
-		if p.getData != nil {
-			if hasCurrentTask {
-				worker.mu.Lock()
-				worker.currentTask.mu.Lock()
-				if worker.currentTask != nil {
-					data = p.getData(worker.currentTask.data)
-				}
-				worker.currentTask.mu.Unlock()
-				worker.mu.Unlock()
-			}
-		}
-
-		worker.mu.Lock()
-		state := State[T]{
-			ID:      id,
-			Paused:  worker.paused.Load(),
-			Removed: worker.removed.Load(),
-			HasTask: worker.currentTask != nil,
-		}
-
-		if p.getData != nil {
-			if hasCurrentTask {
-				state.Data = data
-			}
-		}
-
-		worker.mu.Unlock()
-		if !f(id, state) {
+// ~~TODO: that function is very probablemetic, we should only use the worker snapshot~~
+func (p *Pool[T]) rangeWorkers(f func(workerID int, state WorkerSnapshot[T]) bool) {
+	p.workersSnapshotMu.RLock()
+	for id, snapshot := range p.workersSnapshot {
+		if !f(id, snapshot) {
 			break
 		}
 	}
+	p.workersSnapshotMu.RUnlock()
 }
 
 func (p *Pool[T]) UpdateTotalQueueSize(delta int64) {
@@ -2029,12 +2004,12 @@ type workerState[T any] struct {
 	logger       Logger
 }
 
-type State[T any] struct {
-	ID      int
-	Paused  bool
-	Removed bool
-	HasTask bool
-	Data    interface{}
+type WorkerSnapshot[T any] struct {
+	ID       int
+	Paused   bool
+	Removed  bool
+	HasTask  bool
+	Metadata map[string]any
 }
 
 // Add adds a new worker to the pool
@@ -2087,9 +2062,20 @@ func (p *Pool[T]) Add(worker Worker[T], queue TaskQueue[T]) error {
 	}
 
 	// Redistribute tasks to include the new worker
-	p.redistributeAllTasks()
+	p.RedistributeAllTasks()
 
 	p.updateRateLimiterBurst()
+
+	// snapshot creation of worker
+	p.workersSnapshotMu.Lock()
+	p.workersSnapshot[workerID] = WorkerSnapshot[T]{
+		ID:       workerID,
+		Paused:   false,
+		Removed:  false,
+		HasTask:  false,
+		Metadata: nil,
+	}
+	p.workersSnapshotMu.Unlock()
 
 	if p.config.async {
 		go p.runWorker(state)
@@ -2295,7 +2281,7 @@ func (p *Pool[T]) Pause(id int) error {
 }
 
 // Redistribute all tasks among workers
-func (p *Pool[T]) redistributeAllTasks() {
+func (p *Pool[T]) RedistributeAllTasks() {
 	p.logger.Debug(p.ctx, "Redistributing all tasks among workers")
 
 	// Collect all tasks from all queues
@@ -2369,7 +2355,7 @@ func (p *Pool[T]) Resume(id int) error {
 	state.paused.Store(false)
 
 	// Redistribute tasks while holding both locks
-	p.redistributeAllTasks()
+	p.RedistributeAllTasks()
 
 	// Signal the worker to continue
 	state.cond.Signal()
@@ -2461,9 +2447,30 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 		p.logger.Debug(p.ctx, "Worker goroutine exited", "worker_id", state.id)
 	}()
 
+	var snapshot WorkerSnapshot[T]
+	p.workersSnapshotMu.Lock()
+	if _, ok := p.workersSnapshot[state.id]; !ok {
+		p.workersSnapshot[state.id] = WorkerSnapshot[T]{ID: state.id}
+	}
+	snapshot = p.workersSnapshot[state.id]
+	p.workersSnapshotMu.Unlock()
+
 	for {
+
+		snapshot.HasTask = false
+		snapshot.Paused = false
+		snapshot.Removed = false
+		snapshot.Metadata = nil
+		p.workersSnapshotMu.Lock()
+		p.workersSnapshot[state.id] = snapshot
+		p.workersSnapshotMu.Unlock()
+
 		// First check if we're removed without holding any locks
 		if state.removed.Load() {
+			snapshot.Removed = true
+			p.workersSnapshotMu.Lock()
+			p.workersSnapshot[state.id] = snapshot
+			p.workersSnapshotMu.Unlock()
 			p.logger.Debug(p.ctx, "Worker detected removal, exiting", "worker_id", state.id)
 			break
 		}
@@ -2472,6 +2479,10 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 		if state.paused.Load() {
 			state.mu.Lock()
 			for state.paused.Load() && !state.removed.Load() {
+				snapshot.Paused = true
+				p.workersSnapshotMu.Lock()
+				p.workersSnapshot[state.id] = snapshot
+				p.workersSnapshotMu.Unlock()
 				p.logger.Debug(p.ctx, "Worker is paused, waiting", "worker_id", state.id)
 				state.cond.Wait()
 			}
@@ -2505,6 +2516,10 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 
 		if !ok {
 			if state.removed.Load() {
+				snapshot.Removed = true
+				p.workersSnapshotMu.Lock()
+				p.workersSnapshot[state.id] = snapshot
+				p.workersSnapshotMu.Unlock()
 				p.mu.Unlock()
 				break
 			}
@@ -2521,6 +2536,12 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 			state.currentTask = task
 			state.mu.Unlock()
 
+			snapshot.HasTask = true
+			snapshot.Metadata = task.metadata
+			p.workersSnapshotMu.Lock()
+			p.workersSnapshot[state.id] = snapshot
+			p.workersSnapshotMu.Unlock()
+
 			p.logger.Debug(p.ctx, "Processing task", "worker_id", state.id, "task_data", task.data)
 
 			p.processTask(state, task)
@@ -2529,9 +2550,23 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 			state.currentTask = nil
 			state.mu.Unlock()
 
+			snapshot.HasTask = false
+			snapshot.Metadata = nil
+			p.workersSnapshotMu.Lock()
+			p.workersSnapshot[state.id] = snapshot
+			p.workersSnapshotMu.Unlock()
+
 			p.logger.Debug(p.ctx, "Completed task processing", "worker_id", state.id, "queue_size", p.QueueSize(), "total_processing", p.totalProcessing.Load())
 		}
 	}
+
+	snapshot.HasTask = false
+	snapshot.Paused = false
+	snapshot.Removed = true
+	snapshot.Metadata = nil
+	p.workersSnapshotMu.Lock()
+	p.workersSnapshot[state.id] = snapshot
+	p.workersSnapshotMu.Unlock()
 
 	// Trigger OnStop and OnRemove if not already called
 	state.callMethod("OnStop", state.ctx)
@@ -2581,6 +2616,19 @@ func (p *Pool[T]) run() {
 					continue
 				}
 
+				var snapshot WorkerSnapshot[T]
+
+				p.workersSnapshotMu.Lock()
+				if _, ok := p.workersSnapshot[workerID]; !ok {
+					p.workersSnapshot[workerID] = WorkerSnapshot[T]{ID: workerID}
+				}
+				snapshot = p.workersSnapshot[workerID]
+				snapshot.ID = workerID
+				snapshot.Paused = state.paused.Load()
+				snapshot.Removed = state.removed.Load()
+				p.workersSnapshot[workerID] = snapshot
+				p.workersSnapshotMu.Unlock()
+
 				state.mu.Lock()
 				if state.paused.Load() || state.removed.Load() {
 					state.mu.Unlock()
@@ -2596,6 +2644,12 @@ func (p *Pool[T]) run() {
 						hasWork = true
 					}
 				}
+
+				snapshot.HasTask = hasWork
+
+				p.workersSnapshotMu.Lock()
+				p.workersSnapshot[workerID] = snapshot
+				p.workersSnapshotMu.Unlock()
 			}
 
 			if !hasWork {
@@ -2618,6 +2672,11 @@ func (p *Pool[T]) run() {
 					continue
 				}
 
+				var snapshot WorkerSnapshot[T]
+				p.workersSnapshotMu.Lock()
+				snapshot = p.workersSnapshot[workerID]
+				p.workersSnapshotMu.Unlock()
+
 				state.mu.Lock()
 				if state.paused.Load() || state.removed.Load() {
 					state.mu.Unlock()
@@ -2630,11 +2689,23 @@ func (p *Pool[T]) run() {
 					continue
 				}
 
+				p.workersSnapshotMu.Lock()
+				snapshot.HasTask = true
+				snapshot.Metadata = task.metadata
+				p.workersSnapshot[workerID] = snapshot
+				p.workersSnapshotMu.Unlock()
+
 				state.mu.Lock()
 				state.currentTask = task
 				state.mu.Unlock()
 
 				p.processTask(state, task)
+
+				p.workersSnapshotMu.Lock()
+				snapshot.HasTask = false
+				snapshot.Metadata = nil
+				p.workersSnapshot[workerID] = snapshot
+				p.workersSnapshotMu.Unlock()
 
 				state.mu.Lock()
 				state.currentTask = nil

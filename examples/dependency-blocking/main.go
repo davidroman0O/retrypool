@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/davidroman0O/retrypool"
+	"github.com/k0kubun/pp/v3"
 )
 
 // Now the proper Blocking example
@@ -72,12 +73,17 @@ func (w *worker) Run(ctx context.Context, data task) error {
 
 func main() {
 	ctx := context.Background()
+	var dp *retrypool.BlockingPool[task, string, int]
+	var err error
 
-	dp, err := retrypool.NewBlockingPool[task, string, int](
+	dp, err = retrypool.NewBlockingPool[task, string, int](
 		ctx,
 		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[task] { return &worker{} }),
 		retrypool.WithBlockingOnGroupRemoved[task](func(groupID any, tasks []task) {
 			fmt.Println("Group", groupID, "is done")
+		}),
+		retrypool.WithBlockingSnapshotHandler[task](func() {
+			pp.Println(dp.GetSnapshot())
 		}),
 	)
 	if err != nil {

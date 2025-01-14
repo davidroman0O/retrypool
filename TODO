@@ -8,5 +8,6 @@ Info
 [ ] - Implement an helper to use the DependecyPool for the same API as that: https://github.com/Azure/go-workflow
 
 
-[ ] - Change design to gather metrics, we should have a channel - make a snapshot and return cached 
+[x] - Change design to gather metrics, we should have a channel - make a snapshot and return cached 
+[ ] - somehow unevenly distribution occurs
 

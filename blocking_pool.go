@@ -89,6 +89,8 @@ type BlockingConfig[T any] struct {
 	OnPoolClosed     func()
 
 	getData func(T) interface{}
+
+	onSnapshot func()
 }
 
 // BlockingPoolOption is a functional option for configuring the blocking pool
@@ -150,6 +152,12 @@ func WithBlockingMaxActivePools[T any](max int) BlockingPoolOption[T] {
 }
 
 // All the callback setters
+
+func WithBlockingSnapshotHandler[T any](cb func()) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.onSnapshot = cb
+	}
+}
 
 func WithBlockingLogger[T any](logger Logger) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
@@ -395,7 +403,7 @@ func (p *BlockingPool[T, GID, TID]) RangeWorkerQueues(f func(workerID int, queue
 	}
 }
 
-func (p *BlockingPool[T, GID, TID]) RangeWorkers(f func(workerID int, state State[T]) bool) {
+func (p *BlockingPool[T, GID, TID]) RangeWorkers(f func(workerID int, state WorkerSnapshot[T]) bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for _, pool := range p.pools {
@@ -439,9 +447,9 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 		WithLogger[T](p.config.logger),
 	}
 
-	if p.config.getData != nil {
-		options = append(options, WithGetData[T](p.config.getData))
-	}
+	// if p.config.getData != nil {
+	// 	options = append(options, WithGetData[T](p.config.getData))
+	// }
 
 	options = append(
 		options,
@@ -452,6 +460,9 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 			p.snapshotGroups[groupID] = ms
 			p.calculateMetricsSnapshot()
 			p.snapshotMu.Unlock()
+			if p.config.onSnapshot != nil {
+				p.config.onSnapshot()
+			}
 		}))
 
 	// Create pool with synchronous mode and single retry
@@ -757,6 +768,7 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 type submitConfig struct {
 	queueNotification     *QueuedNotification
 	processedNotification *ProcessedNotification
+	metadata              map[string]any
 }
 
 type SubmitOption[T any] func(*submitConfig)
@@ -770,6 +782,12 @@ func WithBlockingQueueNotification[T any](notification *QueuedNotification) Subm
 func WithBlockingProcessedNotification[T any](notification *ProcessedNotification) SubmitOption[T] {
 	return func(c *submitConfig) {
 		c.processedNotification = notification
+	}
+}
+
+func WithBlockingMetadata[T any](metadata map[string]any) SubmitOption[T] {
+	return func(c *submitConfig) {
+		c.metadata = metadata
 	}
 }
 
@@ -809,6 +827,9 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error
 	}
 	if cfg.processedNotification != nil {
 		state.options = append(state.options, WithProcessedNotification[T](cfg.processedNotification))
+	}
+	if cfg.metadata != nil {
+		state.options = append(state.options, WithMetadata[T](cfg.metadata))
 	}
 
 	p.mu.Lock()
