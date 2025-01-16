@@ -131,7 +131,7 @@ func main() {
 		retrypool.WithDelay[*retrypool.RequestResponse[Data, error]](time.Second),
 		retrypool.WithMaxDelay[*retrypool.RequestResponse[Data, error]](5*time.Second),
 		retrypool.WithMaxJitter[*retrypool.RequestResponse[Data, error]](500*time.Millisecond),
-		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[Data, error]](func(data *retrypool.RequestResponse[Data, error], err error) retrypool.TaskAction {
+		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[Data, error]](func(data *retrypool.RequestResponse[Data, error], metadata retrypool.Metadata, err error) retrypool.TaskAction {
 			data.ConsultRequest(func(d Data) error {
 				log.Printf("Task failed (URL: %s): %v", d.URL, err)
 				return nil

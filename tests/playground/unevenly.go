@@ -15,7 +15,11 @@ type worker struct{}
 
 func (w *worker) Run(ctx context.Context, data *retrypool.RequestResponse[int, struct{}]) error {
 
+	retrypool.SetTaskMetadata(ctx, map[string]any{"working": "yes"})
+
 	<-time.After(time.Millisecond * time.Duration(50+rand.Intn(10000)))
+
+	retrypool.SetTaskMetadata(ctx, map[string]any{"finished": "yes"})
 
 	return nil
 }
@@ -57,21 +61,27 @@ func main() {
 		retrypool.WithAttempts[*retrypool.RequestResponse[int, struct{}]](3),
 		retrypool.WithRoundRobinDistribution[*retrypool.RequestResponse[int, struct{}]](),
 		retrypool.WithSnapshots[*retrypool.RequestResponse[int, struct{}]](),
-		retrypool.WithSnapshotInterval[*retrypool.RequestResponse[int, struct{}]](time.Second),
-		retrypool.WithSnapshotCallback[*retrypool.RequestResponse[int, struct{}]](func(ms retrypool.MetricsSnapshot[*retrypool.RequestResponse[int, struct{}]]) {
-			pp.Println("player snapshot", ms)
-			// we have a bug of tasks queued being ONE worker instead of distributed properly
-			if detectUnevenDistribution(ms.TaskQueues) {
-				pool.RedistributeAllTasks()
-			}
-		}),
+		retrypool.WithSnapshotInterval[*retrypool.RequestResponse[int, struct{}]](time.Second/2),
+		retrypool.WithSnapshotCallback[*retrypool.RequestResponse[int, struct{}]](
+			func(ms retrypool.MetricsSnapshot[*retrypool.RequestResponse[int, struct{}]]) {
+				pp.Println("player snapshot", ms)
+				// we have a bug of tasks queued being ONE worker instead of distributed properly
+				if detectUnevenDistribution(ms.TaskQueues) {
+					pool.RedistributeAllTasks()
+				}
+			}),
 		retrypool.WithOnPanic[*retrypool.RequestResponse[int, struct{}]](func(recovery interface{}, stackTrace string) {
 			fmt.Println("detected panic", recovery, stackTrace)
 		}),
-		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[int, struct{}]](func(data *retrypool.RequestResponse[int, struct{}], err error) retrypool.TaskAction {
-			fmt.Println("task failed", data, err)
+		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[int, struct{}]](func(data *retrypool.RequestResponse[int, struct{}], metadata retrypool.Metadata, err error) retrypool.TaskAction {
+			fmt.Println("task failed", data, metadata, err)
 			return retrypool.TaskActionRetry
 		}),
+		retrypool.WithOnTaskSuccess[*retrypool.RequestResponse[int, struct{}]](
+			func(data *retrypool.RequestResponse[int, struct{}], metadata retrypool.Metadata) {
+				pp.Println("task success", data, metadata)
+			},
+		),
 	)
 
 	go func() {

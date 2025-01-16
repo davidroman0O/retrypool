@@ -473,14 +473,14 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 	)
 
 	// Set completion handler
-	pool.SetOnTaskSuccess(func(data T) {
+	pool.SetOnTaskSuccess(func(data T, metadata Metadata) {
 		p.config.logger.Debug(p.ctx, "Task completed successfully in group",
 			"group_id", groupID)
 		p.handleTaskCompletion(groupID, data)
 	})
 
 	// Add failure handler to trigger group cleanup
-	pool.SetOnTaskFailure(func(data T, err error) TaskAction {
+	pool.SetOnTaskFailure(func(data T, metadata Metadata, err error) TaskAction {
 		p.config.logger.Error(p.ctx, "Task failed in group",
 			"group_id", groupID,
 			"error", err)

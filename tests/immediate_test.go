@@ -79,7 +79,7 @@ func TestImmediateRetry(t *testing.T) {
 			worker.shouldFail[5] = true
 
 			options := []retrypool.Option[int]{
-				retrypool.WithOnTaskFailure[int](func(data int, err error) retrypool.TaskAction {
+				retrypool.WithOnTaskFailure[int](func(data int, metadata retrypool.Metadata, err error) retrypool.TaskAction {
 					return retrypool.TaskActionRetry
 				}),
 			}

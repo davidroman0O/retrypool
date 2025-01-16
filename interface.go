@@ -8,11 +8,11 @@ import (
 // Pooler is an interface that exposes all of the public methods of the Pool[T] struct.
 type Pooler[T any] interface {
 	// SetOnTaskSuccess sets the handler that will be called when a task succeeds.
-	SetOnTaskSuccess(handler func(data T))
+	SetOnTaskSuccess(handler func(data T, metadata Metadata))
 
 	// SetOnTaskFailure sets the handler that will be called when a task fails.
 	// The handler should return a TaskAction indicating how the pool should proceed.
-	SetOnTaskFailure(handler func(data T, err error) TaskAction)
+	SetOnTaskFailure(handler func(data T, metadata Metadata, err error) TaskAction)
 
 	SetOnTaskAttempt(handler func(task *Task[T], workerID int))
 

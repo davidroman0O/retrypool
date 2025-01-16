@@ -99,6 +99,8 @@ const (
 	TaskActionAddToDeadTasks                       // Add the task to dead tasks
 )
 
+const RetrypoolMetadataKey = "$retrypool"
+
 // NoWorkerPolicy defines the behavior when no workers are available
 type NoWorkerPolicy int
 
@@ -336,14 +338,14 @@ func (p *Pool[T]) RoundRobinIndex() int {
 }
 
 // SetOnTaskSuccess allows setting the onTaskSuccess handler after pool creation
-func (p *Pool[T]) SetOnTaskSuccess(handler func(data T)) {
+func (p *Pool[T]) SetOnTaskSuccess(handler func(data T, metadata Metadata)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.config.onTaskSuccess = handler
 }
 
 // SetOnTaskFailure allows setting the onTaskFailure handler after pool creation
-func (p *Pool[T]) SetOnTaskFailure(handler func(data T, err error) TaskAction) {
+func (p *Pool[T]) SetOnTaskFailure(handler func(data T, metadata Metadata, err error) TaskAction) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.config.onTaskFailure = handler
@@ -585,7 +587,7 @@ func WithRateLimit[T any](rps float64) Option[T] {
 }
 
 // WithOnTaskSuccess sets a callback for successful task completion
-func WithOnTaskSuccess[T any](handler func(data T)) Option[T] {
+func WithOnTaskSuccess[T any](handler func(data T, metadata Metadata)) Option[T] {
 	return func(p *Pool[T]) {
 		p.logger.Debug(p.ctx, "Setting OnTaskSuccess handler")
 		p.config.onTaskSuccess = handler
@@ -593,7 +595,7 @@ func WithOnTaskSuccess[T any](handler func(data T)) Option[T] {
 }
 
 // WithOnTaskFailure sets a callback for task failure
-func WithOnTaskFailure[T any](handler func(data T, err error) TaskAction) Option[T] {
+func WithOnTaskFailure[T any](handler func(data T, metadata Metadata, err error) TaskAction) Option[T] {
 	return func(p *Pool[T]) {
 		p.logger.Debug(p.ctx, "Setting OnTaskFailure handler")
 		p.config.onTaskFailure = handler
@@ -669,8 +671,8 @@ type Config[T any] struct {
 	maxQueueSize   int
 	onPanic        func(recovery interface{}, stackTrace string)
 	onWorkerPanic  func(workerID int, recovery interface{}, stackTrace string)
-	onTaskSuccess  func(data T)
-	onTaskFailure  func(data T, err error) TaskAction
+	onTaskSuccess  func(data T, metadata Metadata)
+	onTaskFailure  func(data T, metadata Metadata, err error) TaskAction
 	onDeadTask     func(deadTaskIndex int)
 	onTaskAttempt  func(task *Task[T], workerID int)
 	deadTasksLimit int
@@ -748,10 +750,35 @@ type Metrics struct {
 	DeadTasks      atomic.Int64
 }
 
+type Metadata map[string]any
+
+func (m Metadata) Clone() Metadata {
+	clone := make(Metadata, len(m))
+	for k, v := range m {
+		clone[k] = v
+	}
+	return clone
+}
+
+func (m Metadata) Merge(other Metadata) Metadata {
+	for k, v := range other {
+		m[k] = v
+	}
+	return m
+}
+
+func (m Metadata) Get(key string) any {
+	return m[key]
+}
+
+func (m Metadata) Set(key string, value any) {
+	m[key] = value
+}
+
 // Task represents a task in the pool
 type Task[T any] struct {
 	mu                deadlock.Mutex
-	metadata          map[string]any // `retrypool`'s design doesn't allow to access to `data` directly, so we need to store the metadata
+	metadata          Metadata // `retrypool`'s design doesn't allow to access to `data` directly, so we need to store the metadata
 	data              T
 	retries           int
 	totalDuration     time.Duration
@@ -776,7 +803,7 @@ type Task[T any] struct {
 	stateHistory      []*TaskStateTransition[T]
 }
 
-func (t *Task[T]) GetMetadata() interface{} {
+func (t *Task[T]) GetMetadata() Metadata {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.metadata
@@ -955,7 +982,7 @@ type DeadTask[T any] struct {
 type TaskOption[T any] func(*Task[T])
 
 // WithMetadata sets metadata for the task
-func WithMetadata[T any](metadata map[string]any) TaskOption[T] {
+func WithMetadata[T any](metadata Metadata) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.metadata = metadata
 	}
@@ -1060,7 +1087,11 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	}
 
 	t := p.taskPool.Get().(*Task[T])
-	*t = Task[T]{data: data, state: TaskStateCreated}
+	*t = Task[T]{
+		data:     data,
+		state:    TaskStateCreated,
+		metadata: make(Metadata),
+	}
 
 	for _, option := range options {
 		option(t)
@@ -2009,7 +2040,7 @@ type WorkerSnapshot[T any] struct {
 	Paused   bool
 	Removed  bool
 	HasTask  bool
-	Metadata map[string]any
+	Metadata Metadata
 }
 
 // Add adds a new worker to the pool
@@ -2455,12 +2486,13 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 	snapshot = p.workersSnapshot[state.id]
 	p.workersSnapshotMu.Unlock()
 
+	// worker loop
 	for {
 
 		snapshot.HasTask = false
 		snapshot.Paused = false
 		snapshot.Removed = false
-		snapshot.Metadata = nil
+		snapshot.Metadata = make(Metadata)
 		p.workersSnapshotMu.Lock()
 		p.workersSnapshot[state.id] = snapshot
 		p.workersSnapshotMu.Unlock()
@@ -2532,12 +2564,24 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 
 		// Now process the task
 		if task != nil {
+			task.mu.Lock()
+			if task.metadata == nil {
+				task.metadata = make(Metadata)
+			}
+			task.metadata.Set(
+				RetrypoolMetadataKey,
+				map[string]any{
+					"worker_id": state.id,
+					"assigned":  time.Now(),
+				})
+			task.mu.Unlock()
+
 			state.mu.Lock()
 			state.currentTask = task
 			state.mu.Unlock()
 
 			snapshot.HasTask = true
-			snapshot.Metadata = task.metadata
+			snapshot.Metadata = task.metadata.Clone() // only for snapshot // TODO: all those allocations could be in a sync.Pool
 			p.workersSnapshotMu.Lock()
 			p.workersSnapshot[state.id] = snapshot
 			p.workersSnapshotMu.Unlock()
@@ -2689,6 +2733,15 @@ func (p *Pool[T]) run() {
 					continue
 				}
 
+				task.mu.Lock()
+				task.metadata.Set(
+					RetrypoolMetadataKey,
+					map[string]any{
+						"worker_id": state.id,
+						"assigned":  time.Now(),
+					})
+				task.mu.Unlock()
+
 				p.workersSnapshotMu.Lock()
 				snapshot.HasTask = true
 				snapshot.Metadata = task.metadata
@@ -2780,6 +2833,9 @@ func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
 	}
 	defer cancel()
 
+	// Enhance task context with metadata setter
+	ctx = p.enhanceTaskContext(ctx, task)
+
 	// Before processing the task
 	if err := p.TransitionTaskState(task, TaskStateRunning, "Task processing started"); err != nil {
 		p.logger.Warn(p.ctx, "Failed to transition task state", "error", err, "worker_id", state.id, "task_data", task.data)
@@ -2794,6 +2850,40 @@ func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
 
 	// Handle task completion
 	p.handleTaskCompletion(state, task, err)
+}
+
+const contextMetadataSetKey = "$context_metadata_set"
+
+type TaskMetadataSetter func(metadata Metadata)
+
+func SetTaskMetadata(ctx context.Context, metadata Metadata) error {
+	if ctx == nil {
+		return errors.New("context is nil")
+	}
+
+	if setter, ok := ctx.Value(contextMetadataSetKey).(TaskMetadataSetter); ok {
+		setter(metadata)
+	} else {
+		return errors.New("task metadata setter not found in context")
+	}
+
+	return nil
+}
+
+func (p *Pool[T]) enhanceTaskContext(ctx context.Context, task *Task[T]) context.Context {
+	if ctx.Value(contextMetadataSetKey) != nil {
+		return ctx
+	}
+
+	funcMetadataSet := TaskMetadataSetter(func(metadata Metadata) {
+		task.mu.Lock()
+		task.metadata = metadata.Merge(task.metadata)
+		task.mu.Unlock()
+	})
+
+	ctx = context.WithValue(ctx, contextMetadataSetKey, funcMetadataSet)
+
+	return ctx
 }
 
 // createTaskContext creates a new context for a task attempt, ensuring that both per-attempt and total task timeouts are enforced.
@@ -2912,10 +3002,16 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 	state.currentTask = nil
 	state.mu.Unlock()
 
+	task.mu.Lock()
+	metaBuffer := task.metadata.Get(RetrypoolMetadataKey).(map[string]any)
+	metaBuffer["completed"] = time.Now()
+	task.metadata.Set(RetrypoolMetadataKey, metaBuffer)
+	task.mu.Unlock()
+
 	p.logger.Debug(p.ctx, "Checking task success callback", "has_callback", p.config.onTaskSuccess != nil)
 
 	if p.config.onTaskSuccess != nil {
-		p.config.onTaskSuccess(task.data)
+		p.config.onTaskSuccess(task.data, task.metadata)
 	}
 
 	if task.notifiedProcessed != nil {
@@ -2947,7 +3043,7 @@ func (p *Pool[T]) handleTaskFailure(task *Task[T], err error) {
 
 	action := TaskActionRetry
 	if p.config.onTaskFailure != nil {
-		action = p.config.onTaskFailure(task.data, err)
+		action = p.config.onTaskFailure(task.data, task.metadata, err)
 	}
 
 	p.logger.Debug(p.ctx, "Handling task failure", "task_data", task.data, "action", action, "bounce_retry", task.bounceRetry)
