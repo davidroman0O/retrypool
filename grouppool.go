@@ -883,7 +883,7 @@ type GroupRequestResponse[T any, R any, GID comparable] struct {
 }
 
 // NewGroupRequestResponse creates a new GroupRequestResponse instance
-func NewGroupRequestResponse[T any, R any, GID comparable, TID comparable](request T, gid GID) *GroupRequestResponse[T, R, GID] {
+func NewGroupRequestResponse[T any, R any, GID comparable](request T, gid GID) *GroupRequestResponse[T, R, GID] {
 	return &GroupRequestResponse[T, R, GID]{
 		request: request,
 		done:    make(chan struct{}),
