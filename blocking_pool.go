@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/k0kubun/pp/v3"
 	"github.com/sasha-s/go-deadlock"
 )
 
@@ -339,6 +340,16 @@ func (p *BlockingPool[T, GID, TID]) trySubmitCachedStates(groupID GID) {
 
 	// Try to submit cached states
 	for _, state := range currentStates {
+		// completion check
+		state.mu.Lock()
+		if state.completed {
+			state.mu.Unlock()
+			continue // Skip already completed tasks
+		}
+		state.mu.Unlock()
+
+		pp.Println("Submitting cached task", "groupID", state.groupID, "taskID", state.taskID)
+
 		err := pool.SubmitToFreeWorker(state.task, state.options...)
 		if err != nil {
 			remainingStates = append(remainingStates, state)
@@ -491,19 +502,16 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 
 		// Get group's tasks without holding the pool lock
 		var tasks []T
-		p.mu.Lock()
+
 		group := p.groups[groupID]
 		if group != nil {
-			group.mu.Lock()
 			for _, taskState := range group.tasks {
 				tasks = append(tasks, taskState.task)
 			}
-			group.mu.Unlock()
 			p.config.logger.Debug(p.ctx, "Collected tasks for failed group",
 				"group_id", groupID,
 				"task_count", len(tasks))
 		}
-		p.mu.Unlock()
 
 		// Call callbacks before acquiring any locks
 		if p.config.OnGroupFailed != nil {
@@ -534,9 +542,6 @@ func (p *BlockingPool[T, GID, TID]) cleanupGroup(groupID GID, tasks []T) {
 	p.config.logger.Debug(p.ctx, "Starting group cleanup",
 		"group_id", groupID,
 		"task_count", len(tasks))
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	// First check if the group still exists
 	if _, exists := p.groups[groupID]; !exists {
@@ -664,6 +669,11 @@ func (p *BlockingPool[T, GID, TID]) releaseGroupPool(groupID GID) error {
 				// Submit all pending tasks
 				for _, task := range pendingTasks {
 					task.mu.Lock()
+					if task.completed {
+						task.mu.Unlock()
+						continue
+					}
+					pp.Println("Submitting pending task", "groupID", task.groupID, "taskID", task.taskID)
 					if err := newPool.SubmitToFreeWorker(task.task, task.options...); err != nil {
 						p.config.logger.Error(p.ctx, "Failed to submit pending task",
 							"group_id", nextGroupID,
@@ -813,7 +823,7 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error
 		taskID:       taskID,
 		groupID:      groupID,
 		completionCh: make(chan struct{}),
-		options:      []TaskOption[T]{WithBounceRetry[T]()},
+		options:      []TaskOption[T]{WithTaskBounceRetry[T]()},
 	}
 
 	// Add any additional options
@@ -823,13 +833,13 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error
 	}
 
 	if cfg.queueNotification != nil {
-		state.options = append(state.options, WithQueuedNotification[T](cfg.queueNotification))
+		state.options = append(state.options, WithTaskQueuedNotification[T](cfg.queueNotification))
 	}
 	if cfg.processedNotification != nil {
-		state.options = append(state.options, WithProcessedNotification[T](cfg.processedNotification))
+		state.options = append(state.options, WithTaskProcessedNotification[T](cfg.processedNotification))
 	}
 	if cfg.metadata != nil {
-		state.options = append(state.options, WithMetadata[T](cfg.metadata))
+		state.options = append(state.options, WithTaskMetadata[T](cfg.metadata))
 	}
 
 	p.mu.Lock()
@@ -958,8 +968,10 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 		return
 	}
 
+	task.mu.Lock()
 	task.completed = true
 	close(task.completionCh)
+	task.mu.Unlock()
 	group.completed[taskID] = true
 
 	p.config.logger.Debug(p.ctx, "Task marked as completed",
