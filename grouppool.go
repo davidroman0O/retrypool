@@ -839,6 +839,25 @@ outer:
 	}
 }
 
+// Scale the amount of parallel pools that can be active at the same time
+func (p *GroupPool[T, GID]) SetConcurrentPools(max int) {
+	if max < 1 {
+		max = 1
+	}
+	p.mu.Lock()
+	p.config.MaxActivePools = max
+	p.mu.Unlock()
+}
+
+func (p *GroupPool[T, GID]) SetConcurrentWorkers(max int) {
+	if max < 1 {
+		max = 1
+	}
+	p.mu.Lock()
+	p.config.MaxWorkersPerPool = max
+	p.mu.Unlock()
+}
+
 // AddWorkerToPool forcibly adds a worker to a specific internal pool ID. Respects MaxWorkersPerPool.
 func (gp *GroupPool[T, GID]) AddWorkerToPool(poolID uint, queue TaskQueue[T]) error {
 	gp.mu.Lock()
