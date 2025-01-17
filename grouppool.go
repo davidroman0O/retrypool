@@ -596,23 +596,16 @@ outer:
 }
 
 // PullDeadTask removes and returns a dead task at the specified index, scanning each pool in turn.
-func (gp *GroupPool[T, GID]) PullDeadTask(idx int) (*DeadTask[T], error) {
+func (gp *GroupPool[T, GID]) PullDeadTask(poolID uint, idx int) (*DeadTask[T], error) {
 	gp.mu.Lock()
 	defer gp.mu.Unlock()
-
-	offset := 0
-	for _, it := range gp.pools {
-		it.mu.RLock()
-		pool := it.Pool
-		deadCount := int(pool.DeadTaskCount())
-		it.mu.RUnlock()
-		if idx < offset+deadCount {
-			local := idx - offset
-			return pool.PullDeadTask(local)
-		}
-		offset += deadCount
+	if pool, ok := gp.pools[poolID]; !ok {
+		return nil, fmt.Errorf("pool %d not found", poolID)
+	} else {
+		pool.mu.RLock()
+		defer pool.mu.RUnlock()
+		return pool.Pool.PullDeadTask(idx)
 	}
-	return nil, fmt.Errorf("index out of range")
 }
 
 // PullRangeDeadTasks removes and returns a range of dead tasks [from, to) across all pools.
