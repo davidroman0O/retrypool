@@ -201,6 +201,7 @@ func NewGroupPool[T GroupTask[GID], GID comparable](
 	return gp, nil
 }
 
+// GroupMetricsSnapshot holds aggregated metrics across all groups.
 type GroupMetricsSnapshot[T any, GID comparable] struct {
 	TotalTasksSubmitted int64
 	TotalTasksProcessed int64
@@ -372,9 +373,10 @@ func (gp *GroupPool[T, GID]) handleTaskCompletion(poolID uint) {
 	q := it.Pool.QueueSize()
 	p := it.Pool.ProcessingCount()
 	if q == 0 && p == 0 {
-		// This pool is done with its group. Let's free it.
-		_ = gp.releasePool(poolID)
-		// Now that we have a free pool, let's see if we can consume pending tasks from any group
+		errRelease := gp.releasePool(poolID)
+		if errRelease != nil {
+			gp.config.Logger.Warn(gp.ctx, "Error releasing pool", "pool_id", poolID, "error", errRelease)
+		}
 		gp.consumePendingGroupsLocked()
 	}
 }
@@ -395,7 +397,10 @@ func (gp *GroupPool[T, GID]) consumePendingGroupsLocked() {
 		// We got a pool, let's submit all tasks
 		delete(gp.pendingTasks, groupID)
 		for _, t := range tasks {
-			_ = gp.submitToPool(poolItem, t) // ignoring error for brevity
+			subErr := gp.submitToPool(poolItem, t)
+			if subErr != nil {
+				gp.config.Logger.Warn(gp.ctx, "Error while submitting pending tasks to pool", "error", subErr)
+			}
 		}
 	}
 }
@@ -500,6 +505,7 @@ func (gp *GroupPool[T, GID]) Submit(task T, options ...GroupTaskOption[T, GID]) 
 }
 
 // submitToPool tries to submit one task to the assigned pool. If we only want free workers, we attempt scaling.
+// If ErrNoWorkersAvailable is encountered, we add the task to pendingTasks for later processing.
 func (gp *GroupPool[T, GID]) submitToPool(it *poolItem[T, GID], t T, opts ...GroupTaskOption[T, GID]) error {
 	options := []TaskOption[T]{}
 	cfg := &groupSubmitConfig{}
@@ -515,6 +521,7 @@ func (gp *GroupPool[T, GID]) submitToPool(it *poolItem[T, GID], t T, opts ...Gro
 	if cfg.metadata != nil {
 		options = append(options, WithTaskMetadata[T](cfg.metadata))
 	}
+
 	if gp.config.UseFreeWorkerOnly {
 		if err := gp.scaleWorkersIfNeeded(it); err != nil && err != ErrNoWorkersAvailable {
 			return err
@@ -525,10 +532,20 @@ func (gp *GroupPool[T, GID]) submitToPool(it *poolItem[T, GID], t T, opts ...Gro
 				return scErr
 			}
 			subErr = it.Pool.SubmitToFreeWorker(t, options...)
+			if subErr == ErrNoWorkersAvailable {
+				gp.pendingTasks[t.GetGroupID()] = append(gp.pendingTasks[t.GetGroupID()], t)
+				return nil
+			}
+		}
+		return subErr
+	} else {
+		subErr := it.Pool.Submit(t, options...)
+		if subErr == ErrNoWorkersAvailable {
+			gp.pendingTasks[t.GetGroupID()] = append(gp.pendingTasks[t.GetGroupID()], t)
+			return nil
 		}
 		return subErr
 	}
-	return it.Pool.Submit(t, options...)
 }
 
 // CloseGroup forcibly closes the pool that is assigned to the given group, removing that pool
@@ -1018,11 +1035,11 @@ func (rr *GroupRequestResponse[T, R, GID]) Done() <-chan struct{} {
 
 // Err returns any error that occurred during the request
 func (rr *GroupRequestResponse[T, R, GID]) Err() error {
-	var err error
+	var e error
 	rr.mu.RLock()
-	err = rr.err
+	e = rr.err
 	rr.mu.RUnlock()
-	return err
+	return e
 }
 
 // Wait waits for the request to complete and returns the response and any error
