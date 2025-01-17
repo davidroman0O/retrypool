@@ -383,19 +383,19 @@ type groupSubmitConfig struct {
 
 type GroupTaskOption[T any, GID comparable] func(*groupSubmitConfig)
 
-func WithGroupQueueNotification[T any, GID comparable](notification *QueuedNotification) GroupTaskOption[T, GID] {
+func WithTaskGroupQueueNotification[T any, GID comparable](notification *QueuedNotification) GroupTaskOption[T, GID] {
 	return func(c *groupSubmitConfig) {
 		c.queueNotification = notification
 	}
 }
 
-func WithGroupProcessedNotification[T any, GID comparable](notification *ProcessedNotification) GroupTaskOption[T, GID] {
+func WithTaskGroupProcessedNotification[T any, GID comparable](notification *ProcessedNotification) GroupTaskOption[T, GID] {
 	return func(c *groupSubmitConfig) {
 		c.processedNotification = notification
 	}
 }
 
-func WithGroupMetadata[T any, GID comparable](metadata map[string]any) GroupTaskOption[T, GID] {
+func WithTaskGroupMetadata[T any, GID comparable](metadata map[string]any) GroupTaskOption[T, GID] {
 	return func(c *groupSubmitConfig) {
 		c.metadata = metadata
 	}
