@@ -996,65 +996,65 @@ func WithTaskMetadata[T any](metadata Metadata) TaskOption[T] {
 	}
 }
 
-// WithImmediateRetry allows the submitted task to retry immediately
-func WithImmediateRetry[T any]() TaskOption[T] {
+// WithTaskImmediateRetry allows the submitted task to retry immediately
+func WithTaskImmediateRetry[T any]() TaskOption[T] {
 	return func(t *Task[T]) {
 		t.immediateRetry = true
 	}
 }
 
-// WithBounceRetry enables retry on different workers
-func WithBounceRetry[T any]() TaskOption[T] {
+// WithTaskBounceRetry enables retry on different workers
+func WithTaskBounceRetry[T any]() TaskOption[T] {
 	return func(t *Task[T]) {
 		t.bounceRetry = true
 		t.attemptedWorkers = make(map[int]struct{})
 	}
 }
 
-// WithDuration sets a per-attempt time limit for the task
-func WithDuration[T any](d time.Duration) TaskOption[T] {
+// WithTaskDuration sets a per-attempt time limit for the task
+func WithTaskDuration[T any](d time.Duration) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.attemptTimeout = d
 	}
 }
 
-// WithTimeout sets a total time limit for the task
-func WithTimeout[T any](d time.Duration) TaskOption[T] {
+// WithTaskTimeout sets a total time limit for the task
+func WithTaskTimeout[T any](d time.Duration) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.totalTimeout = d
 	}
 }
 
-// WithProcessedNotification sets a notification for when a task is processed
-func WithProcessedNotification[T any](n *ProcessedNotification) TaskOption[T] {
+// WithTaskProcessedNotification sets a notification for when a task is processed
+func WithTaskProcessedNotification[T any](n *ProcessedNotification) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.notifiedProcessed = n
 	}
 }
 
-// WithQueuedNotification sets a notification for when a task is queued
-func WithQueuedNotification[T any](n *QueuedNotification) TaskOption[T] {
+// WithTaskQueuedNotification sets a notification for when a task is queued
+func WithTaskQueuedNotification[T any](n *QueuedNotification) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.notifiedQueued = n
 	}
 }
 
-// WithQueuedCb sets a callback for when a task is queued
-func WithQueuedCb[T any](cb func()) TaskOption[T] {
+// WithTaskQueuedCb sets a callback for when a task is queued
+func WithTaskQueuedCb[T any](cb func()) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.queuedCb = cb
 	}
 }
 
-// WithProcessedCb sets a callback for when a task is processed
-func WithProcessedCb[T any](cb func()) TaskOption[T] {
+// WithTaskProcessedCb sets a callback for when a task is processed
+func WithTaskProcessedCb[T any](cb func()) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.processedCb = cb
 	}
 }
 
-// WithRunningCb sets a callback for when a task is running
-func WithRunningCb[T any](cb func()) TaskOption[T] {
+// WithTaskRunningCb sets a callback for when a task is running
+func WithTaskRunningCb[T any](cb func()) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.runningCb = cb
 	}

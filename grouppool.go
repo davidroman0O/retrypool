@@ -30,6 +30,8 @@ type GroupPoolConfig[T any, GID comparable] struct {
 	OnTaskAttempt func(gid GID, poolID uint, task *Task[T], workerID int)
 	// Called whenever we get a snapshot from an underlying Pool. We pass that snapshot.
 	OnSnapshot func(snapshot MetricsSnapshot[T])
+
+	metadata Metadata
 }
 
 // GroupPoolOption is a functional option for configuring a GroupPool.
@@ -86,6 +88,12 @@ func WithGroupPoolOnTaskAttempt[T any, GID comparable](cb func(gid GID, poolID u
 func WithGroupPoolOnSnapshot[T any, GID comparable](cb func(snapshot MetricsSnapshot[T])) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.OnSnapshot = cb
+	}
+}
+
+func WithGroupPoolMetadata[T any, GID comparable](m Metadata) GroupPoolOption[T, GID] {
+	return func(cfg *GroupPoolConfig[T, GID]) {
+		cfg.metadata = m
 	}
 }
 
@@ -367,10 +375,36 @@ func (gp *GroupPool[T, GID]) scaleWorkersIfNeeded(it *poolItem[T, GID]) error {
 	return ErrNoWorkersAvailable
 }
 
+type groupSubmitConfig struct {
+	queueNotification     *QueuedNotification
+	processedNotification *ProcessedNotification
+	metadata              map[string]any
+}
+
+type GroupTaskOption[T any, GID comparable] func(*groupSubmitConfig)
+
+func WithGroupQueueNotification[T any, GID comparable](notification *QueuedNotification) GroupTaskOption[T, GID] {
+	return func(c *groupSubmitConfig) {
+		c.queueNotification = notification
+	}
+}
+
+func WithGroupProcessedNotification[T any, GID comparable](notification *ProcessedNotification) GroupTaskOption[T, GID] {
+	return func(c *groupSubmitConfig) {
+		c.processedNotification = notification
+	}
+}
+
+func WithGroupMetadata[T any, GID comparable](metadata map[string]any) GroupTaskOption[T, GID] {
+	return func(c *groupSubmitConfig) {
+		c.metadata = metadata
+	}
+}
+
 // Submit enqueues a task for its group. If the group already has a pool, we submit. Otherwise,
 // we try to assign one. If we can't, tasks go to pending for that group. We'll attempt to
 // consume pending whenever a pool is freed.
-func (gp *GroupPool[T, GID]) Submit(task T, options ...TaskOption[T]) error {
+func (gp *GroupPool[T, GID]) Submit(task T, options ...GroupTaskOption[T, GID]) error {
 	gid := task.GetGroupID()
 
 	gp.mu.Lock()
@@ -411,21 +445,35 @@ func (gp *GroupPool[T, GID]) Submit(task T, options ...TaskOption[T]) error {
 }
 
 // submitToPool tries to submit one task to the assigned pool. If we only want free workers, we attempt scaling.
-func (gp *GroupPool[T, GID]) submitToPool(it *poolItem[T, GID], t T, opts ...TaskOption[T]) error {
+func (gp *GroupPool[T, GID]) submitToPool(it *poolItem[T, GID], t T, opts ...GroupTaskOption[T, GID]) error {
+	options := []TaskOption[T]{}
+	cfg := &groupSubmitConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if cfg.queueNotification != nil {
+		options = append(options, WithTaskQueuedNotification[T](cfg.queueNotification))
+	}
+	if cfg.processedNotification != nil {
+		options = append(options, WithTaskProcessedNotification[T](cfg.processedNotification))
+	}
+	if cfg.metadata != nil {
+		options = append(options, WithTaskMetadata[T](cfg.metadata))
+	}
 	if gp.config.UseFreeWorkerOnly {
 		if err := gp.scaleWorkersIfNeeded(it); err != nil && err != ErrNoWorkersAvailable {
 			return err
 		}
-		subErr := it.Pool.SubmitToFreeWorker(t, opts...)
+		subErr := it.Pool.SubmitToFreeWorker(t, options...)
 		if subErr == ErrNoWorkersAvailable {
 			if scErr := gp.scaleWorkersIfNeeded(it); scErr != nil && scErr != ErrNoWorkersAvailable {
 				return scErr
 			}
-			subErr = it.Pool.SubmitToFreeWorker(t, opts...)
+			subErr = it.Pool.SubmitToFreeWorker(t, options...)
 		}
 		return subErr
 	}
-	return it.Pool.Submit(t, opts...)
+	return it.Pool.Submit(t, options...)
 }
 
 // CloseGroup forcibly closes the pool that is assigned to the given group, removing that pool

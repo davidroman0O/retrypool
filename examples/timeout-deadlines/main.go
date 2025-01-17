@@ -46,7 +46,7 @@ func main() {
 	fmt.Println("Submitting tasks with per-attempt timeout:")
 	for i := 1; i <= 3; i++ {
 		err := pool.Submit(i,
-			retrypool.WithDuration[int](2*time.Second), // Each attempt has 2 seconds
+			retrypool.WithTaskDuration[int](2*time.Second), // Each attempt has 2 seconds
 		)
 		if err != nil {
 			fmt.Println("Error submitting task:", err)
@@ -57,7 +57,7 @@ func main() {
 	fmt.Println("\nSubmitting tasks with total timeout:")
 	for i := 4; i <= 6; i++ {
 		err := pool.Submit(i,
-			retrypool.WithTimeout[int](3*time.Second), // Entire task must finish in 3 seconds
+			retrypool.WithTaskTimeout[int](3*time.Second), // Entire task must finish in 3 seconds
 		)
 		if err != nil {
 			fmt.Println("Error submitting task:", err)

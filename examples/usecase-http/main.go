@@ -146,7 +146,7 @@ func main() {
 			Payload: map[string]interface{}{"key": fmt.Sprintf("value%d", i)},
 		})
 
-		err := pool.Submit(task, retrypool.WithBounceRetry[*retrypool.RequestResponse[Data, error]]())
+		err := pool.Submit(task, retrypool.WithTaskBounceRetry[*retrypool.RequestResponse[Data, error]]())
 		if err != nil {
 			log.Printf("Failed to dispatch task: %v", err)
 			continue

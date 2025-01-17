@@ -101,7 +101,7 @@ func TestImmediateRetry(t *testing.T) {
 					defer wg.Done()
 					var err error
 					if worker.shouldFail[i] {
-						err = pool.Submit(i, retrypool.WithImmediateRetry[int]())
+						err = pool.Submit(i, retrypool.WithTaskImmediateRetry[int]())
 					} else {
 						err = pool.Submit(i)
 					}

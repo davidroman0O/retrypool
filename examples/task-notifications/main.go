@@ -42,8 +42,8 @@ func main() {
 
 		// Submit task with notifications
 		err := pool.Submit(TaskData{ID: taskID},
-			retrypool.WithQueuedNotification[TaskData](queuedNotif),
-			retrypool.WithProcessedNotification[TaskData](processedNotif),
+			retrypool.WithTaskQueuedNotification[TaskData](queuedNotif),
+			retrypool.WithTaskProcessedNotification[TaskData](processedNotif),
 		)
 		if err != nil {
 			fmt.Printf("Error submitting task ID %d: %v\n", taskID, err)
