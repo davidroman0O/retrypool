@@ -32,10 +32,18 @@ type GroupPoolConfig[T any, GID comparable] struct {
 	OnSnapshot func(snapshot MetricsSnapshot[T])
 
 	metadata Metadata
+
+	onSnapshot func()
 }
 
 // GroupPoolOption is a functional option for configuring a GroupPool.
 type GroupPoolOption[T any, GID comparable] func(cfg *GroupPoolConfig[T, GID])
+
+func WithGroupSnapshotHandler[T any, GID comparable](cb func()) GroupPoolOption[T, GID] {
+	return func(c *GroupPoolConfig[T, GID]) {
+		c.onSnapshot = cb
+	}
+}
 
 func WithGroupPoolLogger[T any, GID comparable](logger Logger) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
@@ -125,6 +133,10 @@ type GroupPool[T GroupTask[GID], GID comparable] struct {
 	nextID       uint
 	pools        map[uint]*poolItem[T, GID] // all known pools
 	pendingTasks map[GID][]T                // tasks for groups without an assigned pool
+
+	snapshotMu     deadlock.RWMutex // Protects access to the snapshot
+	snapshotGroups map[GID]MetricsSnapshot[T]
+	snapshot       GroupMetricsSnapshot[T, GID]
 }
 
 // NewGroupPool constructs a new GroupPool with the supplied options.
@@ -178,14 +190,46 @@ func NewGroupPool[T GroupTask[GID], GID comparable](
 
 	c, cancel := context.WithCancel(ctx)
 	gp = &GroupPool[T, GID]{
-		ctx:          c,
-		cancel:       cancel,
-		config:       cfg,
-		nextID:       0,
-		pools:        make(map[uint]*poolItem[T, GID]),
-		pendingTasks: make(map[GID][]T),
+		ctx:            c,
+		cancel:         cancel,
+		config:         cfg,
+		nextID:         0,
+		pools:          make(map[uint]*poolItem[T, GID]),
+		pendingTasks:   make(map[GID][]T),
+		snapshotGroups: make(map[GID]MetricsSnapshot[T]),
 	}
 	return gp, nil
+}
+
+type GroupMetricsSnapshot[T any, GID comparable] struct {
+	TotalTasksSubmitted int64
+	TotalTasksProcessed int64
+	TotalTasksSucceeded int64
+	TotalTasksFailed    int64
+	TotalDeadTasks      int64
+	Metrics             []GroupMetricSnapshot[T, GID]
+}
+
+func (p *GroupPool[T, GID]) GetSnapshot() GroupMetricsSnapshot[T, GID] {
+	p.snapshotMu.RLock()
+	defer p.snapshotMu.RUnlock()
+	return p.snapshot
+}
+
+func (p *GroupPool[T, GID]) calculateMetricsSnapshot() {
+	snapshot := GroupMetricsSnapshot[T, GID]{}
+	for id, metric := range p.snapshotGroups {
+		snapshot.TotalTasksSubmitted += metric.TasksSubmitted
+		snapshot.TotalTasksProcessed += metric.TasksProcessed
+		snapshot.TotalTasksSucceeded += metric.TasksSucceeded
+		snapshot.TotalTasksFailed += metric.TasksFailed
+		snapshot.TotalDeadTasks += metric.DeadTasks
+		snapshot.Metrics = append(snapshot.Metrics, GroupMetricSnapshot[T, GID]{
+			GroupID:         id,
+			MetricsSnapshot: metric,
+		})
+	}
+	p.snapshot = snapshot
 }
 
 // buildPool creates a new poolItem with the next available internal ID, wiring up user callbacks.
@@ -206,6 +250,16 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
 		WithSnapshotInterval[T](time.Second / 4),
 		WithSnapshots[T](),
 		WithMetadata[T](metadata),
+		WithSnapshotCallback[T](func(ms MetricsSnapshot[T]) {
+			gp.snapshotMu.Lock()
+			gp.pools[id].mu.Lock()
+			gp.snapshotGroups[gp.pools[id].assignedGroup] = ms
+			gp.calculateMetricsSnapshot()
+			gp.snapshotMu.Unlock()
+			if gp.config.onSnapshot != nil {
+				gp.config.onSnapshot()
+			}
+		}),
 	}
 
 	// We already wrapped OnTaskSuccess/OnTaskFailure in the constructor,
