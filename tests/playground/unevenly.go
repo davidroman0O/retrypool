@@ -87,7 +87,7 @@ func main() {
 	go func() {
 		for i := range 100 {
 			<-time.After(time.Millisecond * time.Duration(50+rand.Intn(500)))
-			pool.Submit(retrypool.NewRequestResponse[int, struct{}](i), retrypool.WithMetadata[*retrypool.RequestResponse[int, struct{}]](map[string]any{"idx": i}))
+			pool.Submit(retrypool.NewRequestResponse[int, struct{}](i), retrypool.WithTaskMetadata[*retrypool.RequestResponse[int, struct{}]](map[string]any{"idx": i}))
 		}
 	}()
 

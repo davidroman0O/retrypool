@@ -46,7 +46,7 @@ func main() {
 	fmt.Println("Submitting tasks with immediate retry:")
 	for i := 1; i <= 5; i++ {
 		// All those tasks will stay fixed on their worker but they will try to retry by taking the first position in the taskqueue of their worker (taskqueue != current task)
-		err := pool.Submit(i, retrypool.WithImmediateRetry[int](), retrypool.WithMetadata[int](map[string]interface{}{"task": i}))
+		err := pool.Submit(i, retrypool.WithImmediateRetry[int](), retrypool.WithTaskMetadata[int](map[string]interface{}{"task": i}))
 		if err != nil {
 			fmt.Println("Error submitting task:", err)
 		}

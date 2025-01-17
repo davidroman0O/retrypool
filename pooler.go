@@ -225,7 +225,7 @@ type Pool[T any] struct {
 	nextWorkerID          int
 	taskQueues            *taskQueues[T]
 	taskQueueType         TaskQueueType
-	mu                    deadlock.Mutex
+	mu                    deadlock.RWMutex
 	cond                  *sync.Cond
 	stopped               bool
 	ctx                   context.Context
@@ -254,6 +254,8 @@ type Pool[T any] struct {
 	workersSnapshot map[int]WorkerSnapshot[T] // Cached snapshot of workers
 	snapshotMu      deadlock.RWMutex          // Protects access to the snapshot
 	snapshotTicker  *time.Ticker              // Ticker for periodic updates
+
+	metadata Metadata
 }
 
 // New initializes the Pool with given workers and options
@@ -430,6 +432,12 @@ func (p *Pool[T]) newWorkerID() int {
 
 // Option type for configuring the Pool
 type Option[T any] func(*Pool[T])
+
+func WithMetadata[T any](metadata Metadata) Option[T] {
+	return func(p *Pool[T]) {
+		p.metadata = metadata
+	}
+}
 
 // WithSnapshotInterval sets the interval for periodic snapshots
 func WithSnapshots[T any]() Option[T] {
@@ -982,7 +990,7 @@ type DeadTask[T any] struct {
 type TaskOption[T any] func(*Task[T])
 
 // WithMetadata sets metadata for the task
-func WithMetadata[T any](metadata Metadata) TaskOption[T] {
+func WithTaskMetadata[T any](metadata Metadata) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.metadata = metadata
 	}
@@ -2486,8 +2494,20 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 	snapshot = p.workersSnapshot[state.id]
 	p.workersSnapshotMu.Unlock()
 
+	p.mu.RLock()
+	metadata := p.metadata.Clone()
+	p.mu.RUnlock()
+
 	// worker loop
 	for {
+
+		meta := map[string]any{
+			"worker_id": state.id,
+			"assigned":  time.Now(),
+		}
+		if metadata != nil {
+			meta = metadata.Merge(meta)
+		}
 
 		snapshot.HasTask = false
 		snapshot.Paused = false
@@ -2570,10 +2590,9 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 			}
 			task.metadata.Set(
 				RetrypoolMetadataKey,
-				map[string]any{
-					"worker_id": state.id,
-					"assigned":  time.Now(),
-				})
+				meta,
+			)
+
 			task.mu.Unlock()
 
 			state.mu.Lock()
