@@ -16,12 +16,6 @@ type Pooler[T any] interface {
 
 	SetOnTaskAttempt(handler func(task *Task[T], workerID int))
 
-	// GetMetricsSnapshot returns a snapshot of the current pool metrics.
-	// GetMetricsSnapshot() MetricsSnapshot[T]
-
-	// NewWorkerID returns a new unique worker ID.
-	// NewWorkerID() int
-
 	// Add adds a new worker to the pool. If a queue is not provided, a new one will be created.
 	Add(worker Worker[T], queue TaskQueue[T]) error
 
