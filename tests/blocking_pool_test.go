@@ -30,18 +30,14 @@ func (t BlockingTask) GetTaskID() int         { return t.ID }
 
 // BlockingWorker demonstrates the proper blocking pattern
 type BlockingWorker struct {
-	executionTimes map[int]time.Time
+	executionTimes map[string]map[int]int64 // groupID -> taskID -> time
 	mu             sync.Mutex
 }
 
 func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
-	w.mu.Lock()
-	w.executionTimes[task.ID] = time.Now()
-	w.mu.Unlock()
-
 	fmt.Printf("\t\t Running Task %s-%d with deps %v\n", task.GroupID, task.ID, task.Dependencies)
 
-	// Simulate some work
+	// Simulate work
 	if task.sleep > 0 {
 		time.Sleep(task.sleep)
 	}
@@ -50,6 +46,8 @@ func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
 	if task.ID < 3 {
 		nextID := task.ID + 1
 		nextDone := make(chan struct{})
+
+		pp.Println("worker task::", "groupID", task.GroupID, "taskID", task.ID)
 
 		nextTask := BlockingTask{
 			ID:           nextID,
@@ -62,18 +60,33 @@ func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
 
 		fmt.Printf("\t\t\t Creating Next Task %s-%d with deps %v\n", task.GroupID, nextID, nextTask.Dependencies)
 
-		// Submit next task first
+		// Record our execution time AFTER work but BEFORE submitting next task
+		w.mu.Lock()
+		if w.executionTimes[task.GroupID] == nil {
+			w.executionTimes[task.GroupID] = make(map[int]int64)
+		}
+		w.executionTimes[task.GroupID][task.ID] = time.Now().UnixNano()
+		w.mu.Unlock()
+
+		// Submit next task
 		if err := task.Pool.Submit(nextTask); err != nil {
 			return err
 		}
 
-		// Now wait for next task
+		// Wait for next task
 		<-nextDone
 
-		// Signal our completion before waiting for next task
+		// Signal our completion
 		close(task.done)
 	} else {
-		// For the last task, just signal completion
+		// For last task, record time then signal completion
+		w.mu.Lock()
+		if w.executionTimes[task.GroupID] == nil {
+			w.executionTimes[task.GroupID] = make(map[int]int64)
+		}
+		w.executionTimes[task.GroupID][task.ID] = time.Now().UnixNano()
+		w.mu.Unlock()
+
 		close(task.done)
 	}
 
@@ -82,7 +95,7 @@ func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
 
 func TestBlockingPool_ProperBlocking(t *testing.T) {
 	ctx := context.Background()
-	worker := &BlockingWorker{executionTimes: make(map[int]time.Time)}
+	worker := &BlockingWorker{executionTimes: make(map[string]map[int]int64)}
 
 	pool, err := retrypool.NewBlockingPool[BlockingTask, string, int](
 		ctx,
@@ -129,10 +142,7 @@ func TestBlockingPool_ProperBlocking(t *testing.T) {
 
 	// Verify execution times
 	worker.mu.Lock()
-	times := make(map[int]time.Time)
-	for id, t := range worker.executionTimes {
-		times[id] = t
-	}
+	times := worker.executionTimes["groupA"] // We only have groupA in this test
 	worker.mu.Unlock()
 
 	// Verify all three tasks were executed
@@ -143,22 +153,25 @@ func TestBlockingPool_ProperBlocking(t *testing.T) {
 	}
 
 	// Verify execution order
-	if times[2].Before(times[1]) {
+	if times[2] < times[1] {
 		t.Error("Task 2 executed before Task 1")
 	}
-	if times[3].Before(times[2]) {
+	if times[3] < times[2] {
 		t.Error("Task 3 executed before Task 2")
 	}
 }
 
 func TestBlockingPool_MultipleGroups(t *testing.T) {
 	ctx := context.Background()
-	worker := &BlockingWorker{executionTimes: make(map[int]time.Time)}
+	worker := &BlockingWorker{executionTimes: make(map[string]map[int]int64)}
 
 	pool, err := retrypool.NewBlockingPool[BlockingTask, string, int](
 		ctx,
 		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[BlockingTask] { return worker }),
 		retrypool.WithBlockingMaxActivePools[BlockingTask](2), // Allow both groups to run
+		retrypool.WithBlockingOnTaskStarted(func(data BlockingTask) {
+			t.Logf("Task groupID:%v taskID:%d started", data.GroupID, data.ID)
+		}),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
@@ -208,10 +221,11 @@ func TestBlockingPool_MultipleGroups(t *testing.T) {
 
 	// Verify each group had all three tasks execute
 	worker.mu.Lock()
-	times := worker.executionTimes
+	groupTimes := worker.executionTimes
 	worker.mu.Unlock()
 
 	for _, group := range groups {
+		times := groupTimes[group]
 		// Check all three tasks for this group
 		for i := 1; i <= 3; i++ {
 			if _, exists := times[i]; !exists {
@@ -220,13 +234,15 @@ func TestBlockingPool_MultipleGroups(t *testing.T) {
 		}
 
 		// Verify execution order within group
-		if times[2].Before(times[1]) {
+		if times[2] < times[1] {
 			t.Errorf("Group %s: Task 2 executed before Task 1", group)
 		}
-		if times[3].Before(times[2]) {
+		if times[3] < times[2] {
 			t.Errorf("Group %s: Task 3 executed before Task 2", group)
 		}
 	}
+
+	pp.Println("result::", groups, worker.executionTimes)
 }
 
 // StressTestWorker properly implements the Worker interface for stress testing
@@ -505,7 +521,7 @@ func TestBlockingPool_TaskCallbacks(t *testing.T) {
 
 func TestBlockingPool_PoolEvents(t *testing.T) {
 	ctx := context.Background()
-	worker := &BlockingWorker{executionTimes: make(map[int]time.Time)}
+	worker := &BlockingWorker{executionTimes: make(map[string]map[int]int64)}
 
 	var poolsCreated int
 	var mu sync.Mutex
