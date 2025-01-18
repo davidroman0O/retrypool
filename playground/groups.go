@@ -14,6 +14,9 @@ type worker struct {
 
 func (w *worker) Run(ctx context.Context, data task) error {
 	pp.Println("Worker", w.ID, "Processing task", data.ID, "from group", data.GID)
+	metadata := make(retrypool.Metadata)
+	metadata.Set("taskdata", data.ID)
+	retrypool.SetTaskMetadata(ctx, metadata)
 	return nil
 }
 

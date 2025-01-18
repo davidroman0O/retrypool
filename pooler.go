@@ -131,7 +131,7 @@ type TaskStateTransition[T any] struct {
 // stateMetrics tracks counts for each state
 type stateMetrics struct {
 	counts    map[TaskState]*atomic.Int64
-	mu        sync.RWMutex
+	mu        deadlock.RWMutex
 	callbacks map[TaskState][]func(interface{})
 }
 
@@ -2196,7 +2196,9 @@ func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
 	p.handleTaskCompletion(state, task, err)
 }
 
-const contextMetadataSetKey = "$context_metadata_set"
+type poolCtxKey string
+
+const contextMetadataSetKey poolCtxKey = "$context_metadata_set"
 
 type TaskMetadataSetter func(metadata Metadata)
 
@@ -2221,7 +2223,17 @@ func (p *Pool[T]) enhanceTaskContext(ctx context.Context, task *Task[T]) context
 
 	funcMetadataSet := TaskMetadataSetter(func(metadata Metadata) {
 		task.mu.Lock()
-		task.metadata = metadata.Merge(task.metadata)
+		// fmt.Println("\t\tUpdate::", task.metadata, "with", metadata)
+		for k, v := range metadata {
+			task.metadata[k] = v
+		}
+		p.workersSnapshotMu.Lock()
+		snapshot := p.workersSnapshot[task.lastWorkerID]
+		snapshot.Metadata.Merge(metadata)
+		p.workersSnapshot[task.lastWorkerID] = snapshot
+		p.workersSnapshotMu.Unlock()
+		// task.metadata.Merge(task.metadata)
+		// fmt.Println("\t\tUpdated::", task.metadata)
 		task.mu.Unlock()
 	})
 
