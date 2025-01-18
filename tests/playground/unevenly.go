@@ -73,12 +73,12 @@ func main() {
 		retrypool.WithOnPanic[*retrypool.RequestResponse[int, struct{}]](func(recovery interface{}, stackTrace string) {
 			fmt.Println("detected panic", recovery, stackTrace)
 		}),
-		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[int, struct{}]](func(data *retrypool.RequestResponse[int, struct{}], metadata retrypool.Metadata, err error) retrypool.TaskAction {
+		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[int, struct{}]](func(data *retrypool.RequestResponse[int, struct{}], metadata map[string]any, err error) retrypool.TaskAction {
 			fmt.Println("task failed", data, metadata, err)
 			return retrypool.TaskActionRetry
 		}),
 		retrypool.WithOnTaskSuccess[*retrypool.RequestResponse[int, struct{}]](
-			func(data *retrypool.RequestResponse[int, struct{}], metadata retrypool.Metadata) {
+			func(data *retrypool.RequestResponse[int, struct{}], metadata map[string]any) {
 				pp.Println("task success", data, metadata)
 			},
 		),
@@ -87,7 +87,9 @@ func main() {
 	go func() {
 		for i := range 100 {
 			<-time.After(time.Millisecond * time.Duration(50+rand.Intn(500)))
-			pool.Submit(retrypool.NewRequestResponse[int, struct{}](i), retrypool.WithTaskMetadata[*retrypool.RequestResponse[int, struct{}]](map[string]any{"idx": i}))
+			m := retrypool.NewMetadata()
+			m.Set("idx", i)
+			pool.Submit(retrypool.NewRequestResponse[int, struct{}](i), retrypool.WithTaskMetadata[*retrypool.RequestResponse[int, struct{}]](m))
 		}
 	}()
 

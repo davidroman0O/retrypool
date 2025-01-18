@@ -23,15 +23,15 @@ type GroupPoolConfig[T any, GID comparable] struct {
 	UseFreeWorkerOnly bool
 
 	// Called when a task succeeds. We automatically pass the group ID and the pool ID.
-	OnTaskSuccess func(gid GID, poolID uint, data T, metadata Metadata)
+	OnTaskSuccess func(gid GID, poolID uint, data T, metadata map[string]any)
 	// Called when a task fails. We automatically pass the group ID and the pool ID.
-	OnTaskFailure func(gid GID, poolID uint, data T, metadata Metadata, err error) TaskAction
+	OnTaskFailure func(gid GID, poolID uint, data T, metadata map[string]any, err error) TaskAction
 	// Called when a task is about to run. We pass the group ID, the pool ID, the *Task, and the worker ID.
 	OnTaskAttempt func(gid GID, poolID uint, task *Task[T], workerID int)
 	// Called whenever we get a snapshot from an underlying Pool. We pass that snapshot.
 	OnSnapshot func(snapshot MetricsSnapshot[T])
 
-	metadata Metadata
+	metadata *Metadata
 
 	onSnapshot func()
 }
@@ -75,13 +75,13 @@ func WithGroupPoolUseFreeWorkerOnly[T any, GID comparable]() GroupPoolOption[T, 
 	}
 }
 
-func WithGroupPoolOnTaskSuccess[T any, GID comparable](cb func(gid GID, poolID uint, data T, metadata Metadata)) GroupPoolOption[T, GID] {
+func WithGroupPoolOnTaskSuccess[T any, GID comparable](cb func(gid GID, poolID uint, data T, metadata map[string]any)) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.OnTaskSuccess = cb
 	}
 }
 
-func WithGroupPoolOnTaskFailure[T any, GID comparable](cb func(gid GID, poolID uint, data T, metadata Metadata, err error) TaskAction) GroupPoolOption[T, GID] {
+func WithGroupPoolOnTaskFailure[T any, GID comparable](cb func(gid GID, poolID uint, data T, metadata map[string]any, err error) TaskAction) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.OnTaskFailure = cb
 	}
@@ -99,7 +99,7 @@ func WithGroupPoolOnSnapshot[T any, GID comparable](cb func(snapshot MetricsSnap
 	}
 }
 
-func WithGroupPoolMetadata[T any, GID comparable](m Metadata) GroupPoolOption[T, GID] {
+func WithGroupPoolMetadata[T any, GID comparable](m *Metadata) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.metadata = m
 	}
@@ -162,7 +162,7 @@ func NewGroupPool[T GroupTask[GID], GID comparable](
 
 	// Wrap OnTaskSuccess to detect pool idle state
 	originalSuccess := cfg.OnTaskSuccess
-	cfg.OnTaskSuccess = func(gid GID, poolID uint, data T, meta Metadata) {
+	cfg.OnTaskSuccess = func(gid GID, poolID uint, data T, meta map[string]any) {
 		// Forward to user callback if set
 		if originalSuccess != nil {
 			originalSuccess(gid, poolID, data, meta)
@@ -175,7 +175,7 @@ func NewGroupPool[T GroupTask[GID], GID comparable](
 
 	// Wrap OnTaskFailure to detect pool idle state
 	originalFailure := cfg.OnTaskFailure
-	cfg.OnTaskFailure = func(gid GID, poolID uint, data T, meta Metadata, err error) TaskAction {
+	cfg.OnTaskFailure = func(gid GID, poolID uint, data T, meta map[string]any, err error) TaskAction {
 		var action TaskAction
 		if originalFailure != nil {
 			action = originalFailure(gid, poolID, data, meta, err)
@@ -242,7 +242,7 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
 	id := gp.nextID
 	gp.nextID++
 
-	metadata := make(Metadata)
+	metadata := NewMetadata()
 	metadata.Set("pool_id", id)
 
 	// TODO: we should have options for that
@@ -268,14 +268,14 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
 	// so we just pass them along here.
 	if gp.config.OnTaskSuccess != nil {
 		userFn := gp.config.OnTaskSuccess
-		opts = append(opts, WithOnTaskSuccess[T](func(data T, meta Metadata) {
+		opts = append(opts, WithOnTaskSuccess[T](func(data T, meta map[string]any) {
 			gid := data.GetGroupID()
 			userFn(gid, id, data, meta)
 		}))
 	}
 	if gp.config.OnTaskFailure != nil {
 		userFn := gp.config.OnTaskFailure
-		opts = append(opts, WithOnTaskFailure[T](func(data T, meta Metadata, err error) TaskAction {
+		opts = append(opts, WithOnTaskFailure[T](func(data T, meta map[string]any, err error) TaskAction {
 			gid := data.GetGroupID()
 			return userFn(gid, id, data, meta, err)
 		}))
@@ -362,6 +362,7 @@ func (gp *GroupPool[T, GID]) releasePool(poolID uint) error {
 // handleTaskCompletion is invoked (via goroutine) whenever a task completes or fails, to see if the pool is idle.
 // If idle, we free up the pool and try to assign it to any pending group. This helps process more than 2 groups.
 func (gp *GroupPool[T, GID]) handleTaskCompletion(poolID uint) {
+	// Acquire group pool lock first
 	gp.mu.Lock()
 	defer gp.mu.Unlock()
 
@@ -369,14 +370,22 @@ func (gp *GroupPool[T, GID]) handleTaskCompletion(poolID uint) {
 	if !exists {
 		return
 	}
-	// Check if the pool is truly idle: no tasks in the queue, none processing
-	q := it.Pool.QueueSize()
-	p := it.Pool.ProcessingCount()
+
+	// Then acquire pool item lock
+	it.mu.Lock()
+	pool := it.Pool
+	it.mu.Unlock()
+
+	// Check if pool is idle
+	q := pool.QueueSize()
+	p := pool.ProcessingCount()
 	if q == 0 && p == 0 {
+		// Release pool before acquiring new locks
 		errRelease := gp.releasePool(poolID)
 		if errRelease != nil {
 			gp.config.Logger.Warn(gp.ctx, "Error releasing pool", "pool_id", poolID, "error", errRelease)
 		}
+		// Try to consume pending groups
 		gp.consumePendingGroupsLocked()
 	}
 }
@@ -519,7 +528,9 @@ func (gp *GroupPool[T, GID]) submitToPool(it *poolItem[T, GID], t T, opts ...Gro
 		options = append(options, WithTaskProcessedNotification[T](cfg.processedNotification))
 	}
 	if cfg.metadata != nil {
-		options = append(options, WithTaskMetadata[T](cfg.metadata))
+		m := NewMetadata()
+		m.store = cfg.metadata
+		options = append(options, WithTaskMetadata[T](m))
 	}
 
 	if gp.config.UseFreeWorkerOnly {

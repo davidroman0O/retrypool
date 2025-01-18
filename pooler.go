@@ -255,7 +255,7 @@ type Pool[T any] struct {
 	snapshotMu      deadlock.RWMutex          // Protects access to the snapshot
 	snapshotTicker  *time.Ticker              // Ticker for periodic updates
 
-	metadata Metadata
+	metadata *Metadata
 }
 
 // New initializes the Pool with given workers and options
@@ -340,14 +340,14 @@ func (p *Pool[T]) RoundRobinIndex() int {
 }
 
 // SetOnTaskSuccess allows setting the onTaskSuccess handler after pool creation
-func (p *Pool[T]) SetOnTaskSuccess(handler func(data T, metadata Metadata)) {
+func (p *Pool[T]) SetOnTaskSuccess(handler func(data T, metadata map[string]any)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.config.onTaskSuccess = handler
 }
 
 // SetOnTaskFailure allows setting the onTaskFailure handler after pool creation
-func (p *Pool[T]) SetOnTaskFailure(handler func(data T, metadata Metadata, err error) TaskAction) {
+func (p *Pool[T]) SetOnTaskFailure(handler func(data T, metadata map[string]any, err error) TaskAction) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.config.onTaskFailure = handler
@@ -370,11 +370,40 @@ type MetricsSnapshot[T any] struct {
 	Workers        map[int]WorkerSnapshot[T]
 }
 
+func (m MetricsSnapshot[T]) Clone() MetricsSnapshot[T] {
+	clone := MetricsSnapshot[T]{
+		TasksSubmitted: m.TasksSubmitted,
+		TasksProcessed: m.TasksProcessed,
+		TasksSucceeded: m.TasksSucceeded,
+		TasksFailed:    m.TasksFailed,
+		DeadTasks:      m.DeadTasks,
+		TaskQueues:     make(map[int]int, len(m.TaskQueues)),
+		Workers:        make(map[int]WorkerSnapshot[T], len(m.Workers)),
+	}
+
+	for k, v := range m.TaskQueues {
+		clone.TaskQueues[k] = v
+	}
+
+	for k, v := range m.Workers {
+		workerClone := v
+		if v.Metadata != nil {
+			workerClone.Metadata = v.Metadata
+		}
+		clone.Workers[k] = workerClone
+	}
+
+	return clone
+}
+
 func (p *Pool[T]) calculateMetricsSnapshot() MetricsSnapshot[T] {
 	metrics := p.taskQueues.metrics()
 
-	workers := map[int]WorkerSnapshot[T]{}
+	workers := make(map[int]WorkerSnapshot[T])
 	p.RangeWorkers(func(workerID int, state WorkerSnapshot[T]) bool {
+		if state.Metadata == nil {
+			state.Metadata = map[string]any{}
+		}
 		workers[workerID] = state
 		return true
 	})
@@ -433,7 +462,7 @@ func (p *Pool[T]) newWorkerID() int {
 // Option type for configuring the Pool
 type Option[T any] func(*Pool[T])
 
-func WithMetadata[T any](metadata Metadata) Option[T] {
+func WithMetadata[T any](metadata *Metadata) Option[T] {
 	return func(p *Pool[T]) {
 		p.metadata = metadata
 	}
@@ -595,7 +624,7 @@ func WithRateLimit[T any](rps float64) Option[T] {
 }
 
 // WithOnTaskSuccess sets a callback for successful task completion
-func WithOnTaskSuccess[T any](handler func(data T, metadata Metadata)) Option[T] {
+func WithOnTaskSuccess[T any](handler func(data T, metadata map[string]any)) Option[T] {
 	return func(p *Pool[T]) {
 		p.logger.Debug(p.ctx, "Setting OnTaskSuccess handler")
 		p.config.onTaskSuccess = handler
@@ -603,7 +632,7 @@ func WithOnTaskSuccess[T any](handler func(data T, metadata Metadata)) Option[T]
 }
 
 // WithOnTaskFailure sets a callback for task failure
-func WithOnTaskFailure[T any](handler func(data T, metadata Metadata, err error) TaskAction) Option[T] {
+func WithOnTaskFailure[T any](handler func(data T, metadata map[string]any, err error) TaskAction) Option[T] {
 	return func(p *Pool[T]) {
 		p.logger.Debug(p.ctx, "Setting OnTaskFailure handler")
 		p.config.onTaskFailure = handler
@@ -679,8 +708,8 @@ type Config[T any] struct {
 	maxQueueSize   int
 	onPanic        func(recovery interface{}, stackTrace string)
 	onWorkerPanic  func(workerID int, recovery interface{}, stackTrace string)
-	onTaskSuccess  func(data T, metadata Metadata)
-	onTaskFailure  func(data T, metadata Metadata, err error) TaskAction
+	onTaskSuccess  func(data T, metadata map[string]any)
+	onTaskFailure  func(data T, metadata map[string]any, err error) TaskAction
 	onDeadTask     func(deadTaskIndex int)
 	onTaskAttempt  func(task *Task[T], workerID int)
 	deadTasksLimit int
@@ -758,35 +787,71 @@ type Metrics struct {
 	DeadTasks      atomic.Int64
 }
 
-type Metadata map[string]any
+type Metadata struct {
+	mu    deadlock.RWMutex
+	store map[string]any
+}
 
-func (m Metadata) Clone() Metadata {
-	clone := make(Metadata, len(m))
-	for k, v := range m {
+func NewMetadata() *Metadata {
+	return &Metadata{
+		store: make(map[string]any),
+	}
+}
+
+func (m *Metadata) Clone() *Metadata {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	clone := NewMetadata()
+	for k, v := range m.store {
+		clone.store[k] = v
+	}
+	return clone
+}
+
+func (m *Metadata) CloneStore() map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	clone := make(map[string]any, len(m.store))
+	for k, v := range m.store {
 		clone[k] = v
 	}
 	return clone
 }
 
-func (m Metadata) Merge(other Metadata) Metadata {
-	for k, v := range other {
-		m[k] = v
+func (m *Metadata) Merge(other *Metadata) {
+	if other == nil {
+		return
 	}
-	return m
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	other.mu.RLock()
+	defer other.mu.RUnlock()
+
+	for k, v := range other.store {
+		m.store[k] = v
+	}
 }
 
-func (m Metadata) Get(key string) any {
-	return m[key]
+func (m *Metadata) Get(key string) any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store[key]
 }
 
-func (m Metadata) Set(key string, value any) {
-	m[key] = value
+func (m *Metadata) Set(key string, value any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store[key] = value
 }
 
 // Task represents a task in the pool
 type Task[T any] struct {
 	mu                deadlock.Mutex
-	metadata          Metadata // `retrypool`'s design doesn't allow to access to `data` directly, so we need to store the metadata
+	metadata          *Metadata // `retrypool`'s design doesn't allow to access to `data` directly, so we need to store the metadata
 	data              T
 	retries           int
 	totalDuration     time.Duration
@@ -811,10 +876,10 @@ type Task[T any] struct {
 	stateHistory      []*TaskStateTransition[T]
 }
 
-func (t *Task[T]) GetMetadata() Metadata {
+func (t *Task[T]) GetMetadata() *Metadata {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.metadata
+	return t.metadata.Clone()
 }
 
 func (t *Task[T]) GetAttemptedWorkers() []int {
@@ -990,9 +1055,9 @@ type DeadTask[T any] struct {
 type TaskOption[T any] func(*Task[T])
 
 // WithMetadata sets metadata for the task
-func WithTaskMetadata[T any](metadata Metadata) TaskOption[T] {
+func WithTaskMetadata[T any](metadata *Metadata) TaskOption[T] {
 	return func(t *Task[T]) {
-		t.metadata = metadata
+		t.metadata = metadata.Clone()
 	}
 }
 
@@ -1098,7 +1163,7 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	*t = Task[T]{
 		data:     data,
 		state:    TaskStateCreated,
-		metadata: make(Metadata),
+		metadata: NewMetadata(),
 	}
 
 	for _, option := range options {
@@ -1373,7 +1438,7 @@ type WorkerSnapshot[T any] struct {
 	Paused   bool
 	Removed  bool
 	HasTask  bool
-	Metadata Metadata
+	Metadata map[string]any
 }
 
 // Add adds a new worker to the pool
@@ -1819,25 +1884,37 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 	snapshot = p.workersSnapshot[state.id]
 	p.workersSnapshotMu.Unlock()
 
-	p.mu.RLock()
-	metadata := p.metadata.Clone()
-	p.mu.RUnlock()
-
 	// worker loop
 	for {
 
+		// Create initial metadata map
 		meta := map[string]any{
 			"worker_id": state.id,
 			"assigned":  time.Now(),
 		}
-		if metadata != nil {
-			meta = metadata.Merge(meta)
+
+		// Create a new Metadata instance for this operation
+		newMetadata := NewMetadata()
+		for k, v := range meta {
+			newMetadata.Set(k, v)
 		}
+
+		// Safely merge pool metadata if it exists
+		p.mu.RLock()
+		if p.metadata != nil {
+			p.metadata.mu.RLock()
+			// Copy pool metadata into our new instance
+			for k, v := range p.metadata.store {
+				newMetadata.Set(k, v)
+			}
+			p.metadata.mu.RUnlock()
+		}
+		p.mu.RUnlock()
 
 		snapshot.HasTask = false
 		snapshot.Paused = false
 		snapshot.Removed = false
-		snapshot.Metadata = make(Metadata)
+		snapshot.Metadata = map[string]any{}
 		p.workersSnapshotMu.Lock()
 		p.workersSnapshot[state.id] = snapshot
 		p.workersSnapshotMu.Unlock()
@@ -1911,7 +1988,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 		if task != nil {
 			task.mu.Lock()
 			if task.metadata == nil {
-				task.metadata = make(Metadata)
+				task.metadata = NewMetadata()
 			}
 			task.metadata.Set(
 				RetrypoolMetadataKey,
@@ -1925,7 +2002,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 			state.mu.Unlock()
 
 			snapshot.HasTask = true
-			snapshot.Metadata = task.metadata.Clone() // only for snapshot // TODO: all those allocations could be in a sync.Pool
+			snapshot.Metadata = task.metadata.CloneStore() // only for snapshot // TODO: all those allocations could be in a sync.Pool
 			p.workersSnapshotMu.Lock()
 			p.workersSnapshot[state.id] = snapshot
 			p.workersSnapshotMu.Unlock()
@@ -2088,7 +2165,7 @@ func (p *Pool[T]) run() {
 
 				p.workersSnapshotMu.Lock()
 				snapshot.HasTask = true
-				snapshot.Metadata = task.metadata
+				snapshot.Metadata = task.metadata.CloneStore()
 				p.workersSnapshot[workerID] = snapshot
 				p.workersSnapshotMu.Unlock()
 
@@ -2145,14 +2222,35 @@ func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
 	p.logger.Debug(p.ctx, "Starting task processing", "worker_id", state.id, "task_data", task.data, "task_retries", task.retries, "immediate_retry", task.immediateRetry)
 
 	// Update task state with proper locking
-	task.mu.Lock()
-	task.lastWorkerID = state.id
-	if task.bounceRetry {
-		task.attemptedWorkers[state.id] = struct{}{}
+	p.mu.RLock() // First acquire pool lock
+	if p.metadata != nil {
+		meta := map[string]any{
+			"worker_id": state.id,
+			"assigned":  time.Now(),
+		}
+
+		// Safely copy pool metadata
+		p.metadata.mu.RLock()
+		for k, v := range p.metadata.store {
+			meta[k] = v
+		}
+		p.metadata.mu.RUnlock()
+
+		// Then acquire task lock
+		task.mu.Lock()
+		if task.metadata == nil {
+			task.metadata = NewMetadata()
+		}
+		task.metadata.Set(RetrypoolMetadataKey, meta)
+		task.lastWorkerID = state.id
+		if task.bounceRetry {
+			task.attemptedWorkers[state.id] = struct{}{}
+		}
+		task.attemptStartTime = time.Now()
+		task.processedAt = append(task.processedAt, time.Now())
+		task.mu.Unlock()
 	}
-	task.attemptStartTime = time.Now()
-	task.processedAt = append(task.processedAt, time.Now())
-	task.mu.Unlock()
+	p.mu.RUnlock()
 
 	// Update metrics atomically
 	p.metrics.TasksProcessed.Add(1)
@@ -2200,9 +2298,9 @@ type poolCtxKey string
 
 const contextMetadataSetKey poolCtxKey = "$context_metadata_set"
 
-type TaskMetadataSetter func(metadata Metadata)
+type TaskMetadataSetter func(metadata map[string]any)
 
-func SetTaskMetadata(ctx context.Context, metadata Metadata) error {
+func SetTaskMetadata(ctx context.Context, metadata map[string]any) error {
 	if ctx == nil {
 		return errors.New("context is nil")
 	}
@@ -2221,20 +2319,43 @@ func (p *Pool[T]) enhanceTaskContext(ctx context.Context, task *Task[T]) context
 		return ctx
 	}
 
-	funcMetadataSet := TaskMetadataSetter(func(metadata Metadata) {
-		task.mu.Lock()
-		// fmt.Println("\t\tUpdate::", task.metadata, "with", metadata)
-		for k, v := range metadata {
-			task.metadata[k] = v
-		}
+	funcMetadataSet := TaskMetadataSetter(func(newMetadata map[string]any) {
+		// Follow consistent lock order
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
 		p.workersSnapshotMu.Lock()
+		defer p.workersSnapshotMu.Unlock()
+
+		task.mu.Lock()
+		defer task.mu.Unlock()
+
+		// Safety: initialize if needed
+		if task.metadata == nil {
+			task.metadata = NewMetadata()
+		}
+
+		// Update task metadata
+		task.metadata.mu.Lock()
+		for k, v := range newMetadata {
+			task.metadata.store[k] = v
+		}
+		task.metadata.mu.Unlock()
+
+		// Update snapshot metadata
 		snapshot := p.workersSnapshot[task.lastWorkerID]
-		snapshot.Metadata.Merge(metadata)
+		if snapshot.Metadata == nil {
+			snapshot.Metadata = map[string]any{}
+		}
+
+		// snapshot.Metadata.mu.Lock()
+		// for k, v := range newMetadata {
+		// 	snapshot.Metadata[k] = v
+		// }
+		snapshot.Metadata = newMetadata
+		// snapshot.Metadata.mu.Unlock()
+
 		p.workersSnapshot[task.lastWorkerID] = snapshot
-		p.workersSnapshotMu.Unlock()
-		// task.metadata.Merge(task.metadata)
-		// fmt.Println("\t\tUpdated::", task.metadata)
-		task.mu.Unlock()
 	})
 
 	ctx = context.WithValue(ctx, contextMetadataSetKey, funcMetadataSet)
@@ -2359,15 +2480,24 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 	state.mu.Unlock()
 
 	task.mu.Lock()
-	metaBuffer := task.metadata.Get(RetrypoolMetadataKey).(map[string]any)
-	metaBuffer["completed"] = time.Now()
-	task.metadata.Set(RetrypoolMetadataKey, metaBuffer)
+	if task.metadata == nil {
+		task.metadata = NewMetadata()
+	}
+	if metaRaw := task.metadata.Get(RetrypoolMetadataKey); metaRaw != nil {
+		if metaBuffer, ok := metaRaw.(map[string]any); ok {
+			metaBuffer["completed"] = time.Now()
+			task.metadata.Set(RetrypoolMetadataKey, metaBuffer)
+		}
+	}
 	task.mu.Unlock()
 
 	p.logger.Debug(p.ctx, "Checking task success callback", "has_callback", p.config.onTaskSuccess != nil)
 
 	if p.config.onTaskSuccess != nil {
-		p.config.onTaskSuccess(task.data, task.metadata)
+		task.mu.Lock()
+		metadataClone := task.metadata.CloneStore() // Create a safe copy
+		task.mu.Unlock()
+		p.config.onTaskSuccess(task.data, metadataClone)
 	}
 
 	if task.notifiedProcessed != nil {
@@ -2376,6 +2506,11 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 	if task.processedCb != nil {
 		task.processedCb()
 	}
+
+	task.mu.Lock()
+	task.metadata = nil // Clear metadata before recycling
+	task.mu.Unlock()
+
 	p.taskPool.Put(task)
 }
 
@@ -2399,7 +2534,10 @@ func (p *Pool[T]) handleTaskFailure(task *Task[T], err error) {
 
 	action := TaskActionRetry
 	if p.config.onTaskFailure != nil {
-		action = p.config.onTaskFailure(task.data, task.metadata, err)
+		task.mu.Lock()
+		metadataClone := task.metadata.CloneStore() // Create a safe copy
+		task.mu.Unlock()
+		action = p.config.onTaskFailure(task.data, metadataClone, err)
 	}
 
 	p.logger.Debug(p.ctx, "Handling task failure", "task_data", task.data, "action", action, "bounce_retry", task.bounceRetry)
@@ -2472,6 +2610,9 @@ func (p *Pool[T]) handleTaskFailure(task *Task[T], err error) {
 
 	case TaskActionRemove:
 		p.UpdateTotalQueueSize(-1)
+		task.mu.Lock()
+		task.metadata = nil
+		task.mu.Unlock()
 		p.taskPool.Put(task)
 	}
 }
@@ -2515,6 +2656,10 @@ func (p *Pool[T]) addDeadTask(task *Task[T]) {
 			p.logger.Warn(p.ctx, "Dead task notification channel full, notification dropped", "dead_task_index", deadTaskIndex)
 		}
 	}
+
+	task.mu.Lock()
+	task.metadata = nil
+	task.mu.Unlock()
 
 	p.taskPool.Put(task)
 }

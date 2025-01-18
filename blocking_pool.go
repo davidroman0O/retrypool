@@ -484,14 +484,14 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 	)
 
 	// Set completion handler
-	pool.SetOnTaskSuccess(func(data T, metadata Metadata) {
+	pool.SetOnTaskSuccess(func(data T, metadata map[string]any) {
 		p.config.logger.Debug(p.ctx, "Task completed successfully in group",
 			"group_id", groupID)
 		p.handleTaskCompletion(groupID, data)
 	})
 
 	// Add failure handler to trigger group cleanup
-	pool.SetOnTaskFailure(func(data T, metadata Metadata, err error) TaskAction {
+	pool.SetOnTaskFailure(func(data T, metadata map[string]any, err error) TaskAction {
 		p.config.logger.Error(p.ctx, "Task failed in group",
 			"group_id", groupID,
 			"error", err)
@@ -839,7 +839,9 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error
 		state.options = append(state.options, WithTaskProcessedNotification[T](cfg.processedNotification))
 	}
 	if cfg.metadata != nil {
-		state.options = append(state.options, WithTaskMetadata[T](cfg.metadata))
+		m := NewMetadata()
+		m.store = cfg.metadata
+		state.options = append(state.options, WithTaskMetadata[T](m))
 	}
 
 	p.mu.Lock()

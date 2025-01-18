@@ -288,7 +288,7 @@ func NewIndependentPool[T any, GID comparable, TID comparable](
 	}
 
 	pool.pooler.SetOnTaskSuccess(pool.handleTaskCompletion)
-	pool.pooler.SetOnTaskFailure(func(data T, metadata Metadata, err error) TaskAction {
+	pool.pooler.SetOnTaskFailure(func(data T, metadata map[string]any, err error) TaskAction {
 		if pool.config.OnTaskFailed != nil {
 			pool.config.OnTaskFailed(data, err)
 		}
@@ -498,7 +498,7 @@ func (p *IndependentPool[T, GID, TID]) topologicalSort(graph *DependencyGraph[TI
 	return order, nil
 }
 
-func (p *IndependentPool[T, GID, TID]) handleTaskCompletion(data T, metadata Metadata) {
+func (p *IndependentPool[T, GID, TID]) handleTaskCompletion(data T, metadata map[string]any) {
 	if p.config.OnTaskCompleted != nil {
 		p.config.OnTaskCompleted(data)
 	}

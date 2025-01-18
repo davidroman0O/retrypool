@@ -14,9 +14,9 @@ type worker struct {
 
 func (w *worker) Run(ctx context.Context, data task) error {
 	pp.Println("Worker", w.ID, "Processing task", data.ID, "from group", data.GID)
-	metadata := make(retrypool.Metadata)
-	metadata.Set("taskdata", data.ID)
-	retrypool.SetTaskMetadata(ctx, metadata)
+	retrypool.SetTaskMetadata(ctx, map[string]any{
+		"taskdata": data.ID,
+	})
 	return nil
 }
 
@@ -42,7 +42,7 @@ func main() {
 			}),
 		retrypool.WithGroupPoolMaxActivePools[task, string](2),
 		retrypool.WithGroupPoolUseFreeWorkerOnly[task, string](),
-		retrypool.WithGroupPoolOnTaskSuccess[task, string](func(gid string, pool uint, data task, metadata retrypool.Metadata) {
+		retrypool.WithGroupPoolOnTaskSuccess[task, string](func(gid string, pool uint, data task, metadata map[string]any) {
 			pp.Println("Task", data.ID, "from group", data.GID, "completed", metadata, "with", pool, "workers")
 		}),
 		retrypool.WithGroupPoolOnSnapshot[task, string](func(shot retrypool.MetricsSnapshot[task]) {
@@ -55,9 +55,20 @@ func main() {
 
 	groups := []string{"group1", "group2", "group3", "group4", "group5"}
 
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				pp.Println(pool.GetSnapshot())
+			}
+		}
+	}()
+
 	for _, g := range groups {
 		go func() {
-			for i := range 10 {
+			for i := range 1000 {
 				if err := pool.Submit(task{GID: g, ID: i}); err != nil {
 					panic(err)
 				}

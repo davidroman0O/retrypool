@@ -83,10 +83,10 @@ func TestPoolLifecycleAsync(t *testing.T) {
 	var pool *retrypool.Pool[TestTaskData]
 	pool = retrypool.New[TestTaskData](ctx, workers,
 		retrypool.WithAttempts[TestTaskData](3),
-		retrypool.WithOnTaskSuccess[TestTaskData](func(data TestTaskData, metadata retrypool.Metadata) {
+		retrypool.WithOnTaskSuccess[TestTaskData](func(data TestTaskData, metadata map[string]any) {
 			fmt.Printf("Task succeeded: %v\n", data)
 		}),
-		retrypool.WithOnTaskFailure[TestTaskData](func(data TestTaskData, metadata retrypool.Metadata, err error) retrypool.TaskAction {
+		retrypool.WithOnTaskFailure[TestTaskData](func(data TestTaskData, metadata map[string]any, err error) retrypool.TaskAction {
 			fmt.Printf("Task failed: %v, error: %v\n", data, err)
 			return retrypool.TaskActionRetry
 		}),
@@ -203,10 +203,10 @@ func TestPoolLifecycleSync(t *testing.T) {
 
 	pool := retrypool.New[TestTaskData](ctx, workers,
 		retrypool.WithAttempts[TestTaskData](3),
-		retrypool.WithOnTaskSuccess[TestTaskData](func(data TestTaskData, metadata retrypool.Metadata) {
+		retrypool.WithOnTaskSuccess[TestTaskData](func(data TestTaskData, metadata map[string]any) {
 			fmt.Printf("Task succeeded: %v\n", data)
 		}),
-		retrypool.WithOnTaskFailure[TestTaskData](func(data TestTaskData, metadata retrypool.Metadata, err error) retrypool.TaskAction {
+		retrypool.WithOnTaskFailure[TestTaskData](func(data TestTaskData, metadata map[string]any, err error) retrypool.TaskAction {
 			fmt.Printf("Task failed: %v, error: %v\n", data, err)
 			return retrypool.TaskActionRetry
 		}),
