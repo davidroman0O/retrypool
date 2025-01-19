@@ -40,14 +40,14 @@ func main() {
 			func() retrypool.Worker[task] {
 				return &worker{}
 			}),
-		retrypool.WithGroupPoolMaxActivePools[task, string](2),
+		retrypool.WithGroupPoolMaxActivePools[task, string](5),
 		retrypool.WithGroupPoolUseFreeWorkerOnly[task, string](),
 		retrypool.WithGroupPoolOnTaskSuccess[task, string](func(gid string, pool uint, data task, metadata map[string]any) {
 			pp.Println("Task", data.ID, "from group", data.GID, "completed", metadata, "with", pool, "workers")
 		}),
-		retrypool.WithGroupPoolOnSnapshot[task, string](func(shot retrypool.MetricsSnapshot[task]) {
-			pp.Println(shot)
-		}),
+		// retrypool.WithGroupPoolOnSnapshot[task, string](func(shot retrypool.MetricsSnapshot[task]) {
+		// 	pp.Println(shot)
+		// }),
 	)
 	if err != nil {
 		panic(err)
@@ -79,6 +79,8 @@ func main() {
 	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {
 		return queueSize > 0 || processingCount > 0 || deadTaskCount > 0
 	}, time.Second)
+
+	<-time.After(5 * time.Second)
 
 	pool.Close()
 }

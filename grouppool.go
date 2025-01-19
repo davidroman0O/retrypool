@@ -245,12 +245,11 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
 	metadata := NewMetadata()
 	metadata.Set("pool_id", id)
 
-	// TODO: we should have options for that
 	opts := []Option[T]{
 		WithLogger[T](gp.config.Logger),
-		WithSnapshotInterval[T](time.Second / 4),
-		WithSnapshots[T](),
 		WithMetadata[T](metadata),
+		WithSnapshotInterval[T](time.Second / 4), // TODO: we should have options for that
+		WithSnapshots[T](),                       // TODO: we should have options for that
 		WithSnapshotCallback[T](func(ms MetricsSnapshot[T]) {
 			gp.snapshotMu.Lock()
 			if _, ok := gp.pools[id]; ok {
