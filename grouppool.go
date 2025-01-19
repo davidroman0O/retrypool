@@ -253,10 +253,12 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
 		WithMetadata[T](metadata),
 		WithSnapshotCallback[T](func(ms MetricsSnapshot[T]) {
 			gp.snapshotMu.Lock()
-			gp.pools[id].mu.Lock()
-			gp.snapshotGroups[gp.pools[id].assignedGroup] = ms
-			gp.pools[id].mu.Unlock()
-			gp.calculateMetricsSnapshot()
+			if _, ok := gp.pools[id]; ok {
+				gp.pools[id].mu.Lock()
+				gp.snapshotGroups[gp.pools[id].assignedGroup] = ms
+				gp.pools[id].mu.Unlock()
+				gp.calculateMetricsSnapshot()
+			}
 			gp.snapshotMu.Unlock()
 			if gp.config.onSnapshot != nil {
 				gp.config.onSnapshot()
