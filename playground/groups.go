@@ -45,9 +45,9 @@ func main() {
 		retrypool.WithGroupPoolOnTaskSuccess[task, string](func(gid string, pool uint, data task, metadata map[string]any) {
 			pp.Println("Task", data.ID, "from group", data.GID, "completed", metadata, "with", pool, "workers")
 		}),
-		// retrypool.WithGroupPoolOnSnapshot[task, string](func(shot retrypool.MetricsSnapshot[task]) {
-		// 	pp.Println(shot)
-		// }),
+		retrypool.WithGroupPoolOnSnapshot[task, string](func(snapshot retrypool.GroupMetricsSnapshot[task, string]) {
+			pp.Println("group pool snapshot::", snapshot)
+		}),
 	)
 	if err != nil {
 		panic(err)
@@ -55,25 +55,14 @@ func main() {
 
 	groups := []string{"group1", "group2", "group3", "group4", "group5"}
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				pp.Println(pool.GetSnapshot())
-			}
-		}
-	}()
-
 	for _, g := range groups {
-		go func() {
+		go func(groupID string) {
 			for i := range 1000 {
-				if err := pool.Submit(task{GID: g, ID: i}); err != nil {
+				if err := pool.Submit(task{GID: groupID, ID: i}); err != nil {
 					panic(err)
 				}
 			}
-		}()
+		}(g)
 	}
 
 	pool.WaitWithCallback(ctx, func(queueSize, processingCount, deadTaskCount int) bool {

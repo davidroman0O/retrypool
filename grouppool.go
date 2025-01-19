@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
@@ -29,21 +30,21 @@ type GroupPoolConfig[T any, GID comparable] struct {
 	// Called when a task is about to run. We pass the group ID, the pool ID, the *Task, and the worker ID.
 	OnTaskAttempt func(gid GID, poolID uint, task *Task[T], workerID int)
 	// Called whenever we get a snapshot from an underlying Pool. We pass that snapshot.
-	OnSnapshot func(snapshot MetricsSnapshot[T])
+	OnSnapshot func(snapshot GroupMetricsSnapshot[T, GID])
 
 	metadata *Metadata
 
-	onSnapshot func()
+	// onSnapshot func()
 }
 
 // GroupPoolOption is a functional option for configuring a GroupPool.
 type GroupPoolOption[T any, GID comparable] func(cfg *GroupPoolConfig[T, GID])
 
-func WithGroupSnapshotHandler[T any, GID comparable](cb func()) GroupPoolOption[T, GID] {
-	return func(c *GroupPoolConfig[T, GID]) {
-		c.onSnapshot = cb
-	}
-}
+// func WithGroupSnapshotHandler[T any, GID comparable](cb func()) GroupPoolOption[T, GID] {
+// 	return func(c *GroupPoolConfig[T, GID]) {
+// 		c.onSnapshot = cb
+// 	}
+// }
 
 func WithGroupPoolLogger[T any, GID comparable](logger Logger) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
@@ -93,7 +94,7 @@ func WithGroupPoolOnTaskAttempt[T any, GID comparable](cb func(gid GID, poolID u
 	}
 }
 
-func WithGroupPoolOnSnapshot[T any, GID comparable](cb func(snapshot MetricsSnapshot[T])) GroupPoolOption[T, GID] {
+func WithGroupPoolOnSnapshot[T any, GID comparable](cb func(snapshot GroupMetricsSnapshot[T, GID])) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.OnSnapshot = cb
 	}
@@ -113,6 +114,22 @@ type poolItem[T any, GID comparable] struct {
 	Pool          Pooler[T]
 	assignedGroup GID
 	busy          bool
+}
+
+// isZeroValueOfGroup uses reflection to detect if GID is a zero value
+func isZeroValueOfGroup[GID comparable](gid GID) bool {
+	// Get zero value for the type
+	var zero GID
+	return reflect.DeepEqual(gid, zero)
+}
+
+// validateGroupID verifies that the GID is not a zero value
+func (gp *GroupPool[T, GID]) validateGroupID(task T) error {
+	gid := task.GetGroupID()
+	if isZeroValueOfGroup(gid) {
+		return fmt.Errorf("invalid group ID: zero value detected for type %T", gid)
+	}
+	return nil
 }
 
 // GroupPool manages multiple pools, each identified by an internal incremental ID. When a group
@@ -201,14 +218,92 @@ func NewGroupPool[T GroupTask[GID], GID comparable](
 	return gp, nil
 }
 
-// GroupMetricsSnapshot holds aggregated metrics across all groups.
+// PoolMetricsSnapshot represents metrics for a single pool
+type PoolMetricsSnapshot[T any] struct {
+	PoolID        uint
+	AssignedGroup any // The GID will be type-asserted when used
+	IsActive      bool
+	QueueSize     int64
+	Workers       map[int]WorkerSnapshot[T]
+}
+
+// PendingTasksSnapshot represents metrics about pending tasks for each group
+type PendingTasksSnapshot[GID comparable] struct {
+	GroupID      GID
+	TasksPending int
+}
+
+// GroupMetricSnapshot now includes pool and task information
+type GroupMetricSnapshot[T any, GID comparable] struct {
+	GroupID         GID
+	PoolID          uint // The pool ID assigned to this group, if any
+	HasPool         bool // Whether this group has an assigned pool
+	IsPending       bool // Whether this group has pending tasks
+	TasksPending    int  // Number of pending tasks for this group
+	MetricsSnapshot MetricsSnapshot[T]
+}
+
+// GroupMetricsSnapshot now includes pool and pending tasks information
 type GroupMetricsSnapshot[T any, GID comparable] struct {
+	// Existing fields
 	TotalTasksSubmitted int64
 	TotalTasksProcessed int64
 	TotalTasksSucceeded int64
 	TotalTasksFailed    int64
 	TotalDeadTasks      int64
-	Metrics             []GroupMetricSnapshot[T, GID]
+
+	// New fields
+	TotalPools        int
+	ActivePools       int
+	TotalPendingTasks int
+	GroupsWithPending int
+
+	// Detailed metrics
+	pools        []PoolMetricsSnapshot[T]
+	PendingTasks []PendingTasksSnapshot[GID]
+	Metrics      []GroupMetricSnapshot[T, GID]
+}
+
+func (m GroupMetricsSnapshot[T, GID]) Clone() GroupMetricsSnapshot[T, GID] {
+	clone := GroupMetricsSnapshot[T, GID]{
+		TotalTasksSubmitted: m.TotalTasksSubmitted,
+		TotalTasksProcessed: m.TotalTasksProcessed,
+		TotalTasksSucceeded: m.TotalTasksSucceeded,
+		TotalTasksFailed:    m.TotalTasksFailed,
+		TotalDeadTasks:      m.TotalDeadTasks,
+		TotalPools:          m.TotalPools,
+		ActivePools:         m.ActivePools,
+		TotalPendingTasks:   m.TotalPendingTasks,
+		GroupsWithPending:   m.GroupsWithPending,
+		pools:               make([]PoolMetricsSnapshot[T], len(m.pools)),
+		PendingTasks:        make([]PendingTasksSnapshot[GID], len(m.PendingTasks)),
+		Metrics:             make([]GroupMetricSnapshot[T, GID], len(m.Metrics)),
+	}
+
+	// Deep copy pools
+	for i, pool := range m.pools {
+		poolClone := pool
+		poolClone.Workers = make(map[int]WorkerSnapshot[T], len(pool.Workers))
+		for k, v := range pool.Workers {
+			workerClone := v
+			if v.Metadata != nil {
+				workerClone.Metadata = make(map[string]any, len(v.Metadata))
+				for mk, mv := range v.Metadata {
+					workerClone.Metadata[mk] = mv
+				}
+			}
+			poolClone.Workers[k] = workerClone
+		}
+		clone.pools[i] = poolClone
+	}
+
+	// Copy pending tasks
+	copy(clone.PendingTasks, m.PendingTasks)
+
+	// Copy metrics
+	copy(clone.Metrics, m.Metrics)
+
+	return clone
 }
 
 func (p *GroupPool[T, GID]) GetSnapshot() GroupMetricsSnapshot[T, GID] {
@@ -218,18 +313,106 @@ func (p *GroupPool[T, GID]) GetSnapshot() GroupMetricsSnapshot[T, GID] {
 }
 
 func (p *GroupPool[T, GID]) calculateMetricsSnapshot() {
+
 	snapshot := GroupMetricsSnapshot[T, GID]{}
+
+	// Collect pool metrics
+	p.mu.RLock()
+	snapshot.TotalPools = len(p.pools)
+	snapshot.pools = make([]PoolMetricsSnapshot[T], 0, len(p.pools))
+
+	// Track active pools and collect pool metrics
+	for id, pool := range p.pools {
+		pool.mu.RLock()
+		isActive := pool.busy
+		assignedGroup := pool.assignedGroup
+		pool.mu.RUnlock()
+
+		if isActive {
+			snapshot.ActivePools++
+		}
+
+		// Collect worker metrics for this pool
+		workers := make(map[int]WorkerSnapshot[T])
+		if pooler := pool.Pool; pooler != nil {
+			pooler.RangeWorkers(func(workerID int, state WorkerSnapshot[T]) bool {
+				workers[workerID] = state
+				return true
+			})
+		}
+
+		// Get queue size for this pool
+		var queueSize int64
+		if pooler := pool.Pool; pooler != nil {
+			queueSize = pooler.QueueSize()
+		}
+
+		snapshot.pools = append(snapshot.pools, PoolMetricsSnapshot[T]{
+			PoolID:        id,
+			AssignedGroup: assignedGroup,
+			IsActive:      isActive,
+			QueueSize:     queueSize,
+			Workers:       workers,
+		})
+	}
+
+	// Collect pending tasks metrics
+	snapshot.PendingTasks = make([]PendingTasksSnapshot[GID], 0, len(p.pendingTasks))
+	snapshot.TotalPendingTasks = 0
+	snapshot.GroupsWithPending = len(p.pendingTasks)
+
+	for gid, tasks := range p.pendingTasks {
+		pendingCount := len(tasks)
+		snapshot.TotalPendingTasks += pendingCount
+		snapshot.PendingTasks = append(snapshot.PendingTasks, PendingTasksSnapshot[GID]{
+			GroupID:      gid,
+			TasksPending: pendingCount,
+		})
+	}
+	p.mu.RUnlock()
+
+	// Aggregate group metrics
 	for id, metric := range p.snapshotGroups {
 		snapshot.TotalTasksSubmitted += metric.TasksSubmitted
 		snapshot.TotalTasksProcessed += metric.TasksProcessed
 		snapshot.TotalTasksSucceeded += metric.TasksSucceeded
 		snapshot.TotalTasksFailed += metric.TasksFailed
 		snapshot.TotalDeadTasks += metric.DeadTasks
+
+		// Find pool assigned to this group
+		var poolID uint
+		var hasPool bool
+		var isPending bool
+		var tasksPending int
+
+		// Look for assigned pool
+		for _, pool := range snapshot.pools {
+			if pool.IsActive && pool.AssignedGroup == id {
+				poolID = pool.PoolID
+				hasPool = true
+				break
+			}
+		}
+
+		// Check if group has pending tasks
+		for _, pending := range snapshot.PendingTasks {
+			if pending.GroupID == id {
+				isPending = true
+				tasksPending = pending.TasksPending
+				break
+			}
+		}
+
 		snapshot.Metrics = append(snapshot.Metrics, GroupMetricSnapshot[T, GID]{
 			GroupID:         id,
+			PoolID:          poolID,
+			HasPool:         hasPool,
+			IsPending:       isPending,
+			TasksPending:    tasksPending,
 			MetricsSnapshot: metric,
 		})
 	}
+
 	p.snapshot = snapshot
 }
 
@@ -248,21 +431,26 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
 	opts := []Option[T]{
 		WithLogger[T](gp.config.Logger),
 		WithMetadata[T](metadata),
-		WithSnapshotInterval[T](time.Second / 4), // TODO: we should have options for that
-		WithSnapshots[T](),                       // TODO: we should have options for that
-		WithSnapshotCallback[T](func(ms MetricsSnapshot[T]) {
-			gp.snapshotMu.Lock()
-			if _, ok := gp.pools[id]; ok {
-				gp.pools[id].mu.Lock()
-				gp.snapshotGroups[gp.pools[id].assignedGroup] = ms
-				gp.pools[id].mu.Unlock()
-				gp.calculateMetricsSnapshot()
-			}
-			gp.snapshotMu.Unlock()
-			if gp.config.onSnapshot != nil {
-				gp.config.onSnapshot()
-			}
-		}),
+		WithSnapshots[T](),                              // TODO: we should have options for that
+		WithSnapshotInterval[T](time.Millisecond * 100), // TODO: we should have options for that
+		WithSnapshotCallback[T](
+			func(ms MetricsSnapshot[T]) {
+
+				gp.snapshotMu.Lock()
+
+				if pool, ok := gp.pools[id]; ok {
+					pool.mu.Lock()
+					gp.snapshotGroups[pool.assignedGroup] = ms
+					pool.mu.Unlock()
+					gp.calculateMetricsSnapshot()
+					if gp.config.OnSnapshot != nil {
+						gp.config.OnSnapshot(gp.snapshot)
+					}
+				}
+
+				gp.snapshotMu.Unlock()
+
+			}),
 	}
 
 	// We already wrapped OnTaskSuccess/OnTaskFailure in the constructor,
@@ -274,6 +462,7 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
 			userFn(gid, id, data, meta)
 		}))
 	}
+
 	if gp.config.OnTaskFailure != nil {
 		userFn := gp.config.OnTaskFailure
 		opts = append(opts, WithOnTaskFailure[T](func(data T, meta map[string]any, err error) TaskAction {
@@ -281,20 +470,16 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
 			return userFn(gid, id, data, meta, err)
 		}))
 	}
+
 	if gp.config.OnTaskAttempt != nil {
 		userFn := gp.config.OnTaskAttempt
 		opts = append(opts, WithOnTaskAttempt[T](func(tsk *Task[T], wid int) {
 			userFn(tsk.data.GetGroupID(), id, tsk, wid)
 		}))
 	}
-	if gp.config.OnSnapshot != nil {
-		userFn := gp.config.OnSnapshot
-		opts = append(opts, WithSnapshotCallback[T](func(s MetricsSnapshot[T]) {
-			userFn(s)
-		}))
-	}
 
 	p := New[T](gp.ctx, []Worker[T]{w}, opts...)
+
 	return &poolItem[T, GID]{
 		PoolID:        id,
 		Pool:          p,
@@ -475,6 +660,10 @@ func WithTaskGroupMetadata[T any, GID comparable](metadata map[string]any) Group
 // we try to assign one. If we can't, tasks go to pending for that group. We'll attempt to
 // consume pending whenever a pool is freed.
 func (gp *GroupPool[T, GID]) Submit(task T, options ...GroupTaskOption[T, GID]) error {
+	if err := gp.validateGroupID(task); err != nil {
+		return err
+	}
+
 	gid := task.GetGroupID()
 
 	gp.mu.Lock()

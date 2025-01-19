@@ -386,7 +386,7 @@ func (p *BlockingPool[T, GID, TID]) SetConcurrentWorkers(max int) {
 	p.mu.Unlock()
 }
 
-type GroupMetricSnapshot[T any, GID comparable] struct {
+type GroupBlockingMetricSnapshot[T any, GID comparable] struct {
 	GroupID GID
 	MetricsSnapshot[T]
 }
@@ -397,7 +397,7 @@ type BlockingMetricsSnapshot[T any, GID comparable] struct {
 	TotalTasksSucceeded int64
 	TotalTasksFailed    int64
 	TotalDeadTasks      int64
-	Metrics             []GroupMetricSnapshot[T, GID]
+	Metrics             []GroupBlockingMetricSnapshot[T, GID]
 }
 
 func (p *BlockingPool[T, GID, TID]) GetSnapshot() BlockingMetricsSnapshot[T, GID] {
@@ -438,7 +438,7 @@ func (p *BlockingPool[T, GID, TID]) calculateMetricsSnapshot() {
 		snapshot.TotalTasksSucceeded += metric.TasksSucceeded
 		snapshot.TotalTasksFailed += metric.TasksFailed
 		snapshot.TotalDeadTasks += metric.DeadTasks
-		snapshot.Metrics = append(snapshot.Metrics, GroupMetricSnapshot[T, GID]{
+		snapshot.Metrics = append(snapshot.Metrics, GroupBlockingMetricSnapshot[T, GID]{
 			GroupID:         id,
 			MetricsSnapshot: metric,
 		})

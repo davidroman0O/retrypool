@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/k0kubun/pp/v3"
 	"github.com/sasha-s/go-deadlock"
 	"golang.org/x/time/rate"
 )
@@ -59,7 +60,8 @@ type WorkerFactory[T any] func() Worker[T]
 type TaskState int
 
 const (
-	TaskStateCreated TaskState = iota
+	TaskStateNone TaskState = iota
+	TaskStateCreated
 	TaskStatePending
 	TaskStateQueued
 	TaskStateRunning
@@ -88,6 +90,18 @@ func (s TaskState) String() string {
 		return "Unknown"
 	}
 }
+
+type WorkerState string
+
+const (
+	WorkerStateCreated    WorkerState = "Created"
+	WorkerStateStarted    WorkerState = "Started"
+	WorkerStateIdle       WorkerState = "Idle"
+	WorkerStateEnqueuing  WorkerState = "Enqueuing"
+	WorkerStateProcessing WorkerState = "Processing"
+	WorkerStatePaused     WorkerState = "Paused"
+	WorkerStateRemoved    WorkerState = "Removed"
+)
 
 // TaskAction represents the action to take for a failed task
 type TaskAction int
@@ -314,6 +328,7 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 		if interval <= 0 {
 			interval = time.Second // Default interval
 		}
+		pp.Println("Starting metrics updater")
 		pool.StartMetricsUpdater(interval)
 	}
 
@@ -422,17 +437,22 @@ func (p *Pool[T]) calculateMetricsSnapshot() MetricsSnapshot[T] {
 func (p *Pool[T]) StartMetricsUpdater(interval time.Duration) {
 	p.snapshotTicker = time.NewTicker(interval)
 	go func() {
-		for range p.snapshotTicker.C {
-			snapshot := p.calculateMetricsSnapshot()
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-p.snapshotTicker.C:
+				snapshot := p.calculateMetricsSnapshot()
 
-			// Store the snapshot
-			p.snapshotMu.Lock()
-			p.metricsSnapshot = snapshot
-			p.snapshotMu.Unlock()
+				// Store the snapshot
+				p.snapshotMu.Lock()
+				p.metricsSnapshot = snapshot
+				p.snapshotMu.Unlock()
 
-			// Trigger the callback if set
-			if p.config.onSnapshot != nil {
-				p.config.onSnapshot(snapshot)
+				// Trigger the callback if set
+				if p.config.onSnapshot != nil {
+					p.config.onSnapshot(snapshot)
+				}
 			}
 		}
 	}()
@@ -869,6 +889,7 @@ type Task[T any] struct {
 	processedCb       func()
 	immediateRetry    bool
 	bounceRetry       bool
+	currentWorkerID   int
 	attemptedWorkers  map[int]struct{} // Track workers that attempted this task
 	lastWorkerID      int              // Last worker that processed this task
 	queuedAt          []time.Time      // When task entered different queues
@@ -1422,6 +1443,7 @@ type workerState[T any] struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	paused       atomic.Bool
+	state        WorkerState
 	currentTask  *Task[T]
 	taskQueue    TaskQueue[T]
 	removed      atomic.Bool
@@ -1439,6 +1461,7 @@ type WorkerSnapshot[T any] struct {
 	Removed  bool
 	HasTask  bool
 	Metadata map[string]any
+	State    WorkerState
 }
 
 // Add adds a new worker to the pool
@@ -1462,6 +1485,7 @@ func (p *Pool[T]) Add(worker Worker[T], queue TaskQueue[T]) error {
 
 	state := &workerState[T]{
 		worker:       worker,
+		state:        WorkerStateCreated,
 		id:           workerID,
 		ctx:          workerCtx,
 		cancel:       cancel,
@@ -1890,7 +1914,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 		// Create initial metadata map
 		meta := map[string]any{
 			"worker_id": state.id,
-			"assigned":  time.Now(),
+			"assigned":  time.Now().UnixNano(),
 		}
 
 		// Create a new Metadata instance for this operation
@@ -1915,6 +1939,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 		snapshot.Paused = false
 		snapshot.Removed = false
 		snapshot.Metadata = map[string]any{}
+		snapshot.State = WorkerStateIdle
 		p.workersSnapshotMu.Lock()
 		p.workersSnapshot[state.id] = snapshot
 		p.workersSnapshotMu.Unlock()
@@ -1922,6 +1947,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 		// First check if we're removed without holding any locks
 		if state.removed.Load() {
 			snapshot.Removed = true
+			snapshot.State = WorkerStateRemoved
 			p.workersSnapshotMu.Lock()
 			p.workersSnapshot[state.id] = snapshot
 			p.workersSnapshotMu.Unlock()
@@ -1934,6 +1960,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 			state.mu.Lock()
 			for state.paused.Load() && !state.removed.Load() {
 				snapshot.Paused = true
+				snapshot.State = WorkerStatePaused
 				p.workersSnapshotMu.Lock()
 				p.workersSnapshot[state.id] = snapshot
 				p.workersSnapshotMu.Unlock()
@@ -1971,6 +1998,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 		if !ok {
 			if state.removed.Load() {
 				snapshot.Removed = true
+				snapshot.State = WorkerStateRemoved
 				p.workersSnapshotMu.Lock()
 				p.workersSnapshot[state.id] = snapshot
 				p.workersSnapshotMu.Unlock()
@@ -2002,6 +2030,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 			state.mu.Unlock()
 
 			snapshot.HasTask = true
+			snapshot.State = WorkerStateEnqueuing
 			snapshot.Metadata = task.metadata.CloneStore() // only for snapshot // TODO: all those allocations could be in a sync.Pool
 			p.workersSnapshotMu.Lock()
 			p.workersSnapshot[state.id] = snapshot
@@ -2017,6 +2046,7 @@ func (p *Pool[T]) runWorker(state *workerState[T]) {
 
 			snapshot.HasTask = false
 			snapshot.Metadata = nil
+			snapshot.State = WorkerStateIdle
 			p.workersSnapshotMu.Lock()
 			p.workersSnapshot[state.id] = snapshot
 			p.workersSnapshotMu.Unlock()
@@ -2159,7 +2189,7 @@ func (p *Pool[T]) run() {
 					RetrypoolMetadataKey,
 					map[string]any{
 						"worker_id": state.id,
-						"assigned":  time.Now(),
+						"assigned":  time.Now().UnixNano(),
 					})
 				task.mu.Unlock()
 
@@ -2226,7 +2256,7 @@ func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
 	if p.metadata != nil {
 		meta := map[string]any{
 			"worker_id": state.id,
-			"assigned":  time.Now(),
+			"assigned":  time.Now().UnixNano(),
 		}
 
 		// Safely copy pool metadata
@@ -2251,6 +2281,11 @@ func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
 		task.mu.Unlock()
 	}
 	p.mu.RUnlock()
+
+	// Assign the current worker
+	task.mu.Lock()
+	task.currentWorkerID = state.id
+	task.mu.Unlock()
 
 	// Update metrics atomically
 	p.metrics.TasksProcessed.Add(1)
@@ -2284,6 +2319,12 @@ func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
 		p.handleTaskFailure(task, err)
 		return
 	}
+
+	p.workersSnapshotMu.Lock()
+	snapshot := p.workersSnapshot[state.id]
+	snapshot.State = WorkerStateProcessing
+	p.workersSnapshot[state.id] = snapshot
+	p.workersSnapshotMu.Unlock()
 
 	// Execute task with proper error handling
 	err := p.executeTask(ctx, state, task)
@@ -2343,7 +2384,7 @@ func (p *Pool[T]) enhanceTaskContext(ctx context.Context, task *Task[T]) context
 		task.metadata.mu.Unlock()
 
 		// Update snapshot metadata
-		snapshot := p.workersSnapshot[task.lastWorkerID]
+		snapshot := p.workersSnapshot[task.currentWorkerID]
 		if snapshot.Metadata == nil {
 			snapshot.Metadata = map[string]any{}
 		}
@@ -2355,7 +2396,7 @@ func (p *Pool[T]) enhanceTaskContext(ctx context.Context, task *Task[T]) context
 		snapshot.Metadata = newMetadata
 		// snapshot.Metadata.mu.Unlock()
 
-		p.workersSnapshot[task.lastWorkerID] = snapshot
+		p.workersSnapshot[task.currentWorkerID] = snapshot
 	})
 
 	ctx = context.WithValue(ctx, contextMetadataSetKey, funcMetadataSet)
@@ -2485,7 +2526,7 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 	}
 	if metaRaw := task.metadata.Get(RetrypoolMetadataKey); metaRaw != nil {
 		if metaBuffer, ok := metaRaw.(map[string]any); ok {
-			metaBuffer["completed"] = time.Now()
+			metaBuffer["completed"] = time.Now().UnixNano()
 			task.metadata.Set(RetrypoolMetadataKey, metaBuffer)
 		}
 	}
@@ -2512,6 +2553,13 @@ func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err
 	task.mu.Unlock()
 
 	p.taskPool.Put(task)
+
+	p.workersSnapshotMu.Lock()
+	snapshot := p.workersSnapshot[state.id]
+	snapshot.Metadata = nil
+	snapshot.HasTask = false
+	p.workersSnapshot[state.id] = snapshot
+	p.workersSnapshotMu.Unlock()
 }
 
 // handleTaskFailure handles a task failure
