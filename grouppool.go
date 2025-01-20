@@ -2,118 +2,952 @@ package retrypool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
-	"sync/atomic"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
 )
 
-// GroupTask is the interface for tasks that have a group ID.
+var (
+	ErrGroupNotFound     = errors.New("group not found")
+	ErrGroupEnded        = errors.New("group already ended")
+	ErrGroupFailed       = errors.New("group has failed")
+	ErrInvalidGroupID    = errors.New("invalid group ID")
+	ErrTaskGroupMismatch = errors.New("task group ID does not match submit group ID")
+)
+
+// GroupTask is the interface for tasks that have a group ID
 type GroupTask[GID comparable] interface {
 	GetGroupID() GID
 }
 
-// GroupPoolConfig holds configuration options for the GroupPool.
-type GroupPoolConfig[T any, GID comparable] struct {
+// GroupPoolConfig holds configuration options for the GroupPool
+type GroupPoolConfig[T GroupTask[GID], GID comparable] struct {
 	Logger            Logger
 	WorkerFactory     WorkerFactory[T]
 	MaxActivePools    int
 	MaxWorkersPerPool int
 	UseFreeWorkerOnly bool
+	GroupMustSucceed  bool // By default a group can have deadtask/failure, if true the pending tasks will be discarded
 
 	OnTaskSuccess func(gid GID, poolID uint, data T, metadata map[string]any)
 	OnTaskFailure func(gid GID, poolID uint, data T, metadata map[string]any, err error) TaskAction
-	OnTaskAttempt func(gid GID, poolID uint, task *Task[T], workerID int)
-	OnSnapshot    func(snapshot GroupMetricsSnapshot[T, GID])
 
-	OnGroupStart func(gid GID, poolID uint)
-	OnGroupEnd   func(gid GID, poolID uint)
+	// GroupPool specific callback handled either OnTaskSuccess or OnTaskFailure
+	OnTaskExecuted func(gid GID, poolID uint, data T, metadata map[string]any, err error)
+
+	OnSnapshot func(snapshot GroupMetricsSnapshot[T, GID])
+
+	OnGroupStarts func(gid GID, poolID uint)
+	OnGroupEnds   func(gid GID, poolID uint)
+	OnGroupFails  func(gid GID, poolID uint, pendingTasks []T) // Only if GroupMustSucceed is enabled
 
 	metadata *Metadata
 }
 
-// GroupPoolOption is a functional option for configuring a GroupPool.
-type GroupPoolOption[T any, GID comparable] func(cfg *GroupPoolConfig[T, GID])
+// GroupOption is a functional option for configuring a GroupPool
+type GroupPoolOption[T GroupTask[GID], GID comparable] func(*GroupPoolConfig[T, GID])
 
-func WithGroupPoolLogger[T any, GID comparable](logger Logger) GroupPoolOption[T, GID] {
+func WithGroupPoolLogger[T GroupTask[GID], GID comparable](logger Logger) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.Logger = logger
 	}
 }
 
-func WithGroupPoolWorkerFactory[T any, GID comparable](wf WorkerFactory[T]) GroupPoolOption[T, GID] {
+func WithGroupPoolWorkerFactory[T GroupTask[GID], GID comparable](wf WorkerFactory[T]) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.WorkerFactory = wf
 	}
 }
 
-func WithGroupPoolMaxActivePools[T any, GID comparable](max int) GroupPoolOption[T, GID] {
+func WithGroupPoolMaxActivePools[T GroupTask[GID], GID comparable](max int) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.MaxActivePools = max
 	}
 }
 
-func WithGroupPoolMaxWorkersPerPool[T any, GID comparable](max int) GroupPoolOption[T, GID] {
+func WithGroupPoolMaxWorkersPerPool[T GroupTask[GID], GID comparable](max int) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.MaxWorkersPerPool = max
 	}
 }
 
-func WithGroupPoolUseFreeWorkerOnly[T any, GID comparable]() GroupPoolOption[T, GID] {
+func WithGroupPoolUseFreeWorkerOnly[T GroupTask[GID], GID comparable]() GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.UseFreeWorkerOnly = true
 	}
 }
 
-func WithGroupPoolOnTaskSuccess[T any, GID comparable](cb func(gid GID, poolID uint, data T, metadata map[string]any)) GroupPoolOption[T, GID] {
+func WithGroupPoolOnTaskSuccess[T GroupTask[GID], GID comparable](cb func(gid GID, poolID uint, data T, metadata map[string]any)) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.OnTaskSuccess = cb
 	}
 }
 
-func WithGroupPoolOnTaskFailure[T any, GID comparable](cb func(gid GID, poolID uint, data T, metadata map[string]any, err error) TaskAction) GroupPoolOption[T, GID] {
+func WithGroupPoolOnTaskFailure[T GroupTask[GID], GID comparable](cb func(gid GID, poolID uint, data T, metadata map[string]any, err error) TaskAction) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.OnTaskFailure = cb
 	}
 }
 
-func WithGroupPoolOnTaskAttempt[T any, GID comparable](cb func(gid GID, poolID uint, task *Task[T], workerID int)) GroupPoolOption[T, GID] {
+func WithGroupPoolOnTaskExecuted[T GroupTask[GID], GID comparable](cb func(gid GID, poolID uint, data T, metadata map[string]any, err error)) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
-		cfg.OnTaskAttempt = cb
+		cfg.OnTaskExecuted = cb
 	}
 }
 
-func WithGroupPoolOnSnapshot[T any, GID comparable](cb func(snapshot GroupMetricsSnapshot[T, GID])) GroupPoolOption[T, GID] {
+func WithGroupPoolOnSnapshot[T GroupTask[GID], GID comparable](cb func(snapshot GroupMetricsSnapshot[T, GID])) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.OnSnapshot = cb
 	}
 }
 
-func WithGroupPoolOnGroupStart[T any, GID comparable](cb func(gid GID, poolID uint)) GroupPoolOption[T, GID] {
+func WithGroupPoolOnGroupStarts[T GroupTask[GID], GID comparable](cb func(gid GID, poolID uint)) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
-		cfg.OnGroupStart = cb
+		cfg.OnGroupStarts = cb
 	}
 }
 
-func WithGroupPoolOnGroupEnd[T any, GID comparable](cb func(gid GID, poolID uint)) GroupPoolOption[T, GID] {
+func WithGroupPoolOnGroupEnds[T GroupTask[GID], GID comparable](cb func(gid GID, poolID uint)) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
-		cfg.OnGroupEnd = cb
+		cfg.OnGroupEnds = cb
 	}
 }
 
-func WithGroupPoolMetadata[T any, GID comparable](m *Metadata) GroupPoolOption[T, GID] {
+func WithGroupPoolOnGroupFails[T GroupTask[GID], GID comparable](cb func(gid GID, poolID uint, pendingTasks []T)) GroupPoolOption[T, GID] {
+	return func(cfg *GroupPoolConfig[T, GID]) {
+		cfg.OnGroupFails = cb
+	}
+}
+
+func WithGroupPoolGroupMustSucceed[T GroupTask[GID], GID comparable](must bool) GroupPoolOption[T, GID] {
+	return func(cfg *GroupPoolConfig[T, GID]) {
+		cfg.GroupMustSucceed = must
+	}
+}
+
+func WithGroupPoolMetadata[T GroupTask[GID], GID comparable](m *Metadata) GroupPoolOption[T, GID] {
 	return func(cfg *GroupPoolConfig[T, GID]) {
 		cfg.metadata = m
 	}
 }
 
-// GroupConfig can hold per-group config if needed.
-type GroupConfig[T GroupTask[GID], GID comparable] struct{}
+func isZeroValueOfGroup[GID comparable](gid GID) bool {
+	var zero GID
+	return reflect.DeepEqual(gid, zero)
+}
 
-type GroupOption[T GroupTask[GID], GID comparable] func(*GroupConfig[T, GID])
+// Managed pool by group pool
+type poolGroupPoolItem[T GroupTask[GID], GID comparable] struct {
+	mu            deadlock.RWMutex
+	PoolID        uint
+	Pool          Pooler[T]
+	assignedGroup GID
+	busy          bool
+}
+
+// HasFreeWorkers checks if pool has any available workers
+func (pi *poolGroupPoolItem[T, GID]) HasFreeWorkers() bool {
+	if pi.Pool == nil {
+		return false
+	}
+
+	freeWorkers := pi.Pool.GetFreeWorkers()
+	return len(freeWorkers) > 0
+}
+
+// Not yet ready to be sent
+// - no pool own that group yet
+type poolGroupPending[T GroupTask[GID], GID comparable] struct {
+	groupID GID
+	tasks   []T
+	isEnded bool
+	endTime time.Time
+}
+
+// Own by a pool and active
+type poolGroupActive[T GroupTask[GID], GID comparable] struct {
+	poolID   uint
+	groupID  GID
+	isEnded  bool // Will refuse new tasks
+	isFailed bool // Track group failure state
+	tasks    []T  // Tasks not yet sent
+	fails    []T  // Failed tasks
+}
+
+type GroupPool[T GroupTask[GID], GID comparable] struct {
+	mu     deadlock.RWMutex
+	ctx    context.Context
+	cancel context.CancelFunc
+	config GroupPoolConfig[T, GID]
+
+	pools map[uint]*poolGroupPoolItem[T, GID]
+
+	activeGroups  map[GID]*poolGroupActive[T, GID]
+	pendingGroups map[GID]*poolGroupPending[T, GID]
+
+	completedPendingGroups []GID
+
+	// Keep accumulative group metrics
+	snapshotMu     deadlock.RWMutex
+	poolMetrics    map[uint]MetricsSnapshot[T]
+	snapshotGroups map[GID]MetricsSnapshot[T]
+
+	// The final snapshot
+	snapshot GroupMetricsSnapshot[T, GID]
+
+	nextPoolID uint
+}
+
+// NewGroupPool creates a new GroupPool instance with provided options
+func NewGroupPool[T GroupTask[GID], GID comparable](
+	ctx context.Context,
+	opts ...GroupPoolOption[T, GID],
+) (*GroupPool[T, GID], error) {
+	if ctx == nil {
+		return nil, errors.New("context cannot be nil")
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	cfg := GroupPoolConfig[T, GID]{
+		Logger:            NewLogger(slog.LevelDebug),
+		MaxActivePools:    -1,
+		MaxWorkersPerPool: -1,
+		UseFreeWorkerOnly: false,
+		GroupMustSucceed:  false,
+	}
+	cfg.Logger.Disable()
+
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	if cfg.WorkerFactory == nil {
+		return nil, fmt.Errorf("worker factory is required")
+	}
+
+	gp := &GroupPool[T, GID]{
+		ctx:                    ctx,
+		cancel:                 cancel,
+		config:                 cfg,
+		pools:                  make(map[uint]*poolGroupPoolItem[T, GID]),
+		activeGroups:           make(map[GID]*poolGroupActive[T, GID]),
+		pendingGroups:          make(map[GID]*poolGroupPending[T, GID]),
+		completedPendingGroups: make([]GID, 0),
+		poolMetrics:            make(map[uint]MetricsSnapshot[T]),
+		snapshotGroups:         make(map[GID]MetricsSnapshot[T]),
+	}
+
+	return gp, nil
+}
+
+// buildPool creates a new internal pool with proper configuration and event handling
+func (gp *GroupPool[T, GID]) buildPool() (*poolGroupPoolItem[T, GID], error) {
+	worker := gp.config.WorkerFactory()
+	if worker == nil {
+		return nil, fmt.Errorf("worker factory returned nil")
+	}
+
+	id := gp.nextPoolID
+	gp.nextPoolID++
+
+	metadata := NewMetadata()
+	metadata.Set("pool_id", id)
+
+	opts := []Option[T]{
+		WithLogger[T](gp.config.Logger),
+		WithMetadata[T](metadata),
+		WithSnapshots[T](),
+		WithSnapshotInterval[T](time.Millisecond * 100),
+		WithSnapshotCallback[T](func(ms MetricsSnapshot[T]) {
+			gp.snapshotMu.Lock()
+			if _, havePool := gp.pools[id]; havePool {
+				gp.poolMetrics[id] = ms
+				gp.calculateMetricsSnapshot()
+			}
+			snapshot := gp.snapshot.Clone()
+			gp.snapshotMu.Unlock()
+
+			if gp.config.OnSnapshot != nil {
+				gp.config.OnSnapshot(snapshot)
+			}
+		}),
+	}
+
+	// Set success/failure handlers that call OnTaskExecuted
+	opts = append(opts, WithOnTaskSuccess[T](func(data T, meta map[string]any) {
+		if gp.config.OnTaskExecuted != nil {
+			retrypoolMeta, ok := meta[RetrypoolMetadataKey].(map[string]any)
+			if !ok {
+				retrypoolMeta = map[string]any{}
+			}
+			gp.config.OnTaskExecuted(data.GetGroupID(), id, data, retrypoolMeta, nil)
+		}
+		if gp.config.OnTaskSuccess != nil {
+			gp.config.OnTaskSuccess(data.GetGroupID(), id, data, meta)
+		}
+		gp.onTaskExecuted(data.GetGroupID(), id, data, meta, nil)
+	}))
+
+	opts = append(opts, WithOnTaskFailure[T](func(data T, meta map[string]any, err error) TaskAction {
+		if gp.config.OnTaskExecuted != nil {
+			retrypoolMeta, ok := meta[RetrypoolMetadataKey].(map[string]any)
+			if !ok {
+				retrypoolMeta = map[string]any{}
+			}
+			gp.config.OnTaskExecuted(data.GetGroupID(), id, data, retrypoolMeta, err)
+		}
+
+		var action TaskAction
+		if gp.config.OnTaskFailure != nil {
+			action = gp.config.OnTaskFailure(data.GetGroupID(), id, data, meta, err)
+		} else {
+			action = TaskActionRemove
+		}
+
+		gp.onTaskExecuted(data.GetGroupID(), id, data, meta, err)
+		return action
+	}))
+
+	pool := New[T](gp.ctx, []Worker[T]{worker}, opts...)
+
+	return &poolGroupPoolItem[T, GID]{
+		PoolID:        id,
+		Pool:          pool,
+		assignedGroup: *new(GID),
+		busy:          false,
+	}, nil
+}
+
+// Submit task to a group
+func (gp *GroupPool[T, GID]) Submit(gid GID, task T, opts ...GroupTaskOption[T, GID]) error {
+	if isZeroValueOfGroup(gid) {
+		return ErrInvalidGroupID
+	}
+
+	if gid != task.GetGroupID() {
+		return ErrTaskGroupMismatch
+	}
+
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+
+	// Check if group is active
+	if active, ok := gp.activeGroups[gid]; ok {
+		// Group exists and is active
+
+		if active.isEnded {
+			return ErrGroupEnded
+		}
+
+		if active.isFailed && gp.config.GroupMustSucceed {
+			return ErrGroupFailed
+		}
+
+		// Get assigned pool
+		pi, ok := gp.pools[active.poolID]
+		if !ok {
+			return fmt.Errorf("pool %d not found for active group %v", active.poolID, gid)
+		}
+
+		// If we have pending tasks, append this one
+		if len(active.tasks) > 0 {
+			active.tasks = append(active.tasks, task)
+			return nil
+		}
+
+		// If we need free workers, check availability
+		if gp.config.UseFreeWorkerOnly && !pi.HasFreeWorkers() {
+			active.tasks = append(active.tasks, task)
+			return nil
+		}
+
+		// Submit directly
+		return gp.submitToPool(pi, task, opts...)
+
+	} else {
+		// Group is not active yet
+
+		// Check if group failed before
+		if pg, exists := gp.pendingGroups[gid]; exists && pg.isEnded && gp.config.GroupMustSucceed {
+			return ErrGroupFailed
+		}
+
+		// Get or create pending group
+		pg, ok := gp.pendingGroups[gid]
+		if !ok {
+			pg = &poolGroupPending[T, GID]{
+				groupID: gid,
+				tasks:   make([]T, 0),
+			}
+			gp.pendingGroups[gid] = pg
+		}
+
+		// Add task to pending
+		pg.tasks = append(pg.tasks, task)
+
+		// Try to activate the group
+		return gp.tryActivatePendingGroup()
+	}
+}
+
+// submitToPool handles submitting a task to a specific pool with proper configuration
+func (gp *GroupPool[T, GID]) submitToPool(pi *poolGroupPoolItem[T, GID], t T, opts ...GroupTaskOption[T, GID]) error {
+	cfg := &groupSubmitConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	var taskOpts []TaskOption[T]
+	if cfg.queueNotification != nil {
+		taskOpts = append(taskOpts, WithTaskQueuedNotification[T](cfg.queueNotification))
+	}
+	if cfg.processedNotification != nil {
+		taskOpts = append(taskOpts, WithTaskProcessedNotification[T](cfg.processedNotification))
+	}
+
+	// Build metadata merging existing and group info
+	meta := NewMetadata()
+	if cfg.metadata != nil {
+		for k, v := range cfg.metadata {
+			meta.Set(k, v)
+		}
+	}
+	meta.Set("$group", map[string]interface{}{
+		"$groupID": t.GetGroupID(),
+		"$poolID":  pi.PoolID,
+	})
+	taskOpts = append(taskOpts, WithTaskMetadata[T](meta))
+
+	if gp.config.UseFreeWorkerOnly {
+		return pi.Pool.SubmitToFreeWorker(t, taskOpts...)
+	}
+	return pi.Pool.Submit(t, taskOpts...)
+}
+
+// EndGroup signals no more tasks for the group, but allows existing tasks to complete
+func (gp *GroupPool[T, GID]) EndGroup(gid GID) error {
+	if isZeroValueOfGroup(gid) {
+		return ErrInvalidGroupID
+	}
+
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+
+	// Check if group is active - just mark as ended and continue processing
+	if active, ok := gp.activeGroups[gid]; ok {
+		// Just mark as ended - tasks will continue processing
+		active.isEnded = true
+		return nil
+	}
+
+	// Check if group is pending
+	pg, ok := gp.pendingGroups[gid]
+	if !ok {
+		return ErrGroupNotFound
+	}
+
+	if pg.isEnded {
+		return ErrGroupEnded
+	}
+
+	// Mark pending group as ended, but keep tasks
+	pg.isEnded = true
+	pg.endTime = time.Now()
+
+	// Add to completed pending groups if not already there
+	found := false
+	for _, cgid := range gp.completedPendingGroups {
+		if cgid == gid {
+			found = true
+			break
+		}
+	}
+	if !found {
+		gp.completedPendingGroups = append(gp.completedPendingGroups, gid)
+	}
+
+	// Try to activate group - tasks will be processed normally
+	return gp.tryActivatePendingGroup()
+}
+
+// onTaskExecuted becomes the key driver of task flow
+func (gp *GroupPool[T, GID]) onTaskExecuted(gid GID, poolID uint, data T, metadata map[string]any, err error) {
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+
+	active, ok := gp.activeGroups[gid]
+	if !ok {
+		return
+	}
+
+	// If group must succeed and there was an error
+	if err != nil && gp.config.GroupMustSucceed {
+		active.isFailed = true
+
+		// Get remaining tasks
+		remaining := active.tasks
+
+		// Clean up pool
+		pi := gp.pools[poolID]
+		if pi != nil {
+			pi.mu.Lock()
+			pi.assignedGroup = *new(GID)
+			pi.busy = false
+			pi.mu.Unlock()
+		}
+
+		// Clear metrics
+		delete(gp.snapshotGroups, gid)
+		delete(gp.activeGroups, gid)
+
+		// Notify failure
+		if gp.config.OnGroupFails != nil {
+			gp.config.OnGroupFails(gid, poolID, remaining)
+		}
+
+		// Try to activate next group
+		gp.tryActivatePendingGroup()
+		return
+	}
+
+	// Check for more pending tasks
+	if len(active.tasks) > 0 {
+
+		// Submit next task
+		next := active.tasks[0]
+		active.tasks = active.tasks[1:]
+
+		pi := gp.pools[poolID]
+		if err := gp.submitToPool(pi, next); err != nil {
+			active.fails = append(active.fails, next)
+			if gp.config.GroupMustSucceed {
+				active.isFailed = true
+
+				if gp.config.OnGroupFails != nil {
+					gp.config.OnGroupFails(gid, poolID, active.tasks)
+				}
+
+				delete(gp.activeGroups, gid)
+				pi.mu.Lock()
+				pi.assignedGroup = *new(GID)
+				pi.busy = false
+				pi.mu.Unlock()
+
+				gp.tryActivatePendingGroup()
+			}
+		}
+		return
+	}
+
+	// Only clean up when no more tasks AND ended
+	if len(active.tasks) == 0 && active.isEnded {
+		// Notify group end
+		if gp.config.OnGroupEnds != nil {
+			gp.config.OnGroupEnds(gid, poolID)
+		}
+
+		// Clean up group
+		delete(gp.activeGroups, gid)
+		delete(gp.snapshotGroups, gid)
+
+		// Clean up pool
+		pi := gp.pools[poolID]
+		if pi != nil {
+			pi.mu.Lock()
+			pi.assignedGroup = *new(GID)
+			pi.busy = false
+			pi.mu.Unlock()
+		}
+
+		// Try to activate next group
+		gp.tryActivatePendingGroup()
+	}
+}
+
+// tryActivatePendingGroup attempts to activate a pending group if resources available
+func (gp *GroupPool[T, GID]) tryActivatePendingGroup() error {
+	// Find or create available pool
+	pi, err := gp.findOrCreateFreePoolLocked()
+	if err != nil {
+		return err
+	}
+	if pi == nil {
+		// No pool available
+		return nil
+	}
+
+	// Handle completed pending groups first
+	if len(gp.completedPendingGroups) > 0 {
+		gid := gp.completedPendingGroups[0]
+		gp.completedPendingGroups = gp.completedPendingGroups[1:]
+
+		pg, ok := gp.pendingGroups[gid]
+		if !ok {
+			return gp.tryActivatePendingGroup()
+		}
+
+		// Create active group - even if ended we activate to process remaining tasks
+		active := &poolGroupActive[T, GID]{
+			poolID:   pi.PoolID,
+			groupID:  gid,
+			isEnded:  pg.isEnded,
+			isFailed: false,
+			tasks:    make([]T, len(pg.tasks)),
+			fails:    make([]T, 0),
+		}
+		copy(active.tasks, pg.tasks)
+
+		// Update mappings
+		delete(gp.pendingGroups, gid)
+		gp.activeGroups[gid] = active
+
+		// Update pool
+		pi.mu.Lock()
+		pi.assignedGroup = gid
+		pi.busy = true
+		pi.mu.Unlock()
+
+		// Initialize metrics if needed
+		if _, exists := gp.snapshotGroups[gid]; !exists {
+			gp.snapshotGroups[gid] = MetricsSnapshot[T]{}
+		}
+
+		// Notify group start
+		if gp.config.OnGroupStarts != nil {
+			gp.config.OnGroupStarts(gid, pi.PoolID)
+		}
+
+		// Submit first task if any
+		if len(active.tasks) > 0 {
+			task := active.tasks[0]
+			active.tasks = active.tasks[1:]
+			if err := gp.submitToPool(pi, task); err != nil {
+				active.fails = append(active.fails, task)
+				if gp.config.GroupMustSucceed {
+					active.isFailed = true
+					if gp.config.OnGroupFails != nil {
+						gp.config.OnGroupFails(gid, pi.PoolID, active.tasks)
+					}
+					delete(gp.activeGroups, gid)
+					pi.mu.Lock()
+					pi.assignedGroup = *new(GID)
+					pi.busy = false
+					pi.mu.Unlock()
+					return gp.tryActivatePendingGroup()
+				}
+			}
+		}
+
+		return nil
+	}
+
+	// Try other pending groups
+	for gid, pg := range gp.pendingGroups {
+		// Create active group
+		active := &poolGroupActive[T, GID]{
+			poolID:   pi.PoolID,
+			groupID:  gid,
+			isEnded:  pg.isEnded,
+			isFailed: false,
+			tasks:    make([]T, len(pg.tasks)),
+			fails:    make([]T, 0),
+		}
+		copy(active.tasks, pg.tasks)
+
+		// Update mappings
+		delete(gp.pendingGroups, gid)
+		gp.activeGroups[gid] = active
+
+		// Update pool
+		pi.mu.Lock()
+		pi.assignedGroup = gid
+		pi.busy = true
+		pi.mu.Unlock()
+
+		// Initialize metrics if needed
+		if _, exists := gp.snapshotGroups[gid]; !exists {
+			gp.snapshotGroups[gid] = MetricsSnapshot[T]{}
+		}
+
+		// Notify group start
+		if gp.config.OnGroupStarts != nil {
+			gp.config.OnGroupStarts(gid, pi.PoolID)
+		}
+
+		// Submit first task if any
+		if len(active.tasks) > 0 {
+			task := active.tasks[0]
+			active.tasks = active.tasks[1:]
+			if err := gp.submitToPool(pi, task); err != nil {
+				active.fails = append(active.fails, task)
+				if gp.config.GroupMustSucceed {
+					active.isFailed = true
+					if gp.config.OnGroupFails != nil {
+						gp.config.OnGroupFails(gid, pi.PoolID, active.tasks)
+					}
+					delete(gp.activeGroups, gid)
+					pi.mu.Lock()
+					pi.assignedGroup = *new(GID)
+					pi.busy = false
+					pi.mu.Unlock()
+					return gp.tryActivatePendingGroup()
+				}
+			}
+		}
+
+		break // Only activate one group at a time
+	}
+
+	return nil
+}
+
+// findOrCreateFreePoolLocked finds an available pool or creates a new one if allowed
+func (gp *GroupPool[T, GID]) findOrCreateFreePoolLocked() (*poolGroupPoolItem[T, GID], error) {
+	// Look for existing free pool
+	var free *poolGroupPoolItem[T, GID]
+	for _, pi := range gp.pools {
+		pi.mu.RLock()
+		busy := pi.busy
+		pi.mu.RUnlock()
+		if !busy {
+			free = pi
+			break
+		}
+	}
+
+	if free != nil {
+		return free, nil
+	}
+
+	// Count active pools
+	activeCount := 0
+	for _, pi := range gp.pools {
+		pi.mu.RLock()
+		if pi.busy {
+			activeCount++
+		}
+		pi.mu.RUnlock()
+	}
+
+	// Check if we can create new pool
+	if gp.config.MaxActivePools >= 0 && activeCount >= gp.config.MaxActivePools {
+		return nil, nil
+	}
+
+	// Create new pool
+	newPool, err := gp.buildPool()
+	if err != nil {
+		return nil, err
+	}
+	gp.pools[newPool.PoolID] = newPool
+	return newPool, nil
+}
+
+// WaitGroup waits for all tasks in a group to complete
+func (gp *GroupPool[T, GID]) WaitGroup(ctx context.Context, gid GID) error {
+	if isZeroValueOfGroup(gid) {
+		return ErrInvalidGroupID
+	}
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-ticker.C:
+			gp.mu.Lock()
+
+			// Check if group is active
+			if active, ok := gp.activeGroups[gid]; ok {
+				pi, exist := gp.pools[active.poolID]
+				if !exist {
+					gp.mu.Unlock()
+					continue
+				}
+
+				// We only complete if no more tasks and ended
+				qSize := pi.Pool.QueueSize()
+				pCount := pi.Pool.ProcessingCount()
+				if qSize == 0 && pCount == 0 && len(active.tasks) == 0 && active.isEnded {
+					gp.mu.Unlock()
+					continue
+				}
+
+				gp.mu.Unlock()
+				continue
+			}
+
+			// Check if group is pending
+			if pg, exists := gp.pendingGroups[gid]; exists {
+				if !pg.isEnded {
+					gp.mu.Unlock()
+					continue
+				}
+				gp.mu.Unlock()
+				continue
+			}
+
+			// Group not found -> completed
+			gp.mu.Unlock()
+			return nil
+		}
+	}
+}
+
+// Close gracefully shuts down all pools and cleans up resources
+func (gp *GroupPool[T, GID]) Close() error {
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+
+	// Cancel context
+	gp.cancel()
+
+	// Close all pools
+	var firstErr error
+	for id, pi := range gp.pools {
+		pi.mu.Lock()
+		p := pi.Pool
+		pi.mu.Unlock()
+
+		if err := p.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		delete(gp.pools, id)
+	}
+
+	// Clear maps
+	gp.activeGroups = make(map[GID]*poolGroupActive[T, GID])
+	gp.pendingGroups = make(map[GID]*poolGroupPending[T, GID])
+	gp.completedPendingGroups = nil
+	gp.poolMetrics = make(map[uint]MetricsSnapshot[T])
+	gp.snapshotGroups = make(map[GID]MetricsSnapshot[T])
+
+	return firstErr
+}
+
+// GetSnapshot returns current metrics snapshot
+func (gp *GroupPool[T, GID]) GetSnapshot() GroupMetricsSnapshot[T, GID] {
+	gp.snapshotMu.RLock()
+	defer gp.snapshotMu.RUnlock()
+	return gp.snapshot.Clone()
+}
+
+// calculateMetricsSnapshot aggregates metrics from internal pools and groups
+func (gp *GroupPool[T, GID]) calculateMetricsSnapshot() {
+	snap := GroupMetricsSnapshot[T, GID]{
+		Pools:        make([]PoolMetricsSnapshot[T], 0),
+		PendingTasks: make([]PendingTasksSnapshot[GID], 0),
+		Metrics:      make([]GroupMetricSnapshot[T, GID], 0),
+	}
+
+	// Sum up totals from pool metrics
+	for _, metrics := range gp.poolMetrics {
+		snap.TotalTasksSubmitted += metrics.TasksSubmitted
+		snap.TotalTasksProcessed += metrics.TasksProcessed
+		snap.TotalTasksSucceeded += metrics.TasksSucceeded
+		snap.TotalTasksFailed += metrics.TasksFailed
+		snap.TotalDeadTasks += metrics.DeadTasks
+	}
+
+	// Collect pools info
+	gp.mu.RLock()
+	snap.TotalPools = len(gp.pools)
+
+	activeCount := 0
+	for id, pi := range gp.pools {
+		pi.mu.RLock()
+		assigned := pi.assignedGroup
+		busy := pi.busy
+		pi.mu.RUnlock()
+
+		if busy {
+			activeCount++
+		}
+
+		workers := make(map[int]WorkerSnapshot[T])
+		qSize := int64(0)
+		if pi.Pool != nil {
+			pi.Pool.RangeWorkers(func(wid int, s WorkerSnapshot[T]) bool {
+				workers[wid] = s
+				return true
+			})
+			qSize = pi.Pool.QueueSize()
+		}
+
+		snap.Pools = append(snap.Pools, PoolMetricsSnapshot[T]{
+			PoolID:        id,
+			AssignedGroup: assigned,
+			IsActive:      busy,
+			QueueSize:     qSize,
+			Workers:       workers,
+		})
+	}
+	snap.ActivePools = activeCount
+
+	// Collect pending groups info
+	snap.GroupsWithPending = len(gp.pendingGroups)
+	for gid, pg := range gp.pendingGroups {
+		snap.TotalPendingTasks += len(pg.tasks)
+		snap.PendingTasks = append(snap.PendingTasks, PendingTasksSnapshot[GID]{
+			GroupID:      gid,
+			TasksPending: len(pg.tasks),
+		})
+	}
+
+	// Track groups to collect metrics for
+	activeOrPending := make(map[GID]bool)
+	for g := range gp.activeGroups {
+		activeOrPending[g] = true
+	}
+	for g := range gp.pendingGroups {
+		activeOrPending[g] = true
+	}
+
+	// Collect metrics for each group
+	for gID := range gp.snapshotGroups {
+		if !activeOrPending[gID] {
+			continue
+		}
+
+		active, inActive := gp.activeGroups[gID]
+		pending, inPending := gp.pendingGroups[gID]
+
+		var pid uint
+		var hasPool bool
+		var isPending bool
+		var pendCount int
+
+		if inActive {
+			pid = active.poolID
+			hasPool = true
+		}
+
+		if inPending {
+			isPending = true
+			pendCount = len(pending.tasks)
+		}
+
+		snap.Metrics = append(snap.Metrics, GroupMetricSnapshot[T, GID]{
+			GroupID:         gID,
+			PoolID:          pid,
+			HasPool:         hasPool,
+			IsPending:       isPending,
+			TasksPending:    pendCount,
+			MetricsSnapshot: gp.snapshotGroups[gID],
+		})
+	}
+	gp.mu.RUnlock()
+
+	gp.snapshot = snap
+}
 
 type groupSubmitConfig struct {
 	queueNotification     *QueuedNotification
@@ -141,51 +975,7 @@ func WithTaskGroupMetadata[T any, GID comparable](metadata map[string]any) Group
 	}
 }
 
-type instructionType int
-
-const (
-	instructStart instructionType = iota
-	instructSubmit
-	instructEnd
-)
-
-type instruction[T GroupTask[GID], GID comparable] struct {
-	instruct  instructionType
-	task      T
-	groupOpts []GroupOption[T, GID]
-	taskOpts  []GroupTaskOption[T, GID]
-	timestamp time.Time
-}
-
-type pendingGroup[T GroupTask[GID], GID comparable] struct {
-	instructions []instruction[T, GID]
-	config       GroupConfig[T, GID]
-	isEnded      bool
-	endTime      time.Time
-}
-
-type groupState struct {
-	poolID         uint
-	isActive       bool
-	isEnded        bool
-	taskCount      atomic.Int64
-	completedCount atomic.Int64
-}
-
-type poolItem[T any, GID comparable] struct {
-	mu            deadlock.RWMutex
-	PoolID        uint
-	Pool          Pooler[T]
-	assignedGroup GID
-	busy          bool
-}
-
-func isZeroValueOfGroup[GID comparable](gid GID) bool {
-	var zero GID
-	return reflect.DeepEqual(gid, zero)
-}
-
-// PoolMetricsSnapshot represents metrics for a single pool.
+// PoolMetricsSnapshot represents metrics for a single pool
 type PoolMetricsSnapshot[T any] struct {
 	PoolID        uint
 	AssignedGroup any
@@ -209,7 +999,7 @@ type GroupMetricSnapshot[T any, GID comparable] struct {
 }
 
 type GroupMetricsSnapshot[T any, GID comparable] struct {
-	// These totals are GLOBAL and never reset.
+	// These totals are GLOBAL and never reset
 	TotalTasksSubmitted int64
 	TotalTasksProcessed int64
 	TotalTasksSucceeded int64
@@ -226,6 +1016,7 @@ type GroupMetricsSnapshot[T any, GID comparable] struct {
 	Metrics      []GroupMetricSnapshot[T, GID]
 }
 
+// Clone creates a deep copy of the snapshot
 func (m GroupMetricsSnapshot[T, GID]) Clone() GroupMetricsSnapshot[T, GID] {
 	clone := GroupMetricsSnapshot[T, GID]{
 		TotalTasksSubmitted: m.TotalTasksSubmitted,
@@ -242,6 +1033,7 @@ func (m GroupMetricsSnapshot[T, GID]) Clone() GroupMetricsSnapshot[T, GID] {
 		Metrics:             make([]GroupMetricSnapshot[T, GID], len(m.Metrics)),
 	}
 
+	// Deep copy pools
 	for i, pool := range m.Pools {
 		poolClone := pool
 		poolClone.Workers = make(map[int]WorkerSnapshot[T], len(pool.Workers))
@@ -258,1107 +1050,9 @@ func (m GroupMetricsSnapshot[T, GID]) Clone() GroupMetricsSnapshot[T, GID] {
 		clone.Pools[i] = poolClone
 	}
 
+	// Copy simple slices
 	copy(clone.PendingTasks, m.PendingTasks)
 	copy(clone.Metrics, m.Metrics)
 
 	return clone
-}
-
-type GroupPool[T GroupTask[GID], GID comparable] struct {
-	mu                     deadlock.RWMutex
-	ctx                    context.Context
-	cancel                 context.CancelFunc
-	config                 GroupPoolConfig[T, GID]
-	pools                  map[uint]*poolItem[T, GID]
-	activeGroups           map[GID]*groupState
-	pendingGroups          map[GID]*pendingGroup[T, GID]
-	completedPendingGroups []GID
-
-	// Keep accumulative group metrics for each active/pending group:
-	snapshotMu     deadlock.RWMutex
-	poolMetrics    map[uint]MetricsSnapshot[T] // Track metrics per pool
-	snapshotGroups map[GID]MetricsSnapshot[T]
-
-	// The final snapshot
-	snapshot GroupMetricsSnapshot[T, GID]
-
-	nextPoolID uint
-}
-
-// NewGroupPool constructs a new GroupPool with the supplied options.
-func NewGroupPool[T GroupTask[GID], GID comparable](
-	ctx context.Context,
-	opts ...GroupPoolOption[T, GID],
-) (*GroupPool[T, GID], error) {
-	cfg := GroupPoolConfig[T, GID]{
-		Logger:            NewLogger(slog.LevelDebug),
-		MaxActivePools:    -1,
-		MaxWorkersPerPool: -1,
-		UseFreeWorkerOnly: false,
-	}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	if cfg.WorkerFactory == nil {
-		return nil, fmt.Errorf("worker factory is required")
-	}
-
-	c, cancel := context.WithCancel(ctx)
-	gp := &GroupPool[T, GID]{
-		ctx:                    c,
-		cancel:                 cancel,
-		config:                 cfg,
-		pools:                  make(map[uint]*poolItem[T, GID]),
-		activeGroups:           make(map[GID]*groupState),
-		pendingGroups:          make(map[GID]*pendingGroup[T, GID]),
-		completedPendingGroups: make([]GID, 0),
-		snapshotGroups:         make(map[GID]MetricsSnapshot[T]),
-		poolMetrics:            make(map[uint]MetricsSnapshot[T]),
-	}
-	return gp, nil
-}
-
-// buildPool creates a new internal Pool. We wrap user callbacks to detect completion.
-func (gp *GroupPool[T, GID]) buildPool() (*poolItem[T, GID], error) {
-	w := gp.config.WorkerFactory()
-	if w == nil {
-		return nil, fmt.Errorf("worker factory returned nil")
-	}
-	id := gp.nextPoolID
-	gp.nextPoolID++
-
-	metadata := NewMetadata()
-	metadata.Set("pool_id", id)
-
-	opts := []Option[T]{
-		WithLogger[T](gp.config.Logger),
-		WithMetadata[T](metadata),
-		WithSnapshots[T](),
-		WithSnapshotInterval[T](time.Millisecond * 100),
-		WithSnapshotCallback[T](func(ms MetricsSnapshot[T]) {
-			gp.snapshotMu.Lock()
-			if _, havePool := gp.pools[id]; havePool {
-				// Store the latest metrics for this pool
-				gp.poolMetrics[id] = ms
-
-				// Calculate and update snapshot under the same lock
-				gp.calculateMetricsSnapshotLocked()
-			}
-			// Get a copy of the snapshot while still holding the lock
-			snapshot := gp.snapshot.Clone()
-			gp.snapshotMu.Unlock()
-
-			// Call user callback outside the lock with the copy
-			if gp.config.OnSnapshot != nil {
-				gp.config.OnSnapshot(snapshot)
-			}
-		}),
-	}
-
-	// Wrap success
-	if gp.config.OnTaskSuccess != nil {
-		userFn := gp.config.OnTaskSuccess
-		opts = append(opts, WithOnTaskSuccess[T](func(data T, meta map[string]any) {
-			gidVal := data.GetGroupID()
-			if !isZeroValueOfGroup(gidVal) {
-				userFn(gidVal, id, data, meta)
-			}
-			go gp.handleTaskCompletion(id)
-		}))
-	} else {
-		opts = append(opts, WithOnTaskSuccess[T](func(data T, meta map[string]any) {
-			go gp.handleTaskCompletion(id)
-		}))
-	}
-
-	// Wrap failure
-	if gp.config.OnTaskFailure != nil {
-		userFn := gp.config.OnTaskFailure
-		opts = append(opts, WithOnTaskFailure[T](func(data T, meta map[string]any, err error) TaskAction {
-			gidVal := data.GetGroupID()
-			var action TaskAction
-			if !isZeroValueOfGroup(gidVal) {
-				action = userFn(gidVal, id, data, meta, err)
-			} else {
-				action = TaskActionRemove
-			}
-			go gp.handleTaskCompletion(id)
-			return action
-		}))
-	} else {
-		opts = append(opts, WithOnTaskFailure[T](func(data T, meta map[string]any, err error) TaskAction {
-			go gp.handleTaskCompletion(id)
-			return TaskActionRemove
-		}))
-	}
-
-	// Wrap attempt
-	if gp.config.OnTaskAttempt != nil {
-		userFn := gp.config.OnTaskAttempt
-		opts = append(opts, WithOnTaskAttempt[T](func(tsk *Task[T], wid int) {
-			gidVal := tsk.data.GetGroupID()
-			if !isZeroValueOfGroup(gidVal) {
-				userFn(gidVal, id, tsk, wid)
-			}
-		}))
-	}
-
-	p := New[T](gp.ctx, []Worker[T]{w}, opts...)
-
-	return &poolItem[T, GID]{
-		PoolID:        id,
-		Pool:          p,
-		assignedGroup: *new(GID),
-		busy:          false,
-	}, nil
-}
-
-// StartGroup tries to start a group.
-func (gp *GroupPool[T, GID]) StartGroup(gid GID, opts ...GroupOption[T, GID]) error {
-	if isZeroValueOfGroup(gid) {
-		return fmt.Errorf("invalid group ID: zero value")
-	}
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	if _, found := gp.activeGroups[gid]; found {
-		gp.config.Logger.Debug(gp.ctx, "StartGroup called again, ignoring", "groupID", gid)
-		return nil
-	}
-
-	pg, pending := gp.pendingGroups[gid]
-	if !pending {
-		pg = &pendingGroup[T, GID]{}
-		gp.pendingGroups[gid] = pg
-	}
-	alreadyStart := false
-	for _, ins := range pg.instructions {
-		if ins.instruct == instructStart {
-			alreadyStart = true
-			break
-		}
-	}
-	if !alreadyStart {
-		pg.instructions = append(pg.instructions, instruction[T, GID]{
-			instruct:  instructStart,
-			timestamp: time.Now(),
-			groupOpts: opts,
-		})
-	}
-
-	return gp.tryActivatePendingGroupLocked(gid)
-}
-
-// SubmitToGroup enqueues a task for the group.
-func (gp *GroupPool[T, GID]) SubmitToGroup(gid GID, task T, opts ...GroupTaskOption[T, GID]) error {
-	if isZeroValueOfGroup(gid) {
-		return fmt.Errorf("invalid group ID: zero value")
-	}
-	if gid != task.GetGroupID() {
-		return fmt.Errorf("task's group ID %v does not match SubmitToGroup ID %v", task.GetGroupID(), gid)
-	}
-
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	st, active := gp.activeGroups[gid]
-	if active {
-		pi, found := gp.pools[st.poolID]
-		if !found {
-			return fmt.Errorf("pool %d not found for active group %v", st.poolID, gid)
-		}
-		return gp.submitToPool(pi, task, opts...)
-	}
-
-	pg, pending := gp.pendingGroups[gid]
-	if !pending {
-		pg = &pendingGroup[T, GID]{}
-		gp.pendingGroups[gid] = pg
-	}
-	pg.instructions = append(pg.instructions, instruction[T, GID]{
-		instruct:  instructSubmit,
-		task:      task,
-		taskOpts:  opts,
-		timestamp: time.Now(),
-	})
-	return gp.tryActivatePendingGroupLocked(gid)
-}
-
-// EndGroup signals no more tasks for the group.
-func (gp *GroupPool[T, GID]) EndGroup(gid GID) error {
-	if isZeroValueOfGroup(gid) {
-		return fmt.Errorf("invalid group ID: zero value")
-	}
-
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	st, active := gp.activeGroups[gid]
-	if active {
-		st.isEnded = true
-		return nil
-	}
-
-	pg, pending := gp.pendingGroups[gid]
-	if !pending {
-		return nil
-	}
-	if pg.isEnded {
-		return nil
-	}
-	pg.instructions = append(pg.instructions, instruction[T, GID]{
-		instruct:  instructEnd,
-		timestamp: time.Now(),
-	})
-	pg.isEnded = true
-	pg.endTime = time.Now()
-
-	found := false
-	for _, cgid := range gp.completedPendingGroups {
-		if cgid == gid {
-			found = true
-			break
-		}
-	}
-	if !found {
-		gp.completedPendingGroups = append(gp.completedPendingGroups, gid)
-	}
-
-	return gp.tryActivatePendingGroupLocked(gid)
-}
-
-// WaitGroup waits until the group completes (pool is idle).
-func (gp *GroupPool[T, GID]) WaitGroup(ctx context.Context, gid GID) error {
-	tick := time.NewTicker(200 * time.Millisecond)
-	defer tick.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-tick.C:
-			gp.mu.Lock()
-			st, active := gp.activeGroups[gid]
-			if !active {
-				pg, exist := gp.pendingGroups[gid]
-				if !exist {
-					gp.mu.Unlock()
-					return nil
-				}
-				if pg.isEnded {
-					gp.mu.Unlock()
-					return nil
-				}
-				gp.mu.Unlock()
-				continue
-			}
-			pi, ok := gp.pools[st.poolID]
-			if !ok {
-				gp.mu.Unlock()
-				return nil
-			}
-			p := pi.Pool
-			gp.mu.Unlock()
-
-			if p.QueueSize() == 0 && p.ProcessingCount() == 0 {
-				return nil
-			}
-		}
-	}
-}
-
-// Close tears down all pools, discarding any pending instructions.
-func (gp *GroupPool[T, GID]) Close() error {
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-	gp.cancel()
-
-	var firstErr error
-	for id, pi := range gp.pools {
-		pi.mu.Lock()
-		p := pi.Pool
-		pi.mu.Unlock()
-		if err := p.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		delete(gp.pools, id)
-	}
-	gp.activeGroups = make(map[GID]*groupState)
-	gp.pendingGroups = make(map[GID]*pendingGroup[T, GID])
-	gp.completedPendingGroups = nil
-	gp.snapshotGroups = make(map[GID]MetricsSnapshot[T])
-	return firstErr
-}
-
-func (gp *GroupPool[T, GID]) findOrCreateFreePoolLocked() (*poolItem[T, GID], error) {
-	var free *poolItem[T, GID]
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		busy := pi.busy
-		pi.mu.RUnlock()
-		if !busy {
-			free = pi
-			break
-		}
-	}
-	if free != nil {
-		return free, nil
-	}
-	activeCount := 0
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		if pi.busy {
-			activeCount++
-		}
-		pi.mu.RUnlock()
-	}
-	if gp.config.MaxActivePools >= 0 && activeCount >= gp.config.MaxActivePools {
-		return nil, nil
-	}
-	newp, err := gp.buildPool()
-	if err != nil {
-		return nil, err
-	}
-	gp.pools[newp.PoolID] = newp
-	return newp, nil
-}
-
-func (gp *GroupPool[T, GID]) tryActivatePendingGroupLocked(gid GID) error {
-	pg, ok := gp.pendingGroups[gid]
-	if !ok {
-		return nil
-	}
-	if !gp.hasStart(pg) {
-		return nil
-	}
-	pi, err := gp.findOrCreateFreePoolLocked()
-	if err != nil {
-		return err
-	}
-	if pi == nil {
-		return nil
-	}
-	delete(gp.pendingGroups, gid)
-	pi.mu.Lock()
-	pi.assignedGroup = gid
-	pi.busy = true
-	pi.mu.Unlock()
-
-	st := &groupState{
-		poolID:   pi.PoolID,
-		isActive: true,
-		isEnded:  pg.isEnded,
-	}
-	gp.activeGroups[gid] = st
-
-	// Initialize the metrics snapshot for this group if needed
-	if _, exists := gp.snapshotGroups[gid]; !exists {
-		gp.snapshotGroups[gid] = MetricsSnapshot[T]{}
-	}
-
-	if gp.config.OnGroupStart != nil {
-		gp.config.OnGroupStart(gid, pi.PoolID)
-	}
-	return gp.replayInstructionsLocked(gid, pi, pg)
-}
-
-func (gp *GroupPool[T, GID]) hasStart(pg *pendingGroup[T, GID]) bool {
-	for _, ins := range pg.instructions {
-		if ins.instruct == instructStart {
-			return true
-		}
-	}
-	return false
-}
-
-func (gp *GroupPool[T, GID]) replayInstructionsLocked(gid GID, pi *poolItem[T, GID], pg *pendingGroup[T, GID]) error {
-	for _, ins := range pg.instructions {
-		switch ins.instruct {
-		case instructStart:
-		case instructSubmit:
-
-			//// TODO: we should take in account if there are free workers or not, if we have UseFreeWorkerOnly that mean we should wait for a free worker before sending more tasks
-			// pi.mu.Lock()
-			// wrs := pi.Pool.GetFreeWorkers()
-			// pi.mu.Unlock()
-
-			if err := gp.submitToPool(pi, ins.task, ins.taskOpts...); err != nil {
-				gp.config.Logger.Warn(gp.ctx, "Error replaying submit", "gid", gid, "err", err)
-			}
-		case instructEnd:
-			st := gp.activeGroups[gid]
-			st.isEnded = true
-		}
-	}
-	return nil
-}
-
-func (gp *GroupPool[T, GID]) submitToPool(pi *poolItem[T, GID], t T, opts ...GroupTaskOption[T, GID]) error {
-	cfg := &groupSubmitConfig{}
-	for _, o := range opts {
-		o(cfg)
-	}
-
-	var taskOpts []TaskOption[T]
-	if cfg.queueNotification != nil {
-		taskOpts = append(taskOpts, WithTaskQueuedNotification[T](cfg.queueNotification))
-	}
-	if cfg.processedNotification != nil {
-		taskOpts = append(taskOpts, WithTaskProcessedNotification[T](cfg.processedNotification))
-	}
-	if cfg.metadata != nil {
-		m := NewMetadata()
-		for k, v := range cfg.metadata {
-			m.Set(k, v)
-		}
-		taskOpts = append(taskOpts, WithTaskMetadata[T](m))
-	}
-
-	if gp.config.UseFreeWorkerOnly {
-		if err := gp.scaleWorkersIfNeeded(pi); err != nil && err != ErrNoWorkersAvailable {
-			return err
-		}
-		err := pi.Pool.SubmitToFreeWorker(t, taskOpts...)
-		if err == ErrNoWorkersAvailable {
-			if scErr := gp.scaleWorkersIfNeeded(pi); scErr != nil && scErr != ErrNoWorkersAvailable {
-				return scErr
-			}
-			err = pi.Pool.SubmitToFreeWorker(t, taskOpts...)
-			if err == ErrNoWorkersAvailable {
-				return err
-			}
-		}
-		return err
-	} else {
-		err := pi.Pool.Submit(t, taskOpts...)
-		if err == ErrNoWorkersAvailable {
-			return err
-		}
-		return err
-	}
-}
-
-func (gp *GroupPool[T, GID]) scaleWorkersIfNeeded(pi *poolItem[T, GID]) error {
-	free := pi.Pool.GetFreeWorkers()
-	if len(free) > 0 {
-		return nil
-	}
-	if gp.config.MaxWorkersPerPool == 0 {
-		return ErrNoWorkersAvailable
-	}
-	if gp.config.MaxWorkersPerPool < 0 {
-		w := gp.config.WorkerFactory()
-		if w == nil {
-			return fmt.Errorf("worker factory returned nil")
-		}
-		return pi.Pool.Add(w, nil)
-	}
-	ws, err := pi.Pool.Workers()
-	if err != nil {
-		return err
-	}
-	if len(ws) < gp.config.MaxWorkersPerPool {
-		w := gp.config.WorkerFactory()
-		if w == nil {
-			return fmt.Errorf("worker factory returned nil")
-		}
-		return pi.Pool.Add(w, nil)
-	}
-	return ErrNoWorkersAvailable
-}
-
-func (gp *GroupPool[T, GID]) handleTaskCompletion(poolID uint) {
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	pi, ok := gp.pools[poolID]
-	if !ok {
-		return
-	}
-	gid := pi.assignedGroup
-	if isZeroValueOfGroup(gid) {
-		return
-	}
-	st, active := gp.activeGroups[gid]
-	if !active {
-		return
-	}
-	p := pi.Pool
-
-	if st.isEnded && p.QueueSize() == 0 && p.ProcessingCount() == 0 {
-		delete(gp.activeGroups, gid)
-
-		if gp.config.OnGroupEnd != nil {
-			gp.config.OnGroupEnd(gid, poolID)
-		}
-
-		// Remove the group from snapshotGroups after we have merged metrics into global counters (which we do continuously).
-		delete(gp.snapshotGroups, gid)
-
-		pi.mu.Lock()
-		pi.assignedGroup = *new(GID)
-		pi.busy = false
-		pi.mu.Unlock()
-
-		gp.consumeFreedPoolLocked(pi)
-	}
-}
-
-func (gp *GroupPool[T, GID]) consumeFreedPoolLocked(pi *poolItem[T, GID]) {
-	if len(gp.completedPendingGroups) > 0 {
-		gid := gp.completedPendingGroups[0]
-		gp.completedPendingGroups = gp.completedPendingGroups[1:]
-		pg, ok := gp.pendingGroups[gid]
-		if !ok {
-			gp.consumeFreedPoolLocked(pi)
-			return
-		}
-		delete(gp.pendingGroups, gid)
-
-		pi.mu.Lock()
-		pi.assignedGroup = gid
-		pi.busy = true
-		pi.mu.Unlock()
-
-		st := &groupState{
-			poolID:   pi.PoolID,
-			isActive: true,
-			isEnded:  pg.isEnded,
-		}
-		gp.activeGroups[gid] = st
-
-		if _, exists := gp.snapshotGroups[gid]; !exists {
-			gp.snapshotGroups[gid] = MetricsSnapshot[T]{}
-		}
-
-		if gp.config.OnGroupStart != nil {
-			gp.config.OnGroupStart(gid, pi.PoolID)
-		}
-		_ = gp.replayInstructionsLocked(gid, pi, pg)
-		return
-	}
-	// any other pending group
-	for gid, pg := range gp.pendingGroups {
-		if gp.hasStart(pg) {
-			delete(gp.pendingGroups, gid)
-
-			pi.mu.Lock()
-			pi.assignedGroup = gid
-			pi.busy = true
-			pi.mu.Unlock()
-
-			st := &groupState{
-				poolID:   pi.PoolID,
-				isActive: true,
-				isEnded:  pg.isEnded,
-			}
-			gp.activeGroups[gid] = st
-			if _, exists := gp.snapshotGroups[gid]; !exists {
-				gp.snapshotGroups[gid] = MetricsSnapshot[T]{}
-			}
-			if gp.config.OnGroupStart != nil {
-				gp.config.OnGroupStart(gid, pi.PoolID)
-			}
-			_ = gp.replayInstructionsLocked(gid, pi, pg)
-			return
-		}
-	}
-}
-
-// // Public version acquires lock
-// func (gp *GroupPool[T, GID]) calculateMetricsSnapshot() {
-// 	gp.snapshotMu.Lock()
-// 	gp.calculateMetricsSnapshotLocked()
-// 	gp.snapshotMu.Unlock()
-// }
-
-// calculateMetricsSnapshot aggregates metrics from internal pools, pending groups, etc.
-// We do NOT reset global counters (TotalTasksSubmitted, etc.). We read them from the global atomic fields.
-// Private locked version - caller must hold snapshotMu
-func (gp *GroupPool[T, GID]) calculateMetricsSnapshotLocked() {
-	var snap GroupMetricsSnapshot[T, GID]
-
-	// Calculate totals from pool metrics
-	for _, metrics := range gp.poolMetrics {
-		snap.TotalTasksSubmitted += metrics.TasksSubmitted
-		snap.TotalTasksProcessed += metrics.TasksProcessed
-		snap.TotalTasksSucceeded += metrics.TasksSucceeded
-		snap.TotalTasksFailed += metrics.TasksFailed
-		snap.TotalDeadTasks += metrics.DeadTasks
-	}
-
-	gp.mu.RLock()
-	snap.TotalPools = len(gp.pools)
-	snap.Pools = make([]PoolMetricsSnapshot[T], 0, len(gp.pools))
-
-	activeCount := 0
-	for id, pi := range gp.pools {
-		pi.mu.RLock()
-		assigned := pi.assignedGroup
-		busy := pi.busy
-		pi.mu.RUnlock()
-
-		if busy {
-			activeCount++
-		}
-
-		ws := make(map[int]WorkerSnapshot[T])
-		qSize := int64(0)
-		if pi.Pool != nil {
-			pi.Pool.RangeWorkers(func(wid int, s WorkerSnapshot[T]) bool {
-				ws[wid] = s
-				return true
-			})
-			qSize = pi.Pool.QueueSize()
-		}
-
-		snap.Pools = append(snap.Pools, PoolMetricsSnapshot[T]{
-			PoolID:        id,
-			AssignedGroup: assigned,
-			IsActive:      busy,
-			QueueSize:     qSize,
-			Workers:       ws,
-		})
-	}
-	snap.ActivePools = activeCount
-
-	snap.PendingTasks = make([]PendingTasksSnapshot[GID], 0, len(gp.pendingGroups))
-	snap.TotalPendingTasks = 0
-	snap.GroupsWithPending = len(gp.pendingGroups)
-	for gid, pg := range gp.pendingGroups {
-		c := len(pg.instructions)
-		snap.TotalPendingTasks += c
-		snap.PendingTasks = append(snap.PendingTasks, PendingTasksSnapshot[GID]{
-			GroupID:      gid,
-			TasksPending: c,
-		})
-	}
-
-	// Collect group metrics
-	activeOrPending := make(map[GID]bool)
-	for g := range gp.activeGroups {
-		activeOrPending[g] = true
-	}
-	for g := range gp.pendingGroups {
-		activeOrPending[g] = true
-	}
-
-	for gID := range gp.snapshotGroups {
-		if !activeOrPending[gID] {
-			continue
-		}
-		st, inActive := gp.activeGroups[gID]
-		pg, inPend := gp.pendingGroups[gID]
-
-		var pid uint
-		var hasPool bool
-		var isPending bool
-		var pendCount int
-
-		if inActive {
-			pid = st.poolID
-			hasPool = true
-		}
-		if inPend {
-			isPending = true
-			pendCount = len(pg.instructions)
-		}
-		snap.Metrics = append(snap.Metrics, GroupMetricSnapshot[T, GID]{
-			GroupID:         gID,
-			PoolID:          pid,
-			HasPool:         hasPool,
-			IsPending:       isPending,
-			TasksPending:    pendCount,
-			MetricsSnapshot: gp.snapshotGroups[gID],
-		})
-	}
-	gp.mu.RUnlock()
-
-	gp.snapshot = snap
-}
-
-func (gp *GroupPool[T, GID]) GetSnapshot() GroupMetricsSnapshot[T, GID] {
-	gp.snapshotMu.RLock()
-	defer gp.snapshotMu.RUnlock()
-	return gp.snapshot
-}
-
-func (gp *GroupPool[T, GID]) AddWorkerToPool(poolID uint, queue TaskQueue[T]) error {
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	pi, ok := gp.pools[poolID]
-	if !ok {
-		return fmt.Errorf("pool %d not found", poolID)
-	}
-	if gp.config.MaxWorkersPerPool == 0 {
-		return fmt.Errorf("maxWorkersPerPool=0, cannot add worker")
-	}
-	ws, err := pi.Pool.Workers()
-	if err != nil {
-		return err
-	}
-	if gp.config.MaxWorkersPerPool > 0 && len(ws) >= gp.config.MaxWorkersPerPool {
-		return fmt.Errorf("pool %d reached max worker limit", poolID)
-	}
-	w := gp.config.WorkerFactory()
-	if w == nil {
-		return fmt.Errorf("worker factory returned nil")
-	}
-	return pi.Pool.Add(w, queue)
-}
-
-func (gp *GroupPool[T, GID]) RemoveWorkerFromPool(poolID uint, workerID int) error {
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	pi, ok := gp.pools[poolID]
-	if !ok {
-		return fmt.Errorf("pool %d not found", poolID)
-	}
-	return pi.Pool.Remove(workerID)
-}
-
-func (gp *GroupPool[T, GID]) PauseWorkerInPool(poolID uint, workerID int) error {
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	pi, ok := gp.pools[poolID]
-	if !ok {
-		return fmt.Errorf("pool %d not found", poolID)
-	}
-	return pi.Pool.Pause(workerID)
-}
-
-func (gp *GroupPool[T, GID]) ResumeWorkerInPool(poolID uint, workerID int) error {
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	pi, ok := gp.pools[poolID]
-	if !ok {
-		return fmt.Errorf("pool %d not found", poolID)
-	}
-	return pi.Pool.Resume(workerID)
-}
-
-func (gp *GroupPool[T, GID]) WorkersInPool(poolID uint) ([]int, error) {
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	pi, ok := gp.pools[poolID]
-	if !ok {
-		return nil, fmt.Errorf("pool %d not found", poolID)
-	}
-	return pi.Pool.Workers()
-}
-
-func (gp *GroupPool[T, GID]) GetFreeWorkersInPool(poolID uint) []int {
-	gp.mu.RLock()
-	defer gp.mu.RUnlock()
-
-	pi, ok := gp.pools[poolID]
-	if !ok {
-		return nil
-	}
-	return pi.Pool.GetFreeWorkers()
-}
-
-func (gp *GroupPool[T, GID]) SetConcurrentPools(max int) {
-	if max < 1 {
-		max = 1
-	}
-	gp.mu.Lock()
-	gp.config.MaxActivePools = max
-	gp.mu.Unlock()
-}
-
-func (gp *GroupPool[T, GID]) SetConcurrentWorkers(max int) {
-	if max < 1 {
-		max = 1
-	}
-	gp.mu.Lock()
-	gp.config.MaxWorkersPerPool = max
-	gp.mu.Unlock()
-}
-
-func (gp *GroupPool[T, GID]) QueueSize() int64 {
-	gp.mu.RLock()
-	defer gp.mu.RUnlock()
-
-	var total int64
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		p := pi.Pool
-		pi.mu.RUnlock()
-		total += p.QueueSize()
-	}
-	return total
-}
-
-func (gp *GroupPool[T, GID]) ProcessingCount() int64 {
-	gp.mu.RLock()
-	defer gp.mu.RUnlock()
-
-	var total int64
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		p := pi.Pool
-		pi.mu.RUnlock()
-		total += p.ProcessingCount()
-	}
-	return total
-}
-
-func (gp *GroupPool[T, GID]) DeadTaskCount() int64 {
-	gp.mu.RLock()
-	defer gp.mu.RUnlock()
-
-	var total int64
-	for _, pi := range gp.pools {
-		pi.mu.RUnlock()
-		pi.mu.RLock()
-		p := pi.Pool
-		pi.mu.RUnlock()
-		total += p.DeadTaskCount()
-	}
-	return total
-}
-
-func (gp *GroupPool[T, GID]) RangeDeadTasks(fn func(*DeadTask[T]) bool) {
-	gp.mu.RLock()
-	defer gp.mu.RUnlock()
-
-outer:
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		p := pi.Pool
-		pi.mu.RUnlock()
-		cont := true
-		p.RangeDeadTasks(func(dt *DeadTask[T]) bool {
-			if !fn(dt) {
-				cont = false
-				return false
-			}
-			return true
-		})
-		if !cont {
-			break outer
-		}
-	}
-}
-
-func (gp *GroupPool[T, GID]) PullDeadTask(poolID uint, idx int) (*DeadTask[T], error) {
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	pi, ok := gp.pools[poolID]
-	if !ok {
-		return nil, fmt.Errorf("pool %d not found", poolID)
-	}
-	pi.mu.RLock()
-	defer pi.mu.RUnlock()
-	return pi.Pool.PullDeadTask(idx)
-}
-
-func (gp *GroupPool[T, GID]) PullRangeDeadTasks(from, to int) ([]*DeadTask[T], error) {
-	if from >= to {
-		return nil, fmt.Errorf("invalid range")
-	}
-	gp.mu.Lock()
-	defer gp.mu.Unlock()
-
-	var result []*DeadTask[T]
-	offset := 0
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		p := pi.Pool
-		count := int(p.DeadTaskCount())
-		pi.mu.RUnlock()
-
-		end := offset + count
-		if end <= from {
-			offset = end
-			continue
-		}
-		if offset >= to {
-			break
-		}
-		if from <= offset && end <= to {
-			dts, err := p.PullRangeDeadTasks(0, count)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, dts...)
-			offset = end
-			continue
-		}
-		localFrom := 0
-		localTo := count
-		if from > offset {
-			localFrom = from - offset
-		}
-		if to < end {
-			localTo = to - offset
-		}
-		dts, err := p.PullRangeDeadTasks(localFrom, localTo)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, dts...)
-		offset = end
-		if offset >= to {
-			break
-		}
-	}
-	return result, nil
-}
-
-func (gp *GroupPool[T, GID]) RangeWorkerQueues(f func(workerID int, queueSize int64) bool) {
-	gp.mu.RLock()
-	defer gp.mu.RUnlock()
-
-outer:
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		p := pi.Pool
-		pi.mu.RUnlock()
-		cont := true
-		p.RangeWorkerQueues(func(wid int, qs int64) bool {
-			if !f(wid, qs) {
-				cont = false
-				return false
-			}
-			return true
-		})
-		if !cont {
-			break outer
-		}
-	}
-}
-
-func (gp *GroupPool[T, GID]) RangeTaskQueues(f func(workerID int, tq TaskQueue[T]) bool) {
-	gp.mu.RLock()
-	defer gp.mu.RUnlock()
-
-outer:
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		p := pi.Pool
-		pi.mu.RUnlock()
-		cont := true
-		p.RangeTaskQueues(func(wid int, queue TaskQueue[T]) bool {
-			if !f(wid, queue) {
-				cont = false
-				return false
-			}
-			return true
-		})
-		if !cont {
-			break outer
-		}
-	}
-}
-
-func (gp *GroupPool[T, GID]) RangeWorkers(f func(workerID int, state WorkerSnapshot[T]) bool) {
-	gp.mu.RLock()
-	defer gp.mu.RUnlock()
-
-outer:
-	for _, pi := range gp.pools {
-		pi.mu.RLock()
-		p := pi.Pool
-		pi.mu.RUnlock()
-		cont := true
-		p.RangeWorkers(func(wid int, ws WorkerSnapshot[T]) bool {
-			if !f(wid, ws) {
-				cont = false
-				return false
-			}
-			return true
-		})
-		if !cont {
-			break outer
-		}
-	}
-}
-
-// GroupRequestResponse manages a request/response pair for tasks in a group.
-type GroupRequestResponse[T any, R any, GID comparable] struct {
-	groupID     GID
-	request     T
-	done        chan struct{}
-	response    R
-	err         error
-	mu          deadlock.RWMutex
-	isCompleted bool
-}
-
-func NewGroupRequestResponse[T any, R any, GID comparable](req T, gid GID) *GroupRequestResponse[T, R, GID] {
-	return &GroupRequestResponse[T, R, GID]{
-		request: req,
-		done:    make(chan struct{}),
-		groupID: gid,
-	}
-}
-
-func (rr GroupRequestResponse[T, R, GID]) GetGroupID() GID {
-	return rr.groupID
-}
-
-func (rr *GroupRequestResponse[T, R, GID]) ConsultRequest(fn func(T) error) error {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	return fn(rr.request)
-}
-
-func (rr *GroupRequestResponse[T, R, GID]) Complete(resp R) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	if !rr.isCompleted {
-		rr.response = resp
-		rr.isCompleted = true
-		close(rr.done)
-	}
-}
-
-func (rr *GroupRequestResponse[T, R, GID]) CompleteWithError(err error) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	if !rr.isCompleted {
-		rr.err = err
-		rr.isCompleted = true
-		close(rr.done)
-	}
-}
-
-func (rr *GroupRequestResponse[T, R, GID]) Done() <-chan struct{} {
-	rr.mu.RLock()
-	defer rr.mu.RUnlock()
-	return rr.done
-}
-
-func (rr *GroupRequestResponse[T, R, GID]) Err() error {
-	rr.mu.RLock()
-	defer rr.mu.RUnlock()
-	return rr.err
-}
-
-func (rr *GroupRequestResponse[T, R, GID]) Wait(ctx context.Context) (R, error) {
-	select {
-	case <-rr.Done():
-		rr.mu.RLock()
-		defer rr.mu.RUnlock()
-		return rr.response, rr.err
-	case <-ctx.Done():
-		rr.mu.Lock()
-		if !rr.isCompleted {
-			rr.err = ctx.Err()
-			rr.isCompleted = true
-			close(rr.done)
-		}
-		r := rr.response
-		e := rr.err
-		rr.mu.Unlock()
-		return r, e
-	}
 }

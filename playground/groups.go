@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/davidroman0O/retrypool"
@@ -15,7 +16,7 @@ type worker struct {
 }
 
 func (w *worker) Run(ctx context.Context, data task) error {
-	pp.Println("Worker", w.ID, "Processing task", data.ID, "from group", data.GID)
+	// pp.Println("Worker", w.ID, "Processing task", data.ID, "from group", data.GID)
 	retrypool.SetTaskMetadata(ctx, map[string]any{
 		"taskdata": data.ID,
 	})
@@ -48,10 +49,10 @@ func main() {
 		retrypool.WithGroupPoolMaxWorkersPerPool[task, string](4),
 		retrypool.WithGroupPoolUseFreeWorkerOnly[task, string](),
 		retrypool.WithGroupPoolOnTaskSuccess[task, string](func(gid string, pool uint, data task, metadata map[string]any) {
-			pp.Println("Task", data.ID, "from group", data.GID, "completed", metadata, "with", pool, "workers")
+			// pp.Println("Task", data.ID, "from group", data.GID, "completed", metadata, "with", pool, "workers")
 		}),
 		retrypool.WithGroupPoolOnSnapshot[task, string](func(snapshot retrypool.GroupMetricsSnapshot[task, string]) {
-			pp.Println("group pool snapshot::", snapshot)
+			// pp.Println("group pool snapshot::", snapshot)
 		}),
 	)
 	if err != nil {
@@ -62,19 +63,21 @@ func main() {
 
 	for _, g := range groups {
 		go func(groupID string) {
-			pool.StartGroup(groupID)
 			for i := range 1000 {
-				if err := pool.SubmitToGroup(groupID, task{GID: groupID, ID: i}); err != nil {
+				if err := pool.Submit(groupID, task{GID: groupID, ID: i}); err != nil {
 					panic(err)
 				}
 			}
 			pool.EndGroup(groupID)
+			fmt.Println("Group", groupID, "finished")
 		}(g)
 	}
 
 	for _, v := range groups {
 		pool.WaitGroup(ctx, v)
 	}
+
+	// <-time.After(2 * time.Second)
 
 	pool.Close()
 
