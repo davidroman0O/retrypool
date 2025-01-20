@@ -1134,3 +1134,84 @@ func (m GroupMetricsSnapshot[T, GID]) Clone() GroupMetricsSnapshot[T, GID] {
 
 	return clone
 }
+
+// GroupRequestResponse manages a request/response pair for tasks in a group.
+type GroupRequestResponse[T any, R any, GID comparable] struct {
+	groupID     GID
+	request     T
+	done        chan struct{}
+	response    R
+	err         error
+	mu          deadlock.RWMutex
+	isCompleted bool
+}
+
+func NewGroupRequestResponse[T any, R any, GID comparable](req T, gid GID) *GroupRequestResponse[T, R, GID] {
+	return &GroupRequestResponse[T, R, GID]{
+		request: req,
+		done:    make(chan struct{}),
+		groupID: gid,
+	}
+}
+
+func (rr GroupRequestResponse[T, R, GID]) GetGroupID() GID {
+	return rr.groupID
+}
+
+func (rr *GroupRequestResponse[T, R, GID]) ConsultRequest(fn func(T) error) error {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	return fn(rr.request)
+}
+
+func (rr *GroupRequestResponse[T, R, GID]) Complete(resp R) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if !rr.isCompleted {
+		rr.response = resp
+		rr.isCompleted = true
+		close(rr.done)
+	}
+}
+
+func (rr *GroupRequestResponse[T, R, GID]) CompleteWithError(err error) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if !rr.isCompleted {
+		rr.err = err
+		rr.isCompleted = true
+		close(rr.done)
+	}
+}
+
+func (rr *GroupRequestResponse[T, R, GID]) Done() <-chan struct{} {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	return rr.done
+}
+
+func (rr *GroupRequestResponse[T, R, GID]) Err() error {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	return rr.err
+}
+
+func (rr *GroupRequestResponse[T, R, GID]) Wait(ctx context.Context) (R, error) {
+	select {
+	case <-rr.Done():
+		rr.mu.RLock()
+		defer rr.mu.RUnlock()
+		return rr.response, rr.err
+	case <-ctx.Done():
+		rr.mu.Lock()
+		if !rr.isCompleted {
+			rr.err = ctx.Err()
+			rr.isCompleted = true
+			close(rr.done)
+		}
+		r := rr.response
+		e := rr.err
+		rr.mu.Unlock()
+		return r, e
+	}
+}
