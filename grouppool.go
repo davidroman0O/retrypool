@@ -227,6 +227,7 @@ func NewGroupPool[T GroupTask[GID], GID comparable](
 	}
 
 	if cfg.WorkerFactory == nil {
+		defer cancel()
 		return nil, fmt.Errorf("worker factory is required")
 	}
 
