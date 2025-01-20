@@ -315,6 +315,25 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolGroupPoolItem[T, GID], error) {
 
 	pool := New[T](gp.ctx, []Worker[T]{worker}, opts...)
 
+	// Add more workers if configured for more than 1
+	if gp.config.MaxWorkersPerPool != 0 && gp.config.MaxWorkersPerPool != 1 {
+		// Add workers up to max or just one more for unlimited
+		targetWorkers := gp.config.MaxWorkersPerPool
+		if targetWorkers < 0 {
+			targetWorkers = 2 // For unlimited, start with 2 workers
+		}
+
+		for i := 1; i < targetWorkers; i++ {
+			w := gp.config.WorkerFactory()
+			if w == nil {
+				return nil, fmt.Errorf("worker factory returned nil for additional worker")
+			}
+			if err := pool.Add(w, nil); err != nil {
+				return nil, fmt.Errorf("failed to add additional worker: %w", err)
+			}
+		}
+	}
+
 	return &poolGroupPoolItem[T, GID]{
 		PoolID:        id,
 		Pool:          pool,
@@ -395,6 +414,44 @@ func (gp *GroupPool[T, GID]) Submit(gid GID, task T, opts ...GroupTaskOption[T, 
 	}
 }
 
+// scaleWorkersForPool handles worker scaling for a pool based on constraints
+func (gp *GroupPool[T, GID]) scaleWorkersForPool(pi *poolGroupPoolItem[T, GID]) error {
+	// No scaling needed if max is 0
+	if gp.config.MaxWorkersPerPool == 0 {
+		return nil
+	}
+
+	// Get current worker count
+	workers, err := pi.Pool.Workers()
+	if err != nil {
+		return err
+	}
+
+	currentCount := len(workers)
+
+	// Handle unlimited case (-1)
+	if gp.config.MaxWorkersPerPool < 0 {
+		// Add one more worker
+		w := gp.config.WorkerFactory()
+		if w == nil {
+			return fmt.Errorf("worker factory returned nil")
+		}
+		return pi.Pool.Add(w, nil)
+	}
+
+	// Handle limited case
+	if currentCount < gp.config.MaxWorkersPerPool {
+		// Add one more worker up to limit
+		w := gp.config.WorkerFactory()
+		if w == nil {
+			return fmt.Errorf("worker factory returned nil")
+		}
+		return pi.Pool.Add(w, nil)
+	}
+
+	return nil
+}
+
 // submitToPool handles submitting a task to a specific pool with proper configuration
 func (gp *GroupPool[T, GID]) submitToPool(pi *poolGroupPoolItem[T, GID], t T, opts ...GroupTaskOption[T, GID]) error {
 	cfg := &groupSubmitConfig{}
@@ -424,9 +481,29 @@ func (gp *GroupPool[T, GID]) submitToPool(pi *poolGroupPoolItem[T, GID], t T, op
 	taskOpts = append(taskOpts, WithTaskMetadata[T](meta))
 
 	if gp.config.UseFreeWorkerOnly {
-		return pi.Pool.SubmitToFreeWorker(t, taskOpts...)
+		err := pi.Pool.SubmitToFreeWorker(t, taskOpts...)
+		if err == ErrNoWorkersAvailable {
+			// Try scaling up workers
+			if scaleErr := gp.scaleWorkersForPool(pi); scaleErr != nil && scaleErr != ErrNoWorkersAvailable {
+				return scaleErr
+			}
+			// Try submit again
+			err = pi.Pool.SubmitToFreeWorker(t, taskOpts...)
+		}
+		return err
 	}
-	return pi.Pool.Submit(t, taskOpts...)
+
+	// Normal submit path
+	err := pi.Pool.Submit(t, taskOpts...)
+	if err == ErrNoWorkersAvailable {
+		// Try scaling up workers
+		if scaleErr := gp.scaleWorkersForPool(pi); scaleErr != nil && scaleErr != ErrNoWorkersAvailable {
+			return scaleErr
+		}
+		// Try submit again
+		err = pi.Pool.Submit(t, taskOpts...)
+	}
+	return err
 }
 
 // EndGroup signals no more tasks for the group, but allows existing tasks to complete

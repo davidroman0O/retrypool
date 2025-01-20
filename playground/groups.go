@@ -52,7 +52,7 @@ func main() {
 			// pp.Println("Task", data.ID, "from group", data.GID, "completed", metadata, "with", pool, "workers")
 		}),
 		retrypool.WithGroupPoolOnSnapshot[task, string](func(snapshot retrypool.GroupMetricsSnapshot[task, string]) {
-			// pp.Println("group pool snapshot::", snapshot)
+			pp.Println("group pool snapshot::", snapshot)
 		}),
 	)
 	if err != nil {
@@ -76,8 +76,6 @@ func main() {
 	for _, v := range groups {
 		pool.WaitGroup(ctx, v)
 	}
-
-	// <-time.After(2 * time.Second)
 
 	pool.Close()
 
