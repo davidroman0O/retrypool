@@ -343,6 +343,18 @@ func (gp *GroupPool[T, GID]) buildPool() (*poolGroupPoolItem[T, GID], error) {
 	}, nil
 }
 
+func (gp *GroupPool[T, GID]) SetMaxActivePools(max int) {
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+	gp.config.MaxActivePools = max
+}
+
+func (gp *GroupPool[T, GID]) SetMaxWorkersPerPool(max int) {
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+	gp.config.MaxWorkersPerPool = max
+}
+
 // Submit task to a group
 func (gp *GroupPool[T, GID]) Submit(gid GID, task T, opts ...GroupTaskOption[T, GID]) error {
 	if isZeroValueOfGroup(gid) {
