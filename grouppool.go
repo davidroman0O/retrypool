@@ -892,6 +892,73 @@ func (gp *GroupPool[T, GID]) WaitGroup(ctx context.Context, gid GID) error {
 	}
 }
 
+func (gp *GroupPool[T, GID]) WaitAll(ctx context.Context) error {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-ticker.C:
+			gp.mu.Lock()
+
+			// Check if any active groups
+			if len(gp.activeGroups) > 0 {
+				gp.mu.Unlock()
+				continue
+			}
+
+			// Check if any pending groups
+			if len(gp.pendingGroups) > 0 {
+				// Check if any pending groups are ended
+				ended := true
+				for _, pg := range gp.pendingGroups {
+					if !pg.isEnded {
+						ended = false
+						break
+					}
+				}
+				if !ended {
+					gp.mu.Unlock()
+					continue
+				}
+			}
+
+			gp.mu.Unlock()
+			return nil
+		}
+	}
+}
+
+func (gp *GroupPool[T, GID]) ShouldWaitAll() bool {
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+
+	// Check if any active groups
+	if len(gp.activeGroups) > 0 {
+		return true
+	}
+
+	// Check if any pending groups
+	if len(gp.pendingGroups) > 0 {
+		// Check if any pending groups are ended
+		ended := true
+		for _, pg := range gp.pendingGroups {
+			if !pg.isEnded {
+				ended = false
+				break
+			}
+		}
+		if !ended {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Close gracefully shuts down all pools and cleans up resources
 func (gp *GroupPool[T, GID]) Close() error {
 	gp.mu.Lock()
