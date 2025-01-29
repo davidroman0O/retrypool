@@ -1,5 +1,5 @@
 
-I need to re-think and re-do my design
+I need to re-think and re-do my design, yea something like that
 
 ```go
 var (
@@ -367,3 +367,4 @@ func (gp *GroupPool[T, GID]) releasePool(poolID uint) {
 ```
 
 
+sometimes i can't get my head about that thing
