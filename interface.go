@@ -8,19 +8,13 @@ import (
 // Pooler is an interface that exposes all of the public methods of the Pool[T] struct.
 type Pooler[T any] interface {
 	// SetOnTaskSuccess sets the handler that will be called when a task succeeds.
-	SetOnTaskSuccess(handler func(data T))
+	SetOnTaskSuccess(handler func(data T, metadata map[string]any))
 
 	// SetOnTaskFailure sets the handler that will be called when a task fails.
 	// The handler should return a TaskAction indicating how the pool should proceed.
-	SetOnTaskFailure(handler func(data T, err error) TaskAction)
+	SetOnTaskFailure(handler func(data T, metadata map[string]any, err error) TaskAction)
 
 	SetOnTaskAttempt(handler func(task *Task[T], workerID int))
-
-	// GetMetricsSnapshot returns a snapshot of the current pool metrics.
-	GetMetricsSnapshot() MetricsSnapshot
-
-	// NewWorkerID returns a new unique worker ID.
-	NewWorkerID() int
 
 	// Add adds a new worker to the pool. If a queue is not provided, a new one will be created.
 	Add(worker Worker[T], queue TaskQueue[T]) error
@@ -76,4 +70,7 @@ type Pooler[T any] interface {
 
 	// RangeTaskQueues iterates over each worker's TaskQueue. If the callback returns false, iteration stops.
 	RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool)
+
+	// RangeWorkers iterates over each worker. If the callback returns false, iteration stops.
+	RangeWorkers(f func(workerID int, state WorkerSnapshot[T]) bool)
 }

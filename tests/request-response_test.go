@@ -118,7 +118,7 @@ func TestRequestResponse(t *testing.T) {
 			}
 
 			options := []retrypool.Option[Request]{
-				retrypool.WithOnTaskFailure[Request](func(data Request, err error) retrypool.TaskAction {
+				retrypool.WithOnTaskFailure[Request](func(data Request, metadata map[string]any, err error) retrypool.TaskAction {
 					if data.rr != nil {
 						data.rr.CompleteWithError(err)
 					}

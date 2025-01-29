@@ -24,16 +24,22 @@ func (w *ResponseWorker) Run(ctx context.Context, data *retrypool.RequestRespons
 	// Simulate processing time
 	time.Sleep(time.Millisecond * 200)
 
+	var id int
+	data.ConsultRequest(func(rd RequestData) error {
+		id = rd.ID
+		return nil
+	})
+
 	// Simulate an error for a specific ID
-	if data.Request.ID == 3 {
-		err := fmt.Errorf("failed to process request ID: %d", data.Request.ID)
+	if id == 3 {
+		err := fmt.Errorf("failed to process request ID: %d", id)
 		data.CompleteWithError(err)
 		return nil // Return nil to avoid retrying
 	}
 
 	// Create a response
 	response := ResponseData{
-		Result: fmt.Sprintf("Processed request ID: %d", data.Request.ID),
+		Result: fmt.Sprintf("Processed request ID: %d", id),
 	}
 
 	// Complete the request with the response
@@ -65,7 +71,10 @@ func main() {
 		// Submit the request to the pool
 		err := pool.Submit(req)
 		if err != nil {
-			fmt.Printf("Error submitting request ID %d: %v\n", req.Request.ID, err)
+			req.ConsultRequest(func(rd RequestData) error {
+				fmt.Printf("Error submitting request ID %d: %v\n", rd.ID, err)
+				return nil
+			})
 			continue
 		}
 	}
@@ -79,9 +88,15 @@ func main() {
 
 			resp, err := r.Wait(ctx)
 			if err != nil {
-				fmt.Printf("Request ID %d failed: %v\n", r.Request.ID, err)
+				r.ConsultRequest(func(rd RequestData) error {
+					fmt.Printf("Request ID %d failed: %v\n", rd.ID, err)
+					return nil
+				})
 			} else {
-				fmt.Printf("Request ID %d succeeded: %s\n", r.Request.ID, resp.Result)
+				r.ConsultRequest(func(rd RequestData) error {
+					fmt.Printf("Request ID %d succeeded: %s\n", rd.ID, resp.Result)
+					return nil
+				})
 			}
 		}(req)
 	}

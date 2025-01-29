@@ -134,7 +134,7 @@ func TestRetryWithAttempts(t *testing.T) {
 				options := []retrypool.Option[int]{
 					retrypool.WithAttempts[int](tt.maxAttempts),
 					retrypool.WithDelay[int](50 * time.Millisecond),
-					retrypool.WithOnTaskFailure[int](func(data int, err error) retrypool.TaskAction {
+					retrypool.WithOnTaskFailure[int](func(data int, metadata map[string]any, err error) retrypool.TaskAction {
 						worker.mu.Lock()
 						attempts := worker.attempts[data]
 						worker.mu.Unlock()

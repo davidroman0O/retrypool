@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/davidroman0O/retrypool"
+	"github.com/k0kubun/pp/v3"
 )
 
 // BlockingTask properly implements the blocking pattern where tasks can spawn other tasks
@@ -29,18 +30,14 @@ func (t BlockingTask) GetTaskID() int         { return t.ID }
 
 // BlockingWorker demonstrates the proper blocking pattern
 type BlockingWorker struct {
-	executionTimes map[int]time.Time
+	executionTimes map[string]map[int]int64 // groupID -> taskID -> time
 	mu             sync.Mutex
 }
 
 func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
-	w.mu.Lock()
-	w.executionTimes[task.ID] = time.Now()
-	w.mu.Unlock()
-
 	fmt.Printf("\t\t Running Task %s-%d with deps %v\n", task.GroupID, task.ID, task.Dependencies)
 
-	// Simulate some work
+	// Simulate work
 	if task.sleep > 0 {
 		time.Sleep(task.sleep)
 	}
@@ -49,6 +46,8 @@ func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
 	if task.ID < 3 {
 		nextID := task.ID + 1
 		nextDone := make(chan struct{})
+
+		pp.Println("worker task::", "groupID", task.GroupID, "taskID", task.ID)
 
 		nextTask := BlockingTask{
 			ID:           nextID,
@@ -61,18 +60,33 @@ func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
 
 		fmt.Printf("\t\t\t Creating Next Task %s-%d with deps %v\n", task.GroupID, nextID, nextTask.Dependencies)
 
-		// Submit next task first
+		// Record our execution time AFTER work but BEFORE submitting next task
+		w.mu.Lock()
+		if w.executionTimes[task.GroupID] == nil {
+			w.executionTimes[task.GroupID] = make(map[int]int64)
+		}
+		w.executionTimes[task.GroupID][task.ID] = time.Now().UnixNano()
+		w.mu.Unlock()
+
+		// Submit next task
 		if err := task.Pool.Submit(nextTask); err != nil {
 			return err
 		}
 
-		// Now wait for next task
+		// Wait for next task
 		<-nextDone
 
-		// Signal our completion before waiting for next task
+		// Signal our completion
 		close(task.done)
 	} else {
-		// For the last task, just signal completion
+		// For last task, record time then signal completion
+		w.mu.Lock()
+		if w.executionTimes[task.GroupID] == nil {
+			w.executionTimes[task.GroupID] = make(map[int]int64)
+		}
+		w.executionTimes[task.GroupID][task.ID] = time.Now().UnixNano()
+		w.mu.Unlock()
+
 		close(task.done)
 	}
 
@@ -81,7 +95,7 @@ func (w *BlockingWorker) Run(ctx context.Context, task BlockingTask) error {
 
 func TestBlockingPool_ProperBlocking(t *testing.T) {
 	ctx := context.Background()
-	worker := &BlockingWorker{executionTimes: make(map[int]time.Time)}
+	worker := &BlockingWorker{executionTimes: make(map[string]map[int]int64)}
 
 	pool, err := retrypool.NewBlockingPool[BlockingTask, string, int](
 		ctx,
@@ -128,10 +142,7 @@ func TestBlockingPool_ProperBlocking(t *testing.T) {
 
 	// Verify execution times
 	worker.mu.Lock()
-	times := make(map[int]time.Time)
-	for id, t := range worker.executionTimes {
-		times[id] = t
-	}
+	times := worker.executionTimes["groupA"] // We only have groupA in this test
 	worker.mu.Unlock()
 
 	// Verify all three tasks were executed
@@ -142,22 +153,25 @@ func TestBlockingPool_ProperBlocking(t *testing.T) {
 	}
 
 	// Verify execution order
-	if times[2].Before(times[1]) {
+	if times[2] < times[1] {
 		t.Error("Task 2 executed before Task 1")
 	}
-	if times[3].Before(times[2]) {
+	if times[3] < times[2] {
 		t.Error("Task 3 executed before Task 2")
 	}
 }
 
 func TestBlockingPool_MultipleGroups(t *testing.T) {
 	ctx := context.Background()
-	worker := &BlockingWorker{executionTimes: make(map[int]time.Time)}
+	worker := &BlockingWorker{executionTimes: make(map[string]map[int]int64)}
 
 	pool, err := retrypool.NewBlockingPool[BlockingTask, string, int](
 		ctx,
 		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[BlockingTask] { return worker }),
 		retrypool.WithBlockingMaxActivePools[BlockingTask](2), // Allow both groups to run
+		retrypool.WithBlockingOnTaskStarted(func(data BlockingTask) {
+			t.Logf("Task groupID:%v taskID:%d started", data.GroupID, data.ID)
+		}),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create pool: %v", err)
@@ -207,10 +221,11 @@ func TestBlockingPool_MultipleGroups(t *testing.T) {
 
 	// Verify each group had all three tasks execute
 	worker.mu.Lock()
-	times := worker.executionTimes
+	groupTimes := worker.executionTimes
 	worker.mu.Unlock()
 
 	for _, group := range groups {
+		times := groupTimes[group]
 		// Check all three tasks for this group
 		for i := 1; i <= 3; i++ {
 			if _, exists := times[i]; !exists {
@@ -219,13 +234,15 @@ func TestBlockingPool_MultipleGroups(t *testing.T) {
 		}
 
 		// Verify execution order within group
-		if times[2].Before(times[1]) {
+		if times[2] < times[1] {
 			t.Errorf("Group %s: Task 2 executed before Task 1", group)
 		}
-		if times[3].Before(times[2]) {
+		if times[3] < times[2] {
 			t.Errorf("Group %s: Task 3 executed before Task 2", group)
 		}
 	}
+
+	pp.Println("result::", groups, worker.executionTimes)
 }
 
 // StressTestWorker properly implements the Worker interface for stress testing
@@ -504,7 +521,7 @@ func TestBlockingPool_TaskCallbacks(t *testing.T) {
 
 func TestBlockingPool_PoolEvents(t *testing.T) {
 	ctx := context.Background()
-	worker := &BlockingWorker{executionTimes: make(map[int]time.Time)}
+	worker := &BlockingWorker{executionTimes: make(map[string]map[int]int64)}
 
 	var poolsCreated int
 	var mu sync.Mutex
@@ -703,6 +720,238 @@ func TestBlockingPool_ChainFailureHandling(t *testing.T) {
 	}
 
 	// Close pool
+	if err := pool.Close(); err != nil {
+		t.Fatalf("Failed to close pool: %v", err)
+	}
+}
+
+// TreeTask implements BlockingDependentTask for testing
+type TreeTask struct {
+	ID           int
+	GroupID      string
+	Dependencies []int
+	Done         chan struct{}
+}
+
+func (t TreeTask) GetDependencies() []int { return t.Dependencies }
+func (t TreeTask) GetGroupID() string     { return t.GroupID }
+func (t TreeTask) GetTaskID() int         { return t.ID }
+
+// TreeWorker implements Worker
+type TreeWorker struct {
+	executionTimes map[int]time.Time
+	mu             sync.Mutex
+	pool           *retrypool.BlockingPool[TreeTask, string, int]
+}
+
+func (w *TreeWorker) Run(ctx context.Context, task TreeTask) error {
+	w.mu.Lock()
+	w.executionTimes[task.ID] = time.Now()
+	w.mu.Unlock()
+
+	fmt.Printf("Running Task %d\n", task.ID)
+
+	// If this is the root task, submit all dependent tasks
+	if task.ID == 1 {
+		childrenChn := []chan struct{}{}
+		// Submit 10 dependent tasks
+		for i := 2; i <= 11; i++ {
+			childDone := make(chan struct{})
+			childTask := TreeTask{
+				ID:           i,
+				GroupID:      task.GroupID,
+				Dependencies: []int{1}, // All depend on task 1
+				Done:         childDone,
+			}
+
+			if err := w.pool.Submit(childTask); err != nil {
+				return fmt.Errorf("failed to submit dependent task %d: %v", i, err)
+			}
+
+			childrenChn = append(childrenChn, childDone)
+		}
+
+		// Wait for each dependent task to complete
+		for _, v := range childrenChn {
+			<-v
+		}
+	}
+
+	close(task.Done)
+	fmt.Printf("Task %d completed\n", task.ID)
+
+	return nil
+}
+
+func TestBlockingPool_TreeTasks(t *testing.T) {
+	ctx := context.Background()
+
+	var pool *retrypool.BlockingPool[TreeTask, string, int]
+
+	var err error
+	pool, err = retrypool.NewBlockingPool[TreeTask, string, int](
+		ctx,
+		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[TreeTask] {
+			return &TreeWorker{pool: pool, executionTimes: make(map[int]time.Time)}
+		}),
+		retrypool.WithBlockingMaxWorkersPerPool[TreeTask](2), // we should have 1 for the root and 1 for the children
+		retrypool.WithBlockingMaxActivePools[TreeTask](1),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Submit root task
+	done := make(chan struct{})
+	rootTask := TreeTask{
+		ID:      1,
+		GroupID: "tree1",
+		Done:    done,
+	}
+
+	if err := pool.Submit(rootTask); err != nil {
+		t.Fatalf("Failed to submit root task: %v", err)
+	}
+
+	// Wait for completion
+	select {
+	case <-done:
+		t.Log("All tasks completed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for tasks")
+	}
+
+	// // Verify execution times
+	// worker.mu.Lock()
+	// rootTime := worker.executionTimes[1]
+
+	// // All dependent tasks must execute after root
+	// for id := 2; id <= 11; id++ {
+	// 	childTime, exists := worker.executionTimes[id]
+	// 	if !exists {
+	// 		t.Errorf("Task %d was not executed", id)
+	// 		continue
+	// 	}
+	// 	if childTime.Before(rootTime) {
+	// 		t.Errorf("Task %d executed before root task", id)
+	// 	}
+	// }
+	// worker.mu.Unlock()
+
+	pp.Println(pool.GetSnapshot())
+
+	if err := pool.Close(); err != nil {
+		t.Fatalf("Failed to close pool: %v", err)
+	}
+}
+
+// TreeNonLinearTask implements BlockingDependentTask for testing
+type TreeNonLinearTask struct {
+	ID           int
+	GroupID      string
+	Dependencies []int
+	Done         chan struct{}
+}
+
+func (t TreeNonLinearTask) GetDependencies() []int { return t.Dependencies }
+func (t TreeNonLinearTask) GetGroupID() string     { return t.GroupID }
+func (t TreeNonLinearTask) GetTaskID() int         { return t.ID }
+
+// TreeNonLinearWorker implements Worker
+type TreeNonLinearWorker struct {
+	executionTimes map[int]time.Time
+	mu             sync.Mutex
+	pool           *retrypool.BlockingPool[TreeNonLinearTask, string, int]
+}
+
+func (w *TreeNonLinearWorker) Run(ctx context.Context, task TreeNonLinearTask) error {
+	w.mu.Lock()
+	w.executionTimes[task.ID] = time.Now()
+	w.mu.Unlock()
+
+	fmt.Printf("Running Task %d\n", task.ID)
+
+	// If this is the root task, submit all dependent tasks
+	if task.ID == 1 {
+		// Submit 10 dependent tasks
+		for i := 2; i <= 11; i++ {
+			childDone := make(chan struct{})
+			childTask := TreeNonLinearTask{
+				ID:           i,
+				GroupID:      task.GroupID,
+				Dependencies: []int{1}, // All depend on task 1
+				Done:         childDone,
+			}
+			if err := w.pool.Submit(childTask); err != nil {
+				return fmt.Errorf("failed to submit dependent task %d: %v", i, err)
+			}
+		}
+		// we won't wait for it
+	}
+
+	close(task.Done)
+	fmt.Printf("Task %d completed\n", task.ID)
+
+	return nil
+}
+
+func TestBlockingPool_TreeNonLinearTasks(t *testing.T) {
+	ctx := context.Background()
+
+	var pool *retrypool.BlockingPool[TreeNonLinearTask, string, int]
+
+	var err error
+	pool, err = retrypool.NewBlockingPool[TreeNonLinearTask, string, int](
+		ctx,
+		retrypool.WithBlockingWorkerFactory(func() retrypool.Worker[TreeNonLinearTask] {
+			return &TreeNonLinearWorker{pool: pool, executionTimes: make(map[int]time.Time)}
+		}),
+		retrypool.WithBlockingMaxWorkersPerPool[TreeNonLinearTask](2), // we should have 1 for the root and 1 for the children
+		retrypool.WithBlockingMaxActivePools[TreeNonLinearTask](1),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create pool: %v", err)
+	}
+
+	// Submit root task
+	done := make(chan struct{})
+	rootTask := TreeNonLinearTask{
+		ID:      1,
+		GroupID: "tree1",
+		Done:    done,
+	}
+
+	if err := pool.Submit(rootTask); err != nil {
+		t.Fatalf("Failed to submit root task: %v", err)
+	}
+
+	// Wait for completion
+	select {
+	case <-done:
+		t.Log("All tasks completed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for tasks")
+	}
+
+	// // Verify execution times
+	// worker.mu.Lock()
+	// rootTime := worker.executionTimes[1]
+
+	// // All dependent tasks must execute after root
+	// for id := 2; id <= 11; id++ {
+	// 	childTime, exists := worker.executionTimes[id]
+	// 	if !exists {
+	// 		t.Errorf("Task %d was not executed", id)
+	// 		continue
+	// 	}
+	// 	if childTime.Before(rootTime) {
+	// 		t.Errorf("Task %d executed before root task", id)
+	// 	}
+	// }
+	// worker.mu.Unlock()
+
+	pp.Println(pool.GetSnapshot())
+
 	if err := pool.Close(); err != nil {
 		t.Fatalf("Failed to close pool: %v", err)
 	}

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/k0kubun/pp/v3"
 	"github.com/sasha-s/go-deadlock"
 	"golang.org/x/time/rate"
 )
@@ -25,6 +26,13 @@ import (
 /// - Pause: won't accept new tasks, queue tasks are redistributed to other workers (if zero workers then to deadtasks), finish current task (might be retried or go to deadtasks), out of any operations, paused while triggering OnPause
 /// - Resume: accept new tasks, queue is open again, continue processing, resumed while triggering OnResume
 /// - Remove: no more new tasks, queue tasks are redistribute to other workers (if zero workers then to deadtasks), finish current task (might be retried or go to deadtasks), out of any operations, removed from the Pool while triggering OnRemove
+///
+/// Snapshot:
+/// - Goal is to prevent the user from having to call the metrics functions all the time and reducing the number of locks and increasing the performance a little bit
+/// - controlled by one goroutine to update a local cache
+/// - only return the cache
+/// - can be enabled or disabled, can be set to a custom interval, can have a custom callback
+///
 
 // Initialize deadlock detection
 func init() {
@@ -52,7 +60,8 @@ type WorkerFactory[T any] func() Worker[T]
 type TaskState int
 
 const (
-	TaskStateCreated TaskState = iota
+	TaskStateNone TaskState = iota
+	TaskStateCreated
 	TaskStatePending
 	TaskStateQueued
 	TaskStateRunning
@@ -82,6 +91,18 @@ func (s TaskState) String() string {
 	}
 }
 
+type WorkerState string
+
+const (
+	WorkerStateCreated    WorkerState = "Created"
+	WorkerStateStarted    WorkerState = "Started"
+	WorkerStateIdle       WorkerState = "Idle"
+	WorkerStateEnqueuing  WorkerState = "Enqueuing"
+	WorkerStateProcessing WorkerState = "Processing"
+	WorkerStatePaused     WorkerState = "Paused"
+	WorkerStateRemoved    WorkerState = "Removed"
+)
+
 // TaskAction represents the action to take for a failed task
 type TaskAction int
 
@@ -91,6 +112,8 @@ const (
 	TaskActionRemove                               // Remove the task and recycle resources
 	TaskActionAddToDeadTasks                       // Add the task to dead tasks
 )
+
+const RetrypoolMetadataKey = "$retrypool"
 
 // NoWorkerPolicy defines the behavior when no workers are available
 type NoWorkerPolicy int
@@ -122,7 +145,7 @@ type TaskStateTransition[T any] struct {
 // stateMetrics tracks counts for each state
 type stateMetrics struct {
 	counts    map[TaskState]*atomic.Int64
-	mu        sync.RWMutex
+	mu        deadlock.RWMutex
 	callbacks map[TaskState][]func(interface{})
 }
 
@@ -200,13 +223,23 @@ func (tq *taskQueues[T]) range_(f func(id int, q TaskQueue[T]) bool) {
 	}
 }
 
+func (tq *taskQueues[T]) metrics() map[int]int {
+	tq.mu.Lock()
+	defer tq.mu.Unlock()
+	m := make(map[int]int, len(tq.queues))
+	for id, q := range tq.queues {
+		m[id] = q.Length()
+	}
+	return m
+}
+
 // Pool manages a set of workers and tasks
 type Pool[T any] struct {
 	workers               map[int]*workerState[T]
 	nextWorkerID          int
 	taskQueues            *taskQueues[T]
 	taskQueueType         TaskQueueType
-	mu                    deadlock.Mutex
+	mu                    deadlock.RWMutex
 	cond                  *sync.Cond
 	stopped               bool
 	ctx                   context.Context
@@ -225,7 +258,18 @@ type Pool[T any] struct {
 	logger                Logger
 	stateMetrics          *stateMetrics
 	workerQueues          map[int]*atomic.Int64
-	queueMu               sync.RWMutex
+	queueMu               deadlock.RWMutex
+	// (optional) Expressing how we should return the data of the task the user is giving
+	// getData func(T) interface{}
+
+	workersSnapshotMu deadlock.RWMutex   // Protects access to the workers snapshot
+	metricsSnapshot   MetricsSnapshot[T] // Cached snapshot of general metrics
+
+	workersSnapshot map[int]WorkerSnapshot[T] // Cached snapshot of workers
+	snapshotMu      deadlock.RWMutex          // Protects access to the snapshot
+	snapshotTicker  *time.Ticker              // Ticker for periodic updates
+
+	metadata *Metadata
 }
 
 // New initializes the Pool with given workers and options
@@ -244,6 +288,7 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 		deadTaskNotifications: make(chan int, 1000), // todo: make this configurable
 		stateMetrics:          newStateMetrics(),
 		workerQueues:          make(map[int]*atomic.Int64),
+		workersSnapshot:       make(map[int]WorkerSnapshot[T]),
 	}
 
 	pool.logger.Disable()
@@ -277,6 +322,16 @@ func New[T any](ctx context.Context, workers []Worker[T], options ...Option[T]) 
 		}
 	}
 
+	// Start snapshot updater if enabled
+	if pool.config.snapshotEnabled {
+		interval := pool.config.snapshotInterval
+		if interval <= 0 {
+			interval = time.Second // Default interval
+		}
+		pp.Println("Starting metrics updater")
+		pool.StartMetricsUpdater(interval)
+	}
+
 	// In synchronous mode, we want the Pool to have ONE goroutine but it manage ALL the workers and ALL the same rules
 	if !pool.config.async {
 		pool.logger.Debug(ctx, "Starting pool in synchronous mode")
@@ -300,14 +355,14 @@ func (p *Pool[T]) RoundRobinIndex() int {
 }
 
 // SetOnTaskSuccess allows setting the onTaskSuccess handler after pool creation
-func (p *Pool[T]) SetOnTaskSuccess(handler func(data T)) {
+func (p *Pool[T]) SetOnTaskSuccess(handler func(data T, metadata map[string]any)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.config.onTaskSuccess = handler
 }
 
 // SetOnTaskFailure allows setting the onTaskFailure handler after pool creation
-func (p *Pool[T]) SetOnTaskFailure(handler func(data T, err error) TaskAction) {
+func (p *Pool[T]) SetOnTaskFailure(handler func(data T, metadata map[string]any, err error) TaskAction) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.config.onTaskFailure = handler
@@ -320,26 +375,103 @@ func (p *Pool[T]) SetOnTaskAttempt(handler func(task *Task[T], workerID int)) {
 	p.config.onTaskAttempt = handler
 }
 
-type MetricsSnapshot struct {
+type MetricsSnapshot[T any] struct {
 	TasksSubmitted int64
 	TasksProcessed int64
 	TasksSucceeded int64
 	TasksFailed    int64
 	DeadTasks      int64
+	TaskQueues     map[int]int
+	Workers        map[int]WorkerSnapshot[T]
 }
 
-func (p *Pool[T]) GetMetricsSnapshot() MetricsSnapshot {
-	return MetricsSnapshot{
+func (m MetricsSnapshot[T]) Clone() MetricsSnapshot[T] {
+	clone := MetricsSnapshot[T]{
+		TasksSubmitted: m.TasksSubmitted,
+		TasksProcessed: m.TasksProcessed,
+		TasksSucceeded: m.TasksSucceeded,
+		TasksFailed:    m.TasksFailed,
+		DeadTasks:      m.DeadTasks,
+		TaskQueues:     make(map[int]int, len(m.TaskQueues)),
+		Workers:        make(map[int]WorkerSnapshot[T], len(m.Workers)),
+	}
+
+	for k, v := range m.TaskQueues {
+		clone.TaskQueues[k] = v
+	}
+
+	for k, v := range m.Workers {
+		workerClone := v
+		if v.Metadata != nil {
+			workerClone.Metadata = v.Metadata
+		}
+		clone.Workers[k] = workerClone
+	}
+
+	return clone
+}
+
+func (p *Pool[T]) calculateMetricsSnapshot() MetricsSnapshot[T] {
+	metrics := p.taskQueues.metrics()
+
+	workers := make(map[int]WorkerSnapshot[T])
+	p.RangeWorkers(func(workerID int, state WorkerSnapshot[T]) bool {
+		if state.Metadata == nil {
+			state.Metadata = map[string]any{}
+		}
+		workers[workerID] = state
+		return true
+	})
+
+	return MetricsSnapshot[T]{
 		TasksSubmitted: p.metrics.TasksSubmitted.Load(),
 		TasksProcessed: p.metrics.TasksProcessed.Load(),
 		TasksSucceeded: p.metrics.TasksSucceeded.Load(),
 		TasksFailed:    p.metrics.TasksFailed.Load(),
 		DeadTasks:      p.metrics.DeadTasks.Load(),
+		TaskQueues:     metrics,
+		Workers:        workers,
 	}
 }
 
-// NewWorkerID generates a new worker ID
-func (p *Pool[T]) NewWorkerID() int {
+func (p *Pool[T]) StartMetricsUpdater(interval time.Duration) {
+	p.snapshotTicker = time.NewTicker(interval)
+	go func() {
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-p.snapshotTicker.C:
+				snapshot := p.calculateMetricsSnapshot()
+
+				// Store the snapshot
+				p.snapshotMu.Lock()
+				p.metricsSnapshot = snapshot
+				p.snapshotMu.Unlock()
+
+				// Trigger the callback if set
+				if p.config.onSnapshot != nil {
+					p.config.onSnapshot(snapshot)
+				}
+			}
+		}
+	}()
+}
+
+func (p *Pool[T]) StopMetricsUpdater() {
+	if p.snapshotTicker != nil {
+		p.snapshotTicker.Stop()
+	}
+}
+
+func (p *Pool[T]) GetSnapshot() MetricsSnapshot[T] {
+	p.snapshotMu.RLock()
+	defer p.snapshotMu.RUnlock()
+	return p.metricsSnapshot
+}
+
+// newWorkerID generates a new worker ID
+func (p *Pool[T]) newWorkerID() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	workerID := p.nextWorkerID
@@ -350,12 +482,46 @@ func (p *Pool[T]) NewWorkerID() int {
 // Option type for configuring the Pool
 type Option[T any] func(*Pool[T])
 
+func WithMetadata[T any](metadata *Metadata) Option[T] {
+	return func(p *Pool[T]) {
+		p.metadata = metadata
+	}
+}
+
+// WithSnapshotInterval sets the interval for periodic snapshots
+func WithSnapshots[T any]() Option[T] {
+	return func(p *Pool[T]) {
+		p.config.snapshotEnabled = true
+	}
+}
+
+// WithSnapshotInterval sets the interval for periodic snapshots
+func WithSnapshotInterval[T any](interval time.Duration) Option[T] {
+	return func(p *Pool[T]) {
+		p.config.snapshotInterval = interval
+	}
+}
+
+// WithSnapshotCallback sets a callback for snapshot updates
+func WithSnapshotCallback[T any](callback func(MetricsSnapshot[T])) Option[T] {
+	return func(p *Pool[T]) {
+		p.config.onSnapshot = callback
+	}
+}
+
 // WithLogger sets the logger for the pool and all its components
 func WithLogger[T any](logger Logger) Option[T] {
 	return func(p *Pool[T]) {
 		p.logger = logger
 	}
 }
+
+// That was a bad idea
+// func WithGetData[T any](getData func(T) interface{}) Option[T] {
+// 	return func(p *Pool[T]) {
+// 		p.getData = getData
+// 	}
+// }
 
 // WithAttempts sets the maximum number of attempts
 func WithAttempts[T any](attempts int) Option[T] {
@@ -478,7 +644,7 @@ func WithRateLimit[T any](rps float64) Option[T] {
 }
 
 // WithOnTaskSuccess sets a callback for successful task completion
-func WithOnTaskSuccess[T any](handler func(data T)) Option[T] {
+func WithOnTaskSuccess[T any](handler func(data T, metadata map[string]any)) Option[T] {
 	return func(p *Pool[T]) {
 		p.logger.Debug(p.ctx, "Setting OnTaskSuccess handler")
 		p.config.onTaskSuccess = handler
@@ -486,7 +652,7 @@ func WithOnTaskSuccess[T any](handler func(data T)) Option[T] {
 }
 
 // WithOnTaskFailure sets a callback for task failure
-func WithOnTaskFailure[T any](handler func(data T, err error) TaskAction) Option[T] {
+func WithOnTaskFailure[T any](handler func(data T, metadata map[string]any, err error) TaskAction) Option[T] {
 	return func(p *Pool[T]) {
 		p.logger.Debug(p.ctx, "Setting OnTaskFailure handler")
 		p.config.onTaskFailure = handler
@@ -562,8 +728,8 @@ type Config[T any] struct {
 	maxQueueSize   int
 	onPanic        func(recovery interface{}, stackTrace string)
 	onWorkerPanic  func(workerID int, recovery interface{}, stackTrace string)
-	onTaskSuccess  func(data T)
-	onTaskFailure  func(data T, err error) TaskAction
+	onTaskSuccess  func(data T, metadata map[string]any)
+	onTaskFailure  func(data T, metadata map[string]any, err error) TaskAction
 	onDeadTask     func(deadTaskIndex int)
 	onTaskAttempt  func(task *Task[T], workerID int)
 	deadTasksLimit int
@@ -572,6 +738,10 @@ type Config[T any] struct {
 	noWorkerPolicy NoWorkerPolicy
 	loopTicker     time.Duration
 	async          bool
+
+	snapshotEnabled  bool                     // Enable or disable snapshots
+	snapshotInterval time.Duration            // Interval for periodic updates
+	onSnapshot       func(MetricsSnapshot[T]) // Optional callback on snapshot update
 }
 
 // newDefaultConfig initializes default configurations
@@ -637,9 +807,71 @@ type Metrics struct {
 	DeadTasks      atomic.Int64
 }
 
+type Metadata struct {
+	mu    deadlock.RWMutex
+	store map[string]any
+}
+
+func NewMetadata() *Metadata {
+	return &Metadata{
+		store: make(map[string]any),
+	}
+}
+
+func (m *Metadata) Clone() *Metadata {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	clone := NewMetadata()
+	for k, v := range m.store {
+		clone.store[k] = v
+	}
+	return clone
+}
+
+func (m *Metadata) CloneStore() map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	clone := make(map[string]any, len(m.store))
+	for k, v := range m.store {
+		clone[k] = v
+	}
+	return clone
+}
+
+func (m *Metadata) Merge(other *Metadata) {
+	if other == nil {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	other.mu.RLock()
+	defer other.mu.RUnlock()
+
+	for k, v := range other.store {
+		m.store[k] = v
+	}
+}
+
+func (m *Metadata) Get(key string) any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.store[key]
+}
+
+func (m *Metadata) Set(key string, value any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store[key] = value
+}
+
 // Task represents a task in the pool
 type Task[T any] struct {
 	mu                deadlock.Mutex
+	metadata          *Metadata // `retrypool`'s design doesn't allow to access to `data` directly, so we need to store the metadata
 	data              T
 	retries           int
 	totalDuration     time.Duration
@@ -657,6 +889,7 @@ type Task[T any] struct {
 	processedCb       func()
 	immediateRetry    bool
 	bounceRetry       bool
+	currentWorkerID   int
 	attemptedWorkers  map[int]struct{} // Track workers that attempted this task
 	lastWorkerID      int              // Last worker that processed this task
 	queuedAt          []time.Time      // When task entered different queues
@@ -664,10 +897,10 @@ type Task[T any] struct {
 	stateHistory      []*TaskStateTransition[T]
 }
 
-func (t *Task[T]) GetData() T {
+func (t *Task[T]) GetMetadata() *Metadata {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.data
+	return t.metadata.Clone()
 }
 
 func (t *Task[T]) GetAttemptedWorkers() []int {
@@ -842,65 +1075,72 @@ type DeadTask[T any] struct {
 // TaskOption functions for configuring individual tasks
 type TaskOption[T any] func(*Task[T])
 
-// WithImmediateRetry allows the submitted task to retry immediately
-func WithImmediateRetry[T any]() TaskOption[T] {
+// WithMetadata sets metadata for the task
+func WithTaskMetadata[T any](metadata *Metadata) TaskOption[T] {
+	return func(t *Task[T]) {
+		t.metadata = metadata.Clone()
+	}
+}
+
+// WithTaskImmediateRetry allows the submitted task to retry immediately
+func WithTaskImmediateRetry[T any]() TaskOption[T] {
 	return func(t *Task[T]) {
 		t.immediateRetry = true
 	}
 }
 
-// WithBounceRetry enables retry on different workers
-func WithBounceRetry[T any]() TaskOption[T] {
+// WithTaskBounceRetry enables retry on different workers
+func WithTaskBounceRetry[T any]() TaskOption[T] {
 	return func(t *Task[T]) {
 		t.bounceRetry = true
 		t.attemptedWorkers = make(map[int]struct{})
 	}
 }
 
-// WithDuration sets a per-attempt time limit for the task
-func WithDuration[T any](d time.Duration) TaskOption[T] {
+// WithTaskDuration sets a per-attempt time limit for the task
+func WithTaskDuration[T any](d time.Duration) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.attemptTimeout = d
 	}
 }
 
-// WithTimeout sets a total time limit for the task
-func WithTimeout[T any](d time.Duration) TaskOption[T] {
+// WithTaskTimeout sets a total time limit for the task
+func WithTaskTimeout[T any](d time.Duration) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.totalTimeout = d
 	}
 }
 
-// WithProcessedNotification sets a notification for when a task is processed
-func WithProcessedNotification[T any](n *ProcessedNotification) TaskOption[T] {
+// WithTaskProcessedNotification sets a notification for when a task is processed
+func WithTaskProcessedNotification[T any](n *ProcessedNotification) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.notifiedProcessed = n
 	}
 }
 
-// WithQueuedNotification sets a notification for when a task is queued
-func WithQueuedNotification[T any](n *QueuedNotification) TaskOption[T] {
+// WithTaskQueuedNotification sets a notification for when a task is queued
+func WithTaskQueuedNotification[T any](n *QueuedNotification) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.notifiedQueued = n
 	}
 }
 
-// WithQueuedCb sets a callback for when a task is queued
-func WithQueuedCb[T any](cb func()) TaskOption[T] {
+// WithTaskQueuedCb sets a callback for when a task is queued
+func WithTaskQueuedCb[T any](cb func()) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.queuedCb = cb
 	}
 }
 
-// WithProcessedCb sets a callback for when a task is processed
-func WithProcessedCb[T any](cb func()) TaskOption[T] {
+// WithTaskProcessedCb sets a callback for when a task is processed
+func WithTaskProcessedCb[T any](cb func()) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.processedCb = cb
 	}
 }
 
-// WithRunningCb sets a callback for when a task is running
-func WithRunningCb[T any](cb func()) TaskOption[T] {
+// WithTaskRunningCb sets a callback for when a task is running
+func WithTaskRunningCb[T any](cb func()) TaskOption[T] {
 	return func(t *Task[T]) {
 		t.runningCb = cb
 	}
@@ -941,7 +1181,11 @@ func (p *Pool[T]) Submit(data T, options ...TaskOption[T]) error {
 	}
 
 	t := p.taskPool.Get().(*Task[T])
-	*t = Task[T]{data: data, state: TaskStateCreated}
+	*t = Task[T]{
+		data:     data,
+		state:    TaskStateCreated,
+		metadata: NewMetadata(),
+	}
 
 	for _, option := range options {
 		option(t)
@@ -1148,6 +1392,21 @@ func (p *Pool[T]) RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool)
 	p.taskQueues.range_(f)
 }
 
+func (p *Pool[T]) RangeWorkers(f func(workerID int, state WorkerSnapshot[T]) bool) {
+	p.rangeWorkers(f)
+}
+
+// ~~TODO: that function is very probablemetic, we should only use the worker snapshot~~
+func (p *Pool[T]) rangeWorkers(f func(workerID int, state WorkerSnapshot[T]) bool) {
+	p.workersSnapshotMu.RLock()
+	for id, snapshot := range p.workersSnapshot {
+		if !f(id, snapshot) {
+			break
+		}
+	}
+	p.workersSnapshotMu.RUnlock()
+}
+
 func (p *Pool[T]) UpdateTotalQueueSize(delta int64) {
 	newSize := p.totalQueueSize.Add(delta)
 	if newSize < 0 {
@@ -1175,6 +1434,1603 @@ type TaskQueue[T any] interface {
 	Length() int
 	Clear()
 	Drain() []*Task[T]
+}
+
+// workerState holds the state of a worker
+type workerState[T any] struct {
+	worker       Worker[T]
+	id           int
+	ctx          context.Context
+	cancel       context.CancelFunc
+	paused       atomic.Bool
+	state        WorkerState
+	currentTask  *Task[T]
+	taskQueue    TaskQueue[T]
+	removed      atomic.Bool
+	mu           deadlock.Mutex
+	cond         *sync.Cond
+	async        bool
+	methodsCache map[string]*reflect.Value
+	done         chan struct{}
+	logger       Logger
+}
+
+type WorkerSnapshot[T any] struct {
+	ID       int
+	Paused   bool
+	Removed  bool
+	HasTask  bool
+	Metadata map[string]any
+	State    WorkerState
+}
+
+// Add adds a new worker to the pool
+func (p *Pool[T]) Add(worker Worker[T], queue TaskQueue[T]) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if worker == nil {
+		p.logger.Error(p.ctx, "Cannot add nil worker")
+		return errors.New("worker cannot be nil")
+	}
+
+	workerID := p.nextWorkerID
+	p.nextWorkerID++
+
+	if queue == nil {
+		queue = p.NewTaskQueue(p.taskQueueType)
+	}
+
+	workerCtx, cancel := context.WithCancel(p.ctx)
+
+	state := &workerState[T]{
+		worker:       worker,
+		state:        WorkerStateCreated,
+		id:           workerID,
+		ctx:          workerCtx,
+		cancel:       cancel,
+		taskQueue:    queue,
+		async:        p.config.async,
+		done:         make(chan struct{}),
+		methodsCache: getWorkerMethods(worker),
+		// logger:       p.logger.WithFields(map[string]any{"worker_id": workerID}),
+	}
+
+	state.cond = sync.NewCond(&state.mu)
+	p.workers[workerID] = state
+	p.taskQueues.set(workerID, queue)
+	p.workerQueues[workerID] = &atomic.Int64{}
+
+	p.logger.Info(p.ctx, "Added new worker", "worker_id", workerID)
+
+	// Set worker ID if the struct has an ID field
+	setWorkerID(worker, workerID)
+
+	// Trigger OnStart if exists
+	state.callMethod("OnStart", state.ctx)
+
+	// Before returning, update availableWorkers
+	if !state.paused.Load() && !state.removed.Load() {
+		p.availableWorkers.Add(1)
+	}
+
+	// Redistribute tasks to include the new worker
+	p.RedistributeAllTasks()
+
+	p.updateRateLimiterBurst()
+
+	// snapshot creation of worker
+	p.workersSnapshotMu.Lock()
+	p.workersSnapshot[workerID] = WorkerSnapshot[T]{
+		ID:       workerID,
+		Paused:   false,
+		Removed:  false,
+		HasTask:  false,
+		Metadata: nil,
+	}
+	p.workersSnapshotMu.Unlock()
+
+	if p.config.async {
+		go p.runWorker(state)
+	}
+
+	return nil
+}
+
+func setWorkerID[T any](worker Worker[T], id int) {
+	val := reflect.ValueOf(worker)
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+	}
+	if val.Kind() == reflect.Struct {
+		field := val.FieldByName("ID")
+		if field.IsValid() && field.CanSet() && field.Kind() == reflect.Int {
+			field.SetInt(int64(id))
+		}
+	}
+}
+
+func getWorkerMethods[T any](worker Worker[T]) map[string]*reflect.Value {
+	methods := make(map[string]*reflect.Value)
+	rv := reflect.ValueOf(worker)
+	methodNames := []string{"OnStart", "OnStop", "OnRemove", "OnPause", "OnResume"}
+	for _, name := range methodNames {
+		method := rv.MethodByName(name)
+		if method.IsValid() {
+			methods[name] = &method
+		}
+	}
+	return methods
+}
+
+// Remove removes a worker from the pool
+func (p *Pool[T]) Remove(id int) error {
+	p.mu.Lock()
+	state, exists := p.workers[id]
+	if !exists {
+		p.mu.Unlock()
+		p.logger.Error(p.ctx, "Attempted to remove invalid worker", "worker_id", id)
+		return ErrInvalidWorkerID
+	}
+
+	// Check if worker is available
+	wasAvailable := !state.paused.Load() && !state.removed.Load()
+
+	p.logger.Info(p.ctx, "Removing worker", "worker_id", id)
+
+	// Stop the flow of tasks
+	state.mu.Lock()
+	if state.removed.Load() {
+		state.mu.Unlock()
+		p.mu.Unlock()
+		p.logger.Warn(p.ctx, "Worker already removed", "worker_id", id)
+		return nil
+	}
+	state.removed.Store(true)
+	state.paused.Store(true)
+	state.mu.Unlock()
+
+	// Signal the worker's condition variable to wake it up if it's waiting
+	state.cond.Broadcast()
+
+	// Signal the pool's condition variable to wake up any workers waiting on tasks
+	p.cond.Broadcast()
+
+	// Remove the worker's queue and redistribute tasks
+	q, ok := p.taskQueues.get(id)
+	if !ok {
+		p.mu.Unlock()
+		p.logger.Error(p.ctx, "Task queue not found for worker", "worker_id", id)
+		return errors.New("task queue not found for worker")
+	}
+	p.taskQueues.delete(id)
+	delete(p.workerQueues, id)
+
+	p.mu.Unlock()
+
+	// Drain the task queue and redistribute tasks
+	tasks := q.Drain()
+	if len(tasks) > 0 {
+		p.logger.Debug(p.ctx, "Redistributing tasks from removed worker", "worker_id", id, "tasks_count", len(tasks))
+		p.redistributeTasks(tasks)
+	}
+
+	// Cancel the worker's context to signal task cancellation
+	state.cancel()
+
+	// Wait for the worker to finish, with timeout
+	timeout := time.Second * 10 // Configurable timeout duration
+	workerFinished := make(chan struct{})
+
+	go func() {
+		if state.async {
+			// In async mode, wait for the worker goroutine to finish
+			<-state.done
+		} else {
+			// TODO: i'm not sure sure about that but we will see
+			// In synchronous mode, we need to wait for the worker to complete the current task
+			state.mu.Lock()
+			for state.currentTask != nil {
+				state.logger.Debug(state.ctx, "Waiting for worker to finish current task", "worker_id", id)
+				state.cond.Wait()
+			}
+			state.mu.Unlock()
+		}
+		close(workerFinished)
+	}()
+
+	select {
+	case <-workerFinished:
+		// Worker finished gracefully
+		p.logger.Debug(p.ctx, "Worker exited gracefully", "worker_id", id)
+	case <-time.After(timeout):
+		// Worker didn't finish within timeout
+		p.logger.Warn(p.ctx, "Worker did not finish within timeout", "worker_id", id)
+		// Handle the current task
+		state.mu.Lock()
+		if state.currentTask != nil {
+			task := state.currentTask
+			task.mu.Lock()
+			task.deadReason = "worker removed due to timeout"
+			task.mu.Unlock()
+			p.addDeadTask(task)
+			state.currentTask = nil
+			state.cond.Broadcast()
+		}
+		state.mu.Unlock()
+	}
+
+	// After removing, update availableWorkers
+	if wasAvailable {
+		p.availableWorkers.Add(-1)
+	}
+
+	p.logger.Debug(p.ctx, "Calling methods", "worker_id", id)
+	// Trigger OnStop and OnRemove
+	state.callMethod("OnStop", state.ctx)
+	state.callMethod("OnRemove", state.ctx)
+
+	p.logger.Debug(p.ctx, "Removing worker from pool", "worker_id", id)
+	p.mu.Lock()
+	delete(p.workers, id)
+	p.updateRateLimiterBurst()
+	p.mu.Unlock()
+
+	p.logger.Info(p.ctx, "Worker removed successfully", "worker_id", id)
+
+	return nil
+}
+
+// Pause pauses a worker
+func (p *Pool[T]) Pause(id int) error {
+	p.mu.Lock()
+	state, exists := p.workers[id]
+	if !exists {
+		p.mu.Unlock()
+		p.logger.Error(p.ctx, "Attempted to pause invalid worker", "worker_id", id)
+		return ErrInvalidWorkerID
+	}
+
+	// Check if worker is available
+	wasAvailable := !state.paused.Load() && !state.removed.Load()
+
+	p.logger.Info(p.ctx, "Pausing worker", "worker_id", id)
+
+	// Stop the flow of tasks
+	state.mu.Lock()
+	if state.paused.Load() {
+		state.mu.Unlock()
+		p.mu.Unlock()
+		p.logger.Warn(p.ctx, "Worker already paused", "worker_id", id)
+		return nil
+	}
+	state.paused.Store(true)
+	state.mu.Unlock()
+
+	// Remove the worker's queue and redistribute tasks
+	q, _ := p.taskQueues.get(id)
+	p.taskQueues.delete(id)
+	delete(p.workerQueues, id)
+	p.mu.Unlock()
+
+	// Drain the task queue and redistribute tasks
+	tasks := q.Drain()
+	if len(tasks) > 0 {
+		p.logger.Debug(p.ctx, "Redistributing tasks from paused worker", "worker_id", id, "tasks_count", len(tasks))
+		p.redistributeTasks(tasks)
+	}
+
+	// Trigger OnPause
+	state.callMethod("OnPause", state.ctx)
+
+	// After pausing, update availableWorkers
+	if wasAvailable {
+		p.availableWorkers.Add(-1)
+	}
+
+	p.updateRateLimiterBurst()
+
+	return nil
+}
+
+// Redistribute all tasks among workers
+func (p *Pool[T]) RedistributeAllTasks() {
+	p.logger.Debug(p.ctx, "Redistributing all tasks among workers")
+
+	// Collect all tasks from all queues
+	allTasks := []*Task[T]{}
+	p.taskQueues.range_(func(id int, q TaskQueue[T]) bool {
+		tasks := q.Drain()
+		allTasks = append(allTasks, tasks...)
+		return true
+	})
+
+	// Get available (non-paused) workers
+	availableWorkers := []int{}
+	for id, state := range p.workers {
+		if !state.paused.Load() && !state.removed.Load() {
+			availableWorkers = append(availableWorkers, id)
+		}
+	}
+
+	workerCount := len(availableWorkers)
+	if workerCount == 0 {
+		for _, task := range allTasks {
+			task.deadReason = "no workers available"
+			p.addDeadTask(task)
+			p.UpdateTotalQueueSize(-1)
+		}
+		p.logger.Warn(p.ctx, "No workers available during redistribution, tasks added to dead tasks", "dead_tasks_count", len(allTasks))
+		return
+	}
+
+	// Redistribute tasks among available workers
+	for i, task := range allTasks {
+		selectedWorkerID := availableWorkers[i%workerCount]
+		q := p.taskQueues.getOrCreate(selectedWorkerID, func() TaskQueue[T] {
+			return p.NewTaskQueue(p.taskQueueType)
+		})
+		q.Enqueue(task)
+		p.UpdateWorkerQueueSize(selectedWorkerID, 1)
+		p.logger.Debug(p.ctx, "Task redistributed", "worker_id", selectedWorkerID)
+	}
+
+	p.logger.Debug(p.ctx, "Tasks redistributed among workers", "tasks_count", len(allTasks))
+}
+
+// Resume resumes a worker
+func (p *Pool[T]) Resume(id int) error {
+	p.mu.Lock()
+	state, exists := p.workers[id]
+	if !exists {
+		p.mu.Unlock()
+		p.logger.Error(p.ctx, "Attempted to resume invalid worker", "worker_id", id)
+		return ErrInvalidWorkerID
+	}
+
+	p.logger.Info(p.ctx, "Resuming worker", "worker_id", id)
+
+	state.mu.Lock()
+	if !state.paused.Load() {
+		state.mu.Unlock()
+		p.mu.Unlock()
+		p.logger.Warn(p.ctx, "Worker not paused, cannot resume", "worker_id", id)
+		return nil
+	}
+
+	// Create a new task queue for the worker if it doesn't exist
+	if _, ok := p.taskQueues.get(id); !ok {
+		p.taskQueues.set(id, p.NewTaskQueue(p.taskQueueType))
+		p.workerQueues[id] = &atomic.Int64{}
+	}
+
+	// Mark the worker as not paused before redistribution
+	state.paused.Store(false)
+
+	// Redistribute tasks while holding both locks
+	p.RedistributeAllTasks()
+
+	// Signal the worker to continue
+	state.cond.Signal()
+	p.cond.Broadcast()
+
+	state.mu.Unlock()
+	p.mu.Unlock()
+
+	p.updateRateLimiterBurst()
+
+	state.callMethod("OnResume", state.ctx)
+
+	// After resuming, update availableWorkers
+	p.availableWorkers.Add(1)
+
+	p.logger.Info(p.ctx, "Worker resumed", "worker_id", id)
+	return nil
+}
+
+// Workers returns the list of worker IDs
+func (p *Pool[T]) Workers() ([]int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ids := make([]int, 0, len(p.workers))
+	for id := range p.workers {
+		ids = append(ids, id)
+	}
+	p.logger.Debug(p.ctx, "Fetched all worker IDs", "worker_ids", ids)
+	return ids, nil
+}
+
+func (p *Pool[T]) getAvailableWorkerIDs() []int {
+	ids := make([]int, 0)
+	for id, state := range p.workers {
+		if !state.paused.Load() && !state.removed.Load() {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// redistributeTasks redistributes tasks to other workers
+func (p *Pool[T]) redistributeTasks(tasks []*Task[T]) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Get available (non-paused, non-removed) workers
+	availableWorkers := p.getAvailableWorkerIDs()
+	workerCount := len(availableWorkers)
+	if workerCount == 0 {
+		for _, task := range tasks {
+			task.deadReason = "no workers available"
+			p.addDeadTask(task)
+			p.UpdateTotalQueueSize(-1)
+		}
+		p.logger.Warn(p.ctx, "No workers available, tasks added to dead tasks", "dead_tasks_count", len(tasks))
+		return
+	}
+
+	for i, task := range tasks {
+		selectedWorkerID := availableWorkers[i%workerCount]
+		q := p.taskQueues.getOrCreate(selectedWorkerID, func() TaskQueue[T] {
+			return p.NewTaskQueue(p.taskQueueType)
+		})
+		q.Enqueue(task)
+		p.UpdateWorkerQueueSize(selectedWorkerID, 1)
+		p.logger.Debug(p.ctx, "Task redistributed", "worker_id", selectedWorkerID)
+	}
+
+	p.logger.Debug(p.ctx, "Tasks redistributed among workers", "tasks_count", len(tasks))
+
+	// Notify all workers that tasks are available
+	p.cond.Broadcast()
+}
+
+// runWorker runs the worker's loop
+func (p *Pool[T]) runWorker(state *workerState[T]) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 1<<16)
+			n := runtime.Stack(buf, false)
+			stackTrace := string(buf[:n])
+			if p.config.onWorkerPanic != nil {
+				p.config.onWorkerPanic(state.id, r, stackTrace)
+			}
+			p.logger.Error(p.ctx, "Panic in worker", "worker_id", state.id, "error", r, "stack_trace", stackTrace)
+		}
+		close(state.done)
+		p.logger.Debug(p.ctx, "Worker goroutine exited", "worker_id", state.id)
+	}()
+
+	var snapshot WorkerSnapshot[T]
+	p.workersSnapshotMu.Lock()
+	if _, ok := p.workersSnapshot[state.id]; !ok {
+		p.workersSnapshot[state.id] = WorkerSnapshot[T]{ID: state.id}
+	}
+	snapshot = p.workersSnapshot[state.id]
+	p.workersSnapshotMu.Unlock()
+
+	// worker loop
+	for {
+
+		// Create initial metadata map
+		meta := map[string]any{
+			"worker_id": state.id,
+			"assigned":  time.Now().UnixNano(),
+		}
+
+		// Create a new Metadata instance for this operation
+		newMetadata := NewMetadata()
+		for k, v := range meta {
+			newMetadata.Set(k, v)
+		}
+
+		// Safely merge pool metadata if it exists
+		p.mu.RLock()
+		if p.metadata != nil {
+			p.metadata.mu.RLock()
+			// Copy pool metadata into our new instance
+			for k, v := range p.metadata.store {
+				newMetadata.Set(k, v)
+			}
+			p.metadata.mu.RUnlock()
+		}
+		p.mu.RUnlock()
+
+		snapshot.HasTask = false
+		snapshot.Paused = false
+		snapshot.Removed = false
+		snapshot.Metadata = map[string]any{}
+		snapshot.State = WorkerStateIdle
+		p.workersSnapshotMu.Lock()
+		p.workersSnapshot[state.id] = snapshot
+		p.workersSnapshotMu.Unlock()
+
+		// First check if we're removed without holding any locks
+		if state.removed.Load() {
+			snapshot.Removed = true
+			snapshot.State = WorkerStateRemoved
+			p.workersSnapshotMu.Lock()
+			p.workersSnapshot[state.id] = snapshot
+			p.workersSnapshotMu.Unlock()
+			p.logger.Debug(p.ctx, "Worker detected removal, exiting", "worker_id", state.id)
+			break
+		}
+
+		// Then check if we're paused
+		if state.paused.Load() {
+			state.mu.Lock()
+			for state.paused.Load() && !state.removed.Load() {
+				snapshot.Paused = true
+				snapshot.State = WorkerStatePaused
+				p.workersSnapshotMu.Lock()
+				p.workersSnapshot[state.id] = snapshot
+				p.workersSnapshotMu.Unlock()
+				p.logger.Debug(p.ctx, "Worker is paused, waiting", "worker_id", state.id)
+				state.cond.Wait()
+			}
+			state.mu.Unlock()
+			continue
+		}
+
+		// Try to get a task with proper lock ordering
+		var task *Task[T]
+		var ok bool
+
+		// First get pool lock to check queue
+		p.mu.Lock()
+		q, hasQueue := p.taskQueues.get(state.id)
+		if !hasQueue {
+			p.mu.Unlock()
+			p.logger.Error(p.ctx, "No task queue found for worker", "worker_id", state.id)
+			continue
+		}
+
+		qLen := q.Length()
+		p.logger.Debug(p.ctx, "Checking queue", "worker_id", state.id, "queue_length", qLen)
+
+		if qLen > 0 {
+			task, ok = q.Dequeue()
+			if ok {
+				p.UpdateWorkerQueueSize(state.id, -1)
+				p.logger.Debug(p.ctx, "Dequeued task", "worker_id", state.id, "task_data", task.data, "remaining_queue", q.Length())
+			}
+		}
+
+		if !ok {
+			if state.removed.Load() {
+				snapshot.Removed = true
+				snapshot.State = WorkerStateRemoved
+				p.workersSnapshotMu.Lock()
+				p.workersSnapshot[state.id] = snapshot
+				p.workersSnapshotMu.Unlock()
+				p.mu.Unlock()
+				break
+			}
+			p.logger.Debug(p.ctx, "No task available, waiting", "worker_id", state.id, "queue_size", p.QueueSize(), "total_processing", p.totalProcessing.Load())
+			p.cond.Wait()
+			p.mu.Unlock()
+			continue
+		}
+		p.mu.Unlock()
+
+		// Now process the task
+		if task != nil {
+			task.mu.Lock()
+			if task.metadata == nil {
+				task.metadata = NewMetadata()
+			}
+			task.metadata.Set(
+				RetrypoolMetadataKey,
+				meta,
+			)
+
+			task.mu.Unlock()
+
+			state.mu.Lock()
+			state.currentTask = task
+			state.mu.Unlock()
+
+			snapshot.HasTask = true
+			snapshot.State = WorkerStateEnqueuing
+			snapshot.Metadata = task.metadata.CloneStore() // only for snapshot // TODO: all those allocations could be in a sync.Pool
+			p.workersSnapshotMu.Lock()
+			p.workersSnapshot[state.id] = snapshot
+			p.workersSnapshotMu.Unlock()
+
+			p.logger.Debug(p.ctx, "Processing task", "worker_id", state.id, "task_data", task.data)
+
+			p.processTask(state, task)
+
+			state.mu.Lock()
+			state.currentTask = nil
+			state.mu.Unlock()
+
+			snapshot.HasTask = false
+			snapshot.Metadata = nil
+			snapshot.State = WorkerStateIdle
+			p.workersSnapshotMu.Lock()
+			p.workersSnapshot[state.id] = snapshot
+			p.workersSnapshotMu.Unlock()
+
+			p.logger.Debug(p.ctx, "Completed task processing", "worker_id", state.id, "queue_size", p.QueueSize(), "total_processing", p.totalProcessing.Load())
+		}
+	}
+
+	snapshot.HasTask = false
+	snapshot.Paused = false
+	snapshot.Removed = true
+	snapshot.Metadata = nil
+	p.workersSnapshotMu.Lock()
+	p.workersSnapshot[state.id] = snapshot
+	p.workersSnapshotMu.Unlock()
+
+	// Trigger OnStop and OnRemove if not already called
+	state.callMethod("OnStop", state.ctx)
+	state.callMethod("OnRemove", state.ctx)
+}
+
+// run processes tasks in synchronous mode
+func (p *Pool[T]) run() {
+	p.logger.Debug(p.ctx, "Running pool in synchronous mode")
+	duration := time.Millisecond * 10
+	if p.config.loopTicker > 0 {
+		duration = p.config.loopTicker
+	}
+	ticker := time.NewTicker(duration) // Configurable interval
+	defer ticker.Stop()
+
+	iterations := 0
+	for {
+		iterations++
+
+		select {
+		case <-p.ctx.Done():
+			p.logger.Info(p.ctx, "Pool context done, exiting run loop")
+			return
+		case <-ticker.C:
+			p.mu.Lock()
+			if p.stopped {
+				p.mu.Unlock()
+				p.logger.Info(p.ctx, "Pool stopped, exiting run loop")
+				return
+			}
+
+			// Get available workers
+			workerIDs := p.getWorkerIDs()
+
+			if len(workerIDs) == 0 {
+				p.mu.Unlock()
+				p.logger.Warn(p.ctx, "No workers available")
+				continue
+			}
+
+			hasWork := false
+			totalTasks := int64(0)
+			for _, workerID := range workerIDs {
+				state := p.workers[workerID]
+				if state == nil {
+					continue
+				}
+
+				var snapshot WorkerSnapshot[T]
+
+				p.workersSnapshotMu.Lock()
+				if _, ok := p.workersSnapshot[workerID]; !ok {
+					p.workersSnapshot[workerID] = WorkerSnapshot[T]{ID: workerID}
+				}
+				snapshot = p.workersSnapshot[workerID]
+				snapshot.ID = workerID
+				snapshot.Paused = state.paused.Load()
+				snapshot.Removed = state.removed.Load()
+				p.workersSnapshot[workerID] = snapshot
+				p.workersSnapshotMu.Unlock()
+
+				state.mu.Lock()
+				if state.paused.Load() || state.removed.Load() {
+					state.mu.Unlock()
+					continue
+				}
+				state.mu.Unlock()
+
+				// Check if there are tasks available
+				if q, ok := p.taskQueues.get(workerID); ok {
+					qLen := q.Length()
+					totalTasks += int64(qLen)
+					if qLen > 0 {
+						hasWork = true
+					}
+				}
+
+				snapshot.HasTask = hasWork
+
+				p.workersSnapshotMu.Lock()
+				p.workersSnapshot[workerID] = snapshot
+				p.workersSnapshotMu.Unlock()
+			}
+
+			if !hasWork {
+				p.logger.Debug(p.ctx, "No tasks available, waiting")
+				p.cond.Wait()
+				p.mu.Unlock()
+				continue
+			}
+
+			p.mu.Unlock()
+
+			if !hasWork {
+				continue
+			}
+
+			// Process one task per worker
+			for _, workerID := range workerIDs {
+				state := p.workers[workerID]
+				if state == nil {
+					continue
+				}
+
+				var snapshot WorkerSnapshot[T]
+				p.workersSnapshotMu.Lock()
+				snapshot = p.workersSnapshot[workerID]
+				p.workersSnapshotMu.Unlock()
+
+				state.mu.Lock()
+				if state.paused.Load() || state.removed.Load() {
+					state.mu.Unlock()
+					continue
+				}
+				state.mu.Unlock()
+
+				task, ok := p.getTaskForWorker(state.id)
+				if !ok {
+					continue
+				}
+
+				task.mu.Lock()
+				task.metadata.Set(
+					RetrypoolMetadataKey,
+					map[string]any{
+						"worker_id": state.id,
+						"assigned":  time.Now().UnixNano(),
+					})
+				task.mu.Unlock()
+
+				p.workersSnapshotMu.Lock()
+				snapshot.HasTask = true
+				snapshot.Metadata = task.metadata.CloneStore()
+				p.workersSnapshot[workerID] = snapshot
+				p.workersSnapshotMu.Unlock()
+
+				state.mu.Lock()
+				state.currentTask = task
+				state.mu.Unlock()
+
+				p.processTask(state, task)
+
+				p.workersSnapshotMu.Lock()
+				snapshot.HasTask = false
+				snapshot.Metadata = nil
+				p.workersSnapshot[workerID] = snapshot
+				p.workersSnapshotMu.Unlock()
+
+				state.mu.Lock()
+				state.currentTask = nil
+				state.mu.Unlock()
+			}
+		}
+	}
+}
+
+// getTaskForWorker gets the next task for the worker
+func (p *Pool[T]) getTaskForWorker(workerID int) (*Task[T], bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.logger.Debug(p.ctx, "Getting task for worker", "worker_id", workerID, "total_queue_size", p.QueueSize())
+
+	q, ok := p.taskQueues.get(workerID)
+	if !ok {
+		return nil, false
+	}
+
+	qLen := q.Length()
+	p.logger.Debug(p.ctx, "Found queue", "worker_id", workerID, "queue_length", qLen)
+
+	if qLen == 0 {
+		return nil, false
+	}
+
+	task, ok := q.Dequeue()
+	if ok {
+		p.UpdateWorkerQueueSize(workerID, -1)
+		p.logger.Debug(p.ctx, "Got task for worker", "worker_id", workerID, "task_data", task.data, "remaining_queue", q.Length())
+	}
+
+	return task, ok
+}
+
+// processTask processes a task with proper state management
+func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
+	p.logger.Debug(p.ctx, "Starting task processing", "worker_id", state.id, "task_data", task.data, "task_retries", task.retries, "immediate_retry", task.immediateRetry)
+
+	// Update task state with proper locking
+	p.mu.RLock() // First acquire pool lock
+	if p.metadata != nil {
+		meta := map[string]any{
+			"worker_id": state.id,
+			"assigned":  time.Now().UnixNano(),
+		}
+
+		// Safely copy pool metadata
+		p.metadata.mu.RLock()
+		for k, v := range p.metadata.store {
+			meta[k] = v
+		}
+		p.metadata.mu.RUnlock()
+
+		// Then acquire task lock
+		task.mu.Lock()
+		if task.metadata == nil {
+			task.metadata = NewMetadata()
+		}
+		task.metadata.Set(RetrypoolMetadataKey, meta)
+		task.lastWorkerID = state.id
+		if task.bounceRetry {
+			task.attemptedWorkers[state.id] = struct{}{}
+		}
+		task.attemptStartTime = time.Now()
+		task.processedAt = append(task.processedAt, time.Now())
+		task.mu.Unlock()
+	}
+	p.mu.RUnlock()
+
+	// Assign the current worker
+	task.mu.Lock()
+	task.currentWorkerID = state.id
+	task.mu.Unlock()
+
+	// Update metrics atomically
+	p.metrics.TasksProcessed.Add(1)
+	p.totalProcessing.Add(1)
+	defer p.totalProcessing.Add(-1)
+
+	p.logger.Debug(p.ctx, "Processing task", "worker_id", state.id, "task_data", task.data)
+
+	if p.config.onTaskAttempt != nil {
+		p.config.onTaskAttempt(task, state.id)
+	}
+
+	// Create a context for this task attempt, considering both per-attempt and total task timeouts.
+	// If the total task timeout has already been exceeded, createTaskContext returns nil,
+	// and we handle the task failure without starting a new attempt.
+	ctx, cancel := p.createTaskContext(state.ctx, task)
+	if ctx == nil {
+		// Total task timeout has been exceeded before starting this attempt.
+		// Handle task failure without starting a new attempt.
+		p.handleTaskFailure(task, context.DeadlineExceeded)
+		return
+	}
+	defer cancel()
+
+	// Enhance task context with metadata setter
+	ctx = p.enhanceTaskContext(ctx, task)
+
+	// Before processing the task
+	if err := p.TransitionTaskState(task, TaskStateRunning, "Task processing started"); err != nil {
+		p.logger.Warn(p.ctx, "Failed to transition task state", "error", err, "worker_id", state.id, "task_data", task.data)
+		p.handleTaskFailure(task, err)
+		return
+	}
+
+	p.workersSnapshotMu.Lock()
+	snapshot := p.workersSnapshot[state.id]
+	snapshot.State = WorkerStateProcessing
+	p.workersSnapshot[state.id] = snapshot
+	p.workersSnapshotMu.Unlock()
+
+	// Execute task with proper error handling
+	err := p.executeTask(ctx, state, task)
+
+	p.logger.Debug(p.ctx, "Task execution completed", "worker_id", state.id, "task_data", task.data, "error", err, "task_retries", task.retries)
+
+	// Handle task completion
+	p.handleTaskCompletion(state, task, err)
+}
+
+type poolCtxKey string
+
+const contextMetadataSetKey poolCtxKey = "$context_metadata_set"
+
+type TaskMetadataSetter func(metadata map[string]any)
+
+func SetTaskMetadata(ctx context.Context, metadata map[string]any) error {
+	if ctx == nil {
+		return errors.New("context is nil")
+	}
+
+	if setter, ok := ctx.Value(contextMetadataSetKey).(TaskMetadataSetter); ok {
+		setter(metadata)
+	} else {
+		return errors.New("task metadata setter not found in context")
+	}
+
+	return nil
+}
+
+func (p *Pool[T]) enhanceTaskContext(ctx context.Context, task *Task[T]) context.Context {
+	if ctx.Value(contextMetadataSetKey) != nil {
+		return ctx
+	}
+
+	funcMetadataSet := TaskMetadataSetter(func(newMetadata map[string]any) {
+		// Follow consistent lock order
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		p.workersSnapshotMu.Lock()
+		defer p.workersSnapshotMu.Unlock()
+
+		task.mu.Lock()
+		defer task.mu.Unlock()
+
+		// Safety: initialize if needed
+		if task.metadata == nil {
+			task.metadata = NewMetadata()
+		}
+
+		// Update task metadata
+		task.metadata.mu.Lock()
+		for k, v := range newMetadata {
+			task.metadata.store[k] = v
+		}
+		task.metadata.mu.Unlock()
+
+		// Update snapshot metadata
+		snapshot := p.workersSnapshot[task.currentWorkerID]
+		if snapshot.Metadata == nil {
+			snapshot.Metadata = map[string]any{}
+		}
+
+		// snapshot.Metadata.mu.Lock()
+		// for k, v := range newMetadata {
+		// 	snapshot.Metadata[k] = v
+		// }
+		snapshot.Metadata = newMetadata
+		// snapshot.Metadata.mu.Unlock()
+
+		p.workersSnapshot[task.currentWorkerID] = snapshot
+	})
+
+	ctx = context.WithValue(ctx, contextMetadataSetKey, funcMetadataSet)
+
+	return ctx
+}
+
+// createTaskContext creates a new context for a task attempt, ensuring that both per-attempt and total task timeouts are enforced.
+// It calculates the appropriate timeout for the current attempt based on the per-attempt timeout and the remaining total task timeout.
+// - If the total task timeout has been exceeded, it returns nil, indicating that no further attempts should be made.
+// - If only the per-attempt timeout is set, it uses that for the context.
+// - If both timeouts are set, it uses the smaller of the per-attempt timeout and the remaining total task timeout.
+func (p *Pool[T]) createTaskContext(parentCtx context.Context, task *Task[T]) (context.Context, context.CancelFunc) {
+	task.mu.Lock()
+	totalTimeout := task.totalTimeout
+	attemptTimeout := task.attemptTimeout
+	totalDuration := task.totalDuration
+	task.mu.Unlock()
+
+	if totalTimeout > 0 {
+		// Calculate the remaining total task timeout.
+		remainingTotalTimeout := totalTimeout - totalDuration
+		if remainingTotalTimeout <= 0 {
+			// Total task timeout has been exceeded; no further attempts should be made.
+			return nil, nil
+		}
+
+		// Determine the timeout for this attempt.
+		// Use the smaller of the per-attempt timeout and the remaining total task timeout.
+		var timeout time.Duration
+		if attemptTimeout > 0 && attemptTimeout < remainingTotalTimeout {
+			timeout = attemptTimeout
+		} else {
+			timeout = remainingTotalTimeout
+		}
+
+		// Create a context with the calculated timeout.
+		ctx, cancel := context.WithTimeout(parentCtx, timeout)
+		return ctx, cancel
+	} else if attemptTimeout > 0 {
+		// Only per-attempt timeout is set; use it for the context.
+		ctx, cancel := context.WithTimeout(parentCtx, attemptTimeout)
+		return ctx, cancel
+	}
+
+	// No timeouts are set; create a cancellable context without a deadline.
+	return context.WithCancel(parentCtx)
+}
+
+// executeTask executes the task with proper panic recovery
+func (p *Pool[T]) executeTask(ctx context.Context, state *workerState[T], task *Task[T]) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = p.handlePanic(state, r)
+			p.logger.Error(p.ctx, "Recovered from panic in worker", "worker_id", state.id, "error", err)
+		}
+	}()
+
+	p.logger.Debug(p.ctx, "Executing task", "worker_id", state.id, "task_data", task.data)
+
+	if task.runningCb != nil {
+		task.runningCb()
+	}
+
+	return state.worker.Run(ctx, task.data)
+}
+
+// handlePanic processes panic recovery
+func (p *Pool[T]) handlePanic(state *workerState[T], r interface{}) error {
+	const stackSize = 1 << 16
+	buf := make([]byte, stackSize)
+	n := runtime.Stack(buf, false)
+	stackTrace := string(buf[:n])
+
+	err := fmt.Errorf("panic in worker %d: %v\n%s", state.id, r, stackTrace)
+
+	if p.config.onWorkerPanic != nil {
+		p.config.onWorkerPanic(state.id, r, stackTrace)
+	}
+
+	p.logger.Error(p.ctx, "Panic in worker during task execution", "worker_id", state.id, "error", r, "stack_trace", stackTrace)
+
+	return err
+}
+
+// handleTaskCompletion processes task completion or failure
+func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err error) {
+	taskDuration := time.Since(task.attemptStartTime)
+
+	task.mu.Lock()
+	task.totalDuration += taskDuration
+	task.durations = append(task.durations, taskDuration)
+
+	if err != nil {
+		task.errors = append(task.errors, err)
+		task.retries++
+		task.mu.Unlock()
+
+		p.logger.Warn(p.ctx, "Task failed", "worker_id", state.id, "task_data", task.data, "error", err)
+
+		if err := p.TransitionTaskState(task, TaskStateFailed, "Task failed"); err != nil {
+			p.logger.Error(p.ctx, "Failed to transition task state", "error", err)
+		}
+
+		p.handleTaskFailure(task, err)
+		return
+	}
+
+	task.mu.Unlock()
+
+	p.metrics.TasksSucceeded.Add(1)
+	p.UpdateTotalQueueSize(-1)
+
+	p.logger.Debug(p.ctx, "Task succeeded", "worker_id", state.id, "task_data", task.data)
+
+	if err := p.TransitionTaskState(task, TaskStateCompleted, "Task succeeded"); err != nil {
+		p.logger.Error(p.ctx, "Failed to transition task state", "error", err)
+	}
+
+	state.mu.Lock()
+	state.currentTask = nil
+	state.mu.Unlock()
+
+	task.mu.Lock()
+	if task.metadata == nil {
+		task.metadata = NewMetadata()
+	}
+	if metaRaw := task.metadata.Get(RetrypoolMetadataKey); metaRaw != nil {
+		if metaBuffer, ok := metaRaw.(map[string]any); ok {
+			metaBuffer["completed"] = time.Now().UnixNano()
+			task.metadata.Set(RetrypoolMetadataKey, metaBuffer)
+		}
+	}
+	task.mu.Unlock()
+
+	p.logger.Debug(p.ctx, "Checking task success callback", "has_callback", p.config.onTaskSuccess != nil)
+
+	if p.config.onTaskSuccess != nil {
+		task.mu.Lock()
+		metadataClone := task.metadata.CloneStore() // Create a safe copy
+		task.mu.Unlock()
+		p.config.onTaskSuccess(task.data, metadataClone)
+	}
+
+	if task.notifiedProcessed != nil {
+		task.notifiedProcessed.Notify()
+	}
+	if task.processedCb != nil {
+		task.processedCb()
+	}
+
+	task.mu.Lock()
+	task.metadata = nil // Clear metadata before recycling
+	task.mu.Unlock()
+
+	p.taskPool.Put(task)
+
+	p.workersSnapshotMu.Lock()
+	snapshot := p.workersSnapshot[state.id]
+	snapshot.Metadata = nil
+	snapshot.HasTask = false
+	p.workersSnapshot[state.id] = snapshot
+	p.workersSnapshotMu.Unlock()
+}
+
+// handleTaskFailure handles a task failure
+func (p *Pool[T]) handleTaskFailure(task *Task[T], err error) {
+	// p.metrics.TasksFailed.Add(1)
+	p.metrics.TasksFailed.Add(1)
+
+	task.mu.Lock()
+	totalTimeout := task.totalTimeout
+	totalDuration := task.totalDuration
+	task.mu.Unlock()
+
+	// Check if total task timeout has been exceeded
+	if totalTimeout > 0 && totalDuration >= totalTimeout {
+		p.UpdateTotalQueueSize(-1)
+		task.deadReason = "failed; total task time limit exceeded"
+		p.addDeadTask(task)
+		return
+	}
+
+	action := TaskActionRetry
+	if p.config.onTaskFailure != nil {
+		task.mu.Lock()
+		metadataClone := task.metadata.CloneStore() // Create a safe copy
+		task.mu.Unlock()
+		action = p.config.onTaskFailure(task.data, metadataClone, err)
+	}
+
+	p.logger.Debug(p.ctx, "Handling task failure", "task_data", task.data, "action", action, "bounce_retry", task.bounceRetry)
+
+	switch action {
+	case TaskActionRetry:
+		if p.config.attempts > 0 && task.retries >= p.config.attempts {
+			p.UpdateTotalQueueSize(-1)
+			task.deadReason = "failed; max retries exceeded"
+			p.addDeadTask(task)
+			return
+		}
+		if p.config.retryIf != nil && !p.config.retryIf(err) {
+			p.UpdateTotalQueueSize(-1)
+			task.deadReason = "failed; retryIf condition failed"
+			p.addDeadTask(task)
+			return
+		}
+
+		// Handle bounce retry worker tracking
+		if task.bounceRetry {
+			if len(task.attemptedWorkers) >= len(p.workers) {
+				// Reset if we've tried all workers
+				task.attemptedWorkers = make(map[int]struct{})
+			}
+		}
+
+		// Handle immediate retry
+		if task.immediateRetry {
+			p.submitTask(task)
+			return
+		}
+
+		// Calculate retry delay
+		delay := p.config.delay
+		if p.config.delayFunc != nil {
+			delay = p.config.delayFunc(task.retries, err, &p.config)
+		} else if p.config.retryPolicy != nil {
+			delay = p.config.retryPolicy.ComputeDelay(task.retries, err, &p.config)
+		}
+
+		// Simple blocking delay - this will still respect context cancellation
+		select {
+		case <-p.ctx.Done():
+			p.UpdateTotalQueueSize(-1)
+			task.deadReason = "failed; context cancelled during retry delay"
+			p.addDeadTask(task)
+			return
+		case <-time.After(delay):
+			if err := p.submitTask(task); err != nil {
+				p.UpdateTotalQueueSize(-1)
+				task.deadReason = "failed; retry submission failed"
+				p.addDeadTask(task)
+			}
+		}
+
+	case TaskActionForceRetry:
+		if task.bounceRetry {
+			if len(task.attemptedWorkers) >= len(p.workers) {
+				task.attemptedWorkers = make(map[int]struct{})
+			}
+		}
+		task.deadReason = "failed; force retry"
+		p.submitTask(task)
+
+	case TaskActionAddToDeadTasks:
+		p.UpdateTotalQueueSize(-1)
+		task.deadReason = "failed; add to dead tasks"
+		p.addDeadTask(task)
+
+	case TaskActionRemove:
+		p.UpdateTotalQueueSize(-1)
+		task.mu.Lock()
+		task.metadata = nil
+		task.mu.Unlock()
+		p.taskPool.Put(task)
+	}
+}
+
+// addDeadTask adds a task to dead tasks
+func (p *Pool[T]) addDeadTask(task *Task[T]) {
+
+	// First transition to dead state
+	if err := p.TransitionTaskState(task, TaskStateDead, "Task added to dead tasks"); err != nil {
+		p.logger.Error(p.ctx, "Failed to transition task state", "error", err)
+	}
+
+	// THEN copy it
+	p.deadMu.Lock()
+
+	deadTaskIndex := len(p.deadTasks)
+	if p.config.deadTasksLimit > 0 && deadTaskIndex >= p.config.deadTasksLimit {
+		p.deadTasks = p.deadTasks[1:]
+		deadTaskIndex--
+	}
+
+	deadTask := &DeadTask[T]{
+		Data:          task.data,
+		Retries:       task.retries,
+		TotalDuration: task.totalDuration,
+		Errors:        task.errors,
+		Reason:        task.deadReason,
+		StateHistory:  task.stateHistory,
+	}
+
+	p.deadTasks = append(p.deadTasks, deadTask)
+	p.metrics.DeadTasks.Add(1)
+
+	p.deadMu.Unlock()
+
+	// Send notification after releasing the lock
+	if p.config.onDeadTask != nil {
+		select {
+		case p.deadTaskNotifications <- deadTaskIndex:
+		default:
+			p.logger.Warn(p.ctx, "Dead task notification channel full, notification dropped", "dead_task_index", deadTaskIndex)
+		}
+	}
+
+	task.mu.Lock()
+	task.metadata = nil
+	task.mu.Unlock()
+
+	p.taskPool.Put(task)
+}
+
+// WaitWithCallback waits for the pool to complete while calling a callback function
+func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize, processingCount, deadTaskCount int) bool, interval time.Duration) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			p.logger.Warn(p.ctx, "WaitWithCallback context done", "error", ctx.Err())
+			return ctx.Err()
+		case <-ticker.C:
+			queueSize := int(p.QueueSize())
+			processingCount := int(p.totalProcessing.Load())
+			deadTaskCount := int(p.metrics.DeadTasks.Load())
+			p.logger.Debug(p.ctx, "WaitWithCallback tick", "queue_size", queueSize, "processing_count", processingCount, "dead_task_count", deadTaskCount)
+			if !callback(queueSize, processingCount, deadTaskCount) {
+				p.logger.Info(p.ctx, "WaitWithCallback stopping as callback returned false")
+				return nil
+			}
+		}
+	}
+}
+
+// Close gracefully shuts down the pool
+func (p *Pool[T]) Close() error {
+	p.mu.Lock()
+	p.stopped = true
+	p.mu.Unlock()
+
+	p.logger.Info(p.ctx, "Closing pool")
+
+	p.cond.Broadcast()
+
+	p.mu.Lock()
+	for _, state := range p.workers {
+		state.mu.Lock()
+		if !state.removed.Load() {
+			state.removed.Store(true)
+			state.paused.Store(true)
+			state.cancel()
+			state.mu.Unlock()
+			state.callMethod("OnStop", state.ctx)
+			state.callMethod("OnRemove", state.ctx)
+			p.logger.Info(p.ctx, "Worker closed", "worker_id", state.id)
+		} else {
+			state.mu.Unlock()
+		}
+	}
+	p.mu.Unlock()
+
+	p.cancel()
+	return nil
+}
+
+// QueueSize returns the total number of tasks in the queue
+func (p *Pool[T]) QueueSize() int64 {
+	total := p.totalQueueSize.Load()
+	p.logger.Debug(p.ctx, "Fetching total queue size", "queue_size", total)
+	return total
+}
+
+// ProcessingCount returns the number of tasks currently being processed
+func (p *Pool[T]) ProcessingCount() int64 {
+	processingCount := p.totalProcessing.Load()
+	p.logger.Debug(p.ctx, "Fetching processing count", "processing_count", processingCount)
+	return processingCount
+}
+
+// DeadTaskCount returns the number of dead tasks
+func (p *Pool[T]) DeadTaskCount() int64 {
+	deadTaskCount := p.metrics.DeadTasks.Load()
+	p.logger.Debug(p.ctx, "Fetching dead task count", "dead_task_count", deadTaskCount)
+	return deadTaskCount
+}
+
+// RangeDeadTasks iterates over all dead tasks
+func (p *Pool[T]) RangeDeadTasks(fn func(*DeadTask[T]) bool) {
+	p.deadMu.Lock()
+	defer p.deadMu.Unlock()
+	for _, dt := range p.deadTasks {
+		p.logger.Debug(p.ctx, "Iterating dead tasks", "dead_task_data", dt.Data)
+		if !fn(dt) {
+			break
+		}
+	}
+}
+
+// PullDeadTask removes and returns a dead task from the pool
+func (p *Pool[T]) PullDeadTask(idx int) (*DeadTask[T], error) {
+	p.deadMu.Lock()
+	defer p.deadMu.Unlock()
+	if idx < 0 || idx >= len(p.deadTasks) {
+		p.logger.Error(p.ctx, "Invalid index for PullDeadTask", "index", idx)
+		return nil, errors.New("invalid index")
+	}
+	dt := p.deadTasks[idx]
+	p.deadTasks = append(p.deadTasks[:idx], p.deadTasks[idx+1:]...)
+	p.metrics.DeadTasks.Add(-1)
+	p.logger.Debug(p.ctx, "Pulled dead task", "dead_task_data", dt.Data)
+	return dt, nil
+}
+
+// PullRangeDeadTasks removes and returns a range of dead tasks from the pool
+func (p *Pool[T]) PullRangeDeadTasks(from int, to int) ([]*DeadTask[T], error) {
+	p.deadMu.Lock()
+	defer p.deadMu.Unlock()
+	if from < 0 || to > len(p.deadTasks) || from > to {
+		p.logger.Error(p.ctx, "Invalid range for PullRangeDeadTasks", "from", from, "to", to)
+		return nil, errors.New("invalid range")
+	}
+	dts := make([]*DeadTask[T], to-from)
+	copy(dts, p.deadTasks[from:to])
+	p.deadTasks = append(p.deadTasks[:from], p.deadTasks[to:]...)
+	p.metrics.DeadTasks.Add(int64(from - to))
+	p.logger.Debug(p.ctx, "Pulled range of dead tasks", "count", len(dts))
+	return dts, nil
+}
+
+// ProcessedNotification is used to notify when a task is processed
+type ProcessedNotification struct {
+	ch     chan struct{}
+	once   sync.Once
+	closed bool
+}
+
+// NewProcessedNotification creates a new ProcessedNotification
+func NewProcessedNotification() *ProcessedNotification {
+	return &ProcessedNotification{ch: make(chan struct{})}
+}
+
+// Notify notifies that the task has been processed
+func (n *ProcessedNotification) Notify() {
+	n.once.Do(func() {
+		close(n.ch)
+		n.closed = true
+	})
+}
+
+// Wait waits for the notification
+func (n *ProcessedNotification) Wait() {
+	<-n.ch
+}
+
+// Done returns the channel that's closed when the task is processed
+func (n *ProcessedNotification) Done() <-chan struct{} {
+	return n.ch
+}
+
+// QueuedNotification is used to notify when a task is queued
+type QueuedNotification struct {
+	ch     chan struct{}
+	once   sync.Once
+	closed bool
+}
+
+// NewQueuedNotification creates a new QueuedNotification
+func NewQueuedNotification() *QueuedNotification {
+	return &QueuedNotification{ch: make(chan struct{})}
+}
+
+// Notify notifies that the task has been queued
+func (n *QueuedNotification) Notify() {
+	n.once.Do(func() {
+		close(n.ch)
+		n.closed = true
+	})
+}
+
+// Wait waits for the notification
+func (n *QueuedNotification) Wait() {
+	<-n.ch
+}
+
+// Done returns the channel that's closed when the task is queued
+func (n *QueuedNotification) Done() <-chan struct{} {
+	return n.ch
+}
+
+// RequestResponse manages the lifecycle of a task request and its response
+type RequestResponse[T any, R any] struct {
+	request     T                // The request data
+	done        chan struct{}    // Channel to signal completion
+	response    R                // Stores the successful response
+	err         error            // Stores any error that occurred
+	mu          deadlock.RWMutex // Protects response and err
+	isCompleted bool             // Indicates if request is completed
+}
+
+// NewRequestResponse creates a new RequestResponse instance
+func NewRequestResponse[T any, R any](request T) *RequestResponse[T, R] {
+	return &RequestResponse[T, R]{
+		request: request,
+		done:    make(chan struct{}),
+	}
+}
+
+// Safely consults the request data
+func (rr *RequestResponse[T, R]) ConsultRequest(fn func(T) error) error {
+	rr.mu.Lock()
+	err := fn(rr.request)
+	rr.mu.Unlock()
+	return err
+}
+
+// Complete safely marks the request as complete with a response
+func (rr *RequestResponse[T, R]) Complete(response R) {
+	var completed bool
+	rr.mu.RLock()
+	completed = rr.isCompleted
+	rr.mu.RUnlock()
+
+	if !completed {
+		rr.mu.Lock()
+		rr.response = response
+		rr.isCompleted = true
+		close(rr.done)
+		rr.mu.Unlock()
+	}
+}
+
+// CompleteWithError safely marks the request as complete with an error
+func (rr *RequestResponse[T, R]) CompleteWithError(err error) {
+	var completed bool
+	rr.mu.RLock()
+	completed = rr.isCompleted
+	rr.mu.RUnlock()
+
+	if !completed {
+		rr.mu.Lock()
+		rr.err = err
+		rr.isCompleted = true
+		close(rr.done)
+		rr.mu.Unlock()
+	}
+}
+
+// Done returns a channel that's closed when the request is complete
+func (rr *RequestResponse[T, R]) Done() <-chan struct{} {
+	rr.mu.RLock()
+	defer rr.mu.RUnlock()
+	return rr.done
+}
+
+// Err returns any error that occurred during the request
+func (rr *RequestResponse[T, R]) Err() error {
+	var err error
+	rr.mu.RLock()
+	err = rr.err
+	rr.mu.RUnlock()
+	return err
+}
+
+// Wait waits for the request to complete and returns the response and any error
+func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
+
+	select {
+	case <-rr.done:
+		var err error
+		var response R
+		rr.mu.RLock()
+		response = rr.response
+		err = rr.err
+		rr.mu.RUnlock()
+		return response, err
+	case <-ctx.Done():
+		var completed bool
+		rr.mu.RLock()
+		completed = rr.isCompleted
+		rr.mu.RUnlock()
+		if !completed {
+			var zero R
+			rr.mu.Lock()
+			rr.err = ctx.Err()
+			rr.isCompleted = true
+			close(rr.done)
+			rr.mu.Unlock()
+			return zero, ctx.Err()
+		} else {
+			var err error
+			var response R
+			rr.mu.RLock()
+			response = rr.response
+			err = rr.err
+			rr.mu.RUnlock()
+			return response, err
+		}
+	}
+}
+
+// handleDeadTaskNotifications handles dead task notifications
+func (p *Pool[T]) handleDeadTaskNotifications(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case idx := <-p.deadTaskNotifications:
+			if p.config.onDeadTask != nil {
+				p.config.onDeadTask(idx)
+			}
+		}
+	}
+}
+
+func (ws *workerState[T]) callMethod(methodName string, ctx context.Context) {
+	// ws.logger.Debug(ctx, "Attempting to call method", "method_name", methodName)
+
+	method, exists := ws.methodsCache[methodName]
+	if !exists {
+		// ws.logger.Debug(ctx, "Method not found in cache", "method_name", methodName)
+		return
+	}
+
+	methodType := method.Type()
+	if methodType.NumIn() == 0 {
+		// ws.logger.Debug(ctx, "Calling method without context", "method_name", methodName)
+		method.Call(nil)
+	} else if methodType.NumIn() == 1 && methodType.In(0) == reflect.TypeOf((*context.Context)(nil)).Elem() {
+		// ws.logger.Debug(ctx, "Calling method with context", "method_name", methodName)
+		method.Call([]reflect.Value{reflect.ValueOf(ctx)})
+	}
 }
 
 // NewTaskQueue creates a new task queue of the specified type
@@ -1850,1263 +3706,4 @@ func (q *GrowingCircularQueue[T]) Drain() []*Task[T] {
 	q.tail = 0
 	// q.logger.Debug(context.Background(), "GrowingCircularQueue drained", "tasks_drained", len(tasks))
 	return tasks
-}
-
-// workerState holds the state of a worker
-type workerState[T any] struct {
-	worker       Worker[T]
-	id           int
-	ctx          context.Context
-	cancel       context.CancelFunc
-	paused       atomic.Bool
-	currentTask  *Task[T]
-	taskQueue    TaskQueue[T]
-	removed      atomic.Bool
-	mu           deadlock.Mutex
-	cond         *sync.Cond
-	async        bool
-	methodsCache map[string]*reflect.Value
-	done         chan struct{}
-	logger       Logger
-}
-
-// Add adds a new worker to the pool
-func (p *Pool[T]) Add(worker Worker[T], queue TaskQueue[T]) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if worker == nil {
-		p.logger.Error(p.ctx, "Cannot add nil worker")
-		return errors.New("worker cannot be nil")
-	}
-
-	workerID := p.nextWorkerID
-	p.nextWorkerID++
-
-	if queue == nil {
-		queue = p.NewTaskQueue(p.taskQueueType)
-	}
-
-	workerCtx, cancel := context.WithCancel(p.ctx)
-
-	state := &workerState[T]{
-		worker:       worker,
-		id:           workerID,
-		ctx:          workerCtx,
-		cancel:       cancel,
-		taskQueue:    queue,
-		async:        p.config.async,
-		done:         make(chan struct{}),
-		methodsCache: getWorkerMethods(worker),
-		// logger:       p.logger.WithFields(map[string]any{"worker_id": workerID}),
-	}
-
-	state.cond = sync.NewCond(&state.mu)
-	p.workers[workerID] = state
-	p.taskQueues.set(workerID, queue)
-	p.workerQueues[workerID] = &atomic.Int64{}
-
-	p.logger.Info(p.ctx, "Added new worker", "worker_id", workerID)
-
-	// Set worker ID if the struct has an ID field
-	setWorkerID(worker, workerID)
-
-	// Trigger OnStart if exists
-	state.callMethod("OnStart", state.ctx)
-
-	// Before returning, update availableWorkers
-	if !state.paused.Load() && !state.removed.Load() {
-		p.availableWorkers.Add(1)
-	}
-
-	// Redistribute tasks to include the new worker
-	p.redistributeAllTasks()
-
-	p.updateRateLimiterBurst()
-
-	if p.config.async {
-		go p.runWorker(state)
-	}
-
-	return nil
-}
-
-func setWorkerID[T any](worker Worker[T], id int) {
-	val := reflect.ValueOf(worker)
-	if val.Kind() == reflect.Ptr {
-		val = val.Elem()
-	}
-	if val.Kind() == reflect.Struct {
-		field := val.FieldByName("ID")
-		if field.IsValid() && field.CanSet() && field.Kind() == reflect.Int {
-			field.SetInt(int64(id))
-		}
-	}
-}
-
-func getWorkerMethods[T any](worker Worker[T]) map[string]*reflect.Value {
-	methods := make(map[string]*reflect.Value)
-	rv := reflect.ValueOf(worker)
-	methodNames := []string{"OnStart", "OnStop", "OnRemove", "OnPause", "OnResume"}
-	for _, name := range methodNames {
-		method := rv.MethodByName(name)
-		if method.IsValid() {
-			methods[name] = &method
-		}
-	}
-	return methods
-}
-
-// Remove removes a worker from the pool
-func (p *Pool[T]) Remove(id int) error {
-	p.mu.Lock()
-	state, exists := p.workers[id]
-	if !exists {
-		p.mu.Unlock()
-		p.logger.Error(p.ctx, "Attempted to remove invalid worker", "worker_id", id)
-		return ErrInvalidWorkerID
-	}
-
-	// Check if worker is available
-	wasAvailable := !state.paused.Load() && !state.removed.Load()
-
-	p.logger.Info(p.ctx, "Removing worker", "worker_id", id)
-
-	// Stop the flow of tasks
-	state.mu.Lock()
-	if state.removed.Load() {
-		state.mu.Unlock()
-		p.mu.Unlock()
-		p.logger.Warn(p.ctx, "Worker already removed", "worker_id", id)
-		return nil
-	}
-	state.removed.Store(true)
-	state.paused.Store(true)
-	state.mu.Unlock()
-
-	// Signal the worker's condition variable to wake it up if it's waiting
-	state.cond.Broadcast()
-
-	// Signal the pool's condition variable to wake up any workers waiting on tasks
-	p.cond.Broadcast()
-
-	// Remove the worker's queue and redistribute tasks
-	q, ok := p.taskQueues.get(id)
-	if !ok {
-		p.mu.Unlock()
-		p.logger.Error(p.ctx, "Task queue not found for worker", "worker_id", id)
-		return errors.New("task queue not found for worker")
-	}
-	p.taskQueues.delete(id)
-	delete(p.workerQueues, id)
-
-	p.mu.Unlock()
-
-	// Drain the task queue and redistribute tasks
-	tasks := q.Drain()
-	if len(tasks) > 0 {
-		p.logger.Debug(p.ctx, "Redistributing tasks from removed worker", "worker_id", id, "tasks_count", len(tasks))
-		p.redistributeTasks(tasks)
-	}
-
-	// Cancel the worker's context to signal task cancellation
-	state.cancel()
-
-	// Wait for the worker to finish, with timeout
-	timeout := time.Second * 10 // Configurable timeout duration
-	workerFinished := make(chan struct{})
-
-	go func() {
-		if state.async {
-			// In async mode, wait for the worker goroutine to finish
-			<-state.done
-		} else {
-			// TODO: i'm not sure sure about that but we will see
-			// In synchronous mode, we need to wait for the worker to complete the current task
-			state.mu.Lock()
-			for state.currentTask != nil {
-				state.logger.Debug(state.ctx, "Waiting for worker to finish current task", "worker_id", id)
-				state.cond.Wait()
-			}
-			state.mu.Unlock()
-		}
-		close(workerFinished)
-	}()
-
-	select {
-	case <-workerFinished:
-		// Worker finished gracefully
-		p.logger.Debug(p.ctx, "Worker exited gracefully", "worker_id", id)
-	case <-time.After(timeout):
-		// Worker didn't finish within timeout
-		p.logger.Warn(p.ctx, "Worker did not finish within timeout", "worker_id", id)
-		// Handle the current task
-		state.mu.Lock()
-		if state.currentTask != nil {
-			task := state.currentTask
-			task.mu.Lock()
-			task.deadReason = "worker removed due to timeout"
-			task.mu.Unlock()
-			p.addDeadTask(task)
-			state.currentTask = nil
-			state.cond.Broadcast()
-		}
-		state.mu.Unlock()
-	}
-
-	// After removing, update availableWorkers
-	if wasAvailable {
-		p.availableWorkers.Add(-1)
-	}
-
-	p.logger.Debug(p.ctx, "Calling methods", "worker_id", id)
-	// Trigger OnStop and OnRemove
-	state.callMethod("OnStop", state.ctx)
-	state.callMethod("OnRemove", state.ctx)
-
-	p.logger.Debug(p.ctx, "Removing worker from pool", "worker_id", id)
-	p.mu.Lock()
-	delete(p.workers, id)
-	p.updateRateLimiterBurst()
-	p.mu.Unlock()
-
-	p.logger.Info(p.ctx, "Worker removed successfully", "worker_id", id)
-
-	return nil
-}
-
-// Pause pauses a worker
-func (p *Pool[T]) Pause(id int) error {
-	p.mu.Lock()
-	state, exists := p.workers[id]
-	if !exists {
-		p.mu.Unlock()
-		p.logger.Error(p.ctx, "Attempted to pause invalid worker", "worker_id", id)
-		return ErrInvalidWorkerID
-	}
-
-	// Check if worker is available
-	wasAvailable := !state.paused.Load() && !state.removed.Load()
-
-	p.logger.Info(p.ctx, "Pausing worker", "worker_id", id)
-
-	// Stop the flow of tasks
-	state.mu.Lock()
-	if state.paused.Load() {
-		state.mu.Unlock()
-		p.mu.Unlock()
-		p.logger.Warn(p.ctx, "Worker already paused", "worker_id", id)
-		return nil
-	}
-	state.paused.Store(true)
-	state.mu.Unlock()
-
-	// Remove the worker's queue and redistribute tasks
-	q, _ := p.taskQueues.get(id)
-	p.taskQueues.delete(id)
-	delete(p.workerQueues, id)
-	p.mu.Unlock()
-
-	// Drain the task queue and redistribute tasks
-	tasks := q.Drain()
-	if len(tasks) > 0 {
-		p.logger.Debug(p.ctx, "Redistributing tasks from paused worker", "worker_id", id, "tasks_count", len(tasks))
-		p.redistributeTasks(tasks)
-	}
-
-	// Trigger OnPause
-	state.callMethod("OnPause", state.ctx)
-
-	// After pausing, update availableWorkers
-	if wasAvailable {
-		p.availableWorkers.Add(-1)
-	}
-
-	p.updateRateLimiterBurst()
-
-	return nil
-}
-
-// Redistribute all tasks among workers
-func (p *Pool[T]) redistributeAllTasks() {
-	p.logger.Debug(p.ctx, "Redistributing all tasks among workers")
-
-	// Collect all tasks from all queues
-	allTasks := []*Task[T]{}
-	p.taskQueues.range_(func(id int, q TaskQueue[T]) bool {
-		tasks := q.Drain()
-		allTasks = append(allTasks, tasks...)
-		return true
-	})
-
-	// Get available (non-paused) workers
-	availableWorkers := []int{}
-	for id, state := range p.workers {
-		if !state.paused.Load() && !state.removed.Load() {
-			availableWorkers = append(availableWorkers, id)
-		}
-	}
-
-	workerCount := len(availableWorkers)
-	if workerCount == 0 {
-		for _, task := range allTasks {
-			task.deadReason = "no workers available"
-			p.addDeadTask(task)
-			p.UpdateTotalQueueSize(-1)
-		}
-		p.logger.Warn(p.ctx, "No workers available during redistribution, tasks added to dead tasks", "dead_tasks_count", len(allTasks))
-		return
-	}
-
-	// Redistribute tasks among available workers
-	for i, task := range allTasks {
-		selectedWorkerID := availableWorkers[i%workerCount]
-		q := p.taskQueues.getOrCreate(selectedWorkerID, func() TaskQueue[T] {
-			return p.NewTaskQueue(p.taskQueueType)
-		})
-		q.Enqueue(task)
-		p.UpdateWorkerQueueSize(selectedWorkerID, 1)
-		p.logger.Debug(p.ctx, "Task redistributed", "worker_id", selectedWorkerID)
-	}
-
-	p.logger.Debug(p.ctx, "Tasks redistributed among workers", "tasks_count", len(allTasks))
-}
-
-// Resume resumes a worker
-func (p *Pool[T]) Resume(id int) error {
-	p.mu.Lock()
-	state, exists := p.workers[id]
-	if !exists {
-		p.mu.Unlock()
-		p.logger.Error(p.ctx, "Attempted to resume invalid worker", "worker_id", id)
-		return ErrInvalidWorkerID
-	}
-
-	p.logger.Info(p.ctx, "Resuming worker", "worker_id", id)
-
-	state.mu.Lock()
-	if !state.paused.Load() {
-		state.mu.Unlock()
-		p.mu.Unlock()
-		p.logger.Warn(p.ctx, "Worker not paused, cannot resume", "worker_id", id)
-		return nil
-	}
-
-	// Create a new task queue for the worker if it doesn't exist
-	if _, ok := p.taskQueues.get(id); !ok {
-		p.taskQueues.set(id, p.NewTaskQueue(p.taskQueueType))
-		p.workerQueues[id] = &atomic.Int64{}
-	}
-
-	// Mark the worker as not paused before redistribution
-	state.paused.Store(false)
-
-	// Redistribute tasks while holding both locks
-	p.redistributeAllTasks()
-
-	// Signal the worker to continue
-	state.cond.Signal()
-	p.cond.Broadcast()
-
-	state.mu.Unlock()
-	p.mu.Unlock()
-
-	p.updateRateLimiterBurst()
-
-	state.callMethod("OnResume", state.ctx)
-
-	// After resuming, update availableWorkers
-	p.availableWorkers.Add(1)
-
-	p.logger.Info(p.ctx, "Worker resumed", "worker_id", id)
-	return nil
-}
-
-// Workers returns the list of worker IDs
-func (p *Pool[T]) Workers() ([]int, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	ids := make([]int, 0, len(p.workers))
-	for id := range p.workers {
-		ids = append(ids, id)
-	}
-	p.logger.Debug(p.ctx, "Fetched all worker IDs", "worker_ids", ids)
-	return ids, nil
-}
-
-func (p *Pool[T]) getAvailableWorkerIDs() []int {
-	ids := make([]int, 0)
-	for id, state := range p.workers {
-		if !state.paused.Load() && !state.removed.Load() {
-			ids = append(ids, id)
-		}
-	}
-	return ids
-}
-
-// redistributeTasks redistributes tasks to other workers
-func (p *Pool[T]) redistributeTasks(tasks []*Task[T]) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Get available (non-paused, non-removed) workers
-	availableWorkers := p.getAvailableWorkerIDs()
-	workerCount := len(availableWorkers)
-	if workerCount == 0 {
-		for _, task := range tasks {
-			task.deadReason = "no workers available"
-			p.addDeadTask(task)
-			p.UpdateTotalQueueSize(-1)
-		}
-		p.logger.Warn(p.ctx, "No workers available, tasks added to dead tasks", "dead_tasks_count", len(tasks))
-		return
-	}
-
-	for i, task := range tasks {
-		selectedWorkerID := availableWorkers[i%workerCount]
-		q := p.taskQueues.getOrCreate(selectedWorkerID, func() TaskQueue[T] {
-			return p.NewTaskQueue(p.taskQueueType)
-		})
-		q.Enqueue(task)
-		p.UpdateWorkerQueueSize(selectedWorkerID, 1)
-		p.logger.Debug(p.ctx, "Task redistributed", "worker_id", selectedWorkerID)
-	}
-
-	p.logger.Debug(p.ctx, "Tasks redistributed among workers", "tasks_count", len(tasks))
-
-	// Notify all workers that tasks are available
-	p.cond.Broadcast()
-}
-
-// runWorker runs the worker's loop
-func (p *Pool[T]) runWorker(state *workerState[T]) {
-	defer func() {
-		if r := recover(); r != nil {
-			buf := make([]byte, 1<<16)
-			n := runtime.Stack(buf, false)
-			stackTrace := string(buf[:n])
-			if p.config.onWorkerPanic != nil {
-				p.config.onWorkerPanic(state.id, r, stackTrace)
-			}
-			p.logger.Error(p.ctx, "Panic in worker", "worker_id", state.id, "error", r, "stack_trace", stackTrace)
-		}
-		close(state.done)
-		p.logger.Debug(p.ctx, "Worker goroutine exited", "worker_id", state.id)
-	}()
-
-	for {
-		// First check if we're removed without holding any locks
-		if state.removed.Load() {
-			p.logger.Debug(p.ctx, "Worker detected removal, exiting", "worker_id", state.id)
-			break
-		}
-
-		// Then check if we're paused
-		if state.paused.Load() {
-			state.mu.Lock()
-			for state.paused.Load() && !state.removed.Load() {
-				p.logger.Debug(p.ctx, "Worker is paused, waiting", "worker_id", state.id)
-				state.cond.Wait()
-			}
-			state.mu.Unlock()
-			continue
-		}
-
-		// Try to get a task with proper lock ordering
-		var task *Task[T]
-		var ok bool
-
-		// First get pool lock to check queue
-		p.mu.Lock()
-		q, hasQueue := p.taskQueues.get(state.id)
-		if !hasQueue {
-			p.mu.Unlock()
-			p.logger.Error(p.ctx, "No task queue found for worker", "worker_id", state.id)
-			continue
-		}
-
-		qLen := q.Length()
-		p.logger.Debug(p.ctx, "Checking queue", "worker_id", state.id, "queue_length", qLen)
-
-		if qLen > 0 {
-			task, ok = q.Dequeue()
-			if ok {
-				p.UpdateWorkerQueueSize(state.id, -1)
-				p.logger.Debug(p.ctx, "Dequeued task", "worker_id", state.id, "task_data", task.data, "remaining_queue", q.Length())
-			}
-		}
-
-		if !ok {
-			if state.removed.Load() {
-				p.mu.Unlock()
-				break
-			}
-			p.logger.Debug(p.ctx, "No task available, waiting", "worker_id", state.id, "queue_size", p.QueueSize(), "total_processing", p.totalProcessing.Load())
-			p.cond.Wait()
-			p.mu.Unlock()
-			continue
-		}
-		p.mu.Unlock()
-
-		// Now process the task
-		if task != nil {
-			state.mu.Lock()
-			state.currentTask = task
-			state.mu.Unlock()
-
-			p.logger.Debug(p.ctx, "Processing task", "worker_id", state.id, "task_data", task.data)
-
-			p.processTask(state, task)
-
-			state.mu.Lock()
-			state.currentTask = nil
-			state.mu.Unlock()
-
-			p.logger.Debug(p.ctx, "Completed task processing", "worker_id", state.id, "queue_size", p.QueueSize(), "total_processing", p.totalProcessing.Load())
-		}
-	}
-
-	// Trigger OnStop and OnRemove if not already called
-	state.callMethod("OnStop", state.ctx)
-	state.callMethod("OnRemove", state.ctx)
-}
-
-// run processes tasks in synchronous mode
-func (p *Pool[T]) run() {
-	p.logger.Debug(p.ctx, "Running pool in synchronous mode")
-	duration := time.Millisecond * 10
-	if p.config.loopTicker > 0 {
-		duration = p.config.loopTicker
-	}
-	ticker := time.NewTicker(duration) // Configurable interval
-	defer ticker.Stop()
-
-	iterations := 0
-	for {
-		iterations++
-
-		select {
-		case <-p.ctx.Done():
-			p.logger.Info(p.ctx, "Pool context done, exiting run loop")
-			return
-		case <-ticker.C:
-			p.mu.Lock()
-			if p.stopped {
-				p.mu.Unlock()
-				p.logger.Info(p.ctx, "Pool stopped, exiting run loop")
-				return
-			}
-
-			// Get available workers
-			workerIDs := p.getWorkerIDs()
-
-			if len(workerIDs) == 0 {
-				p.mu.Unlock()
-				p.logger.Warn(p.ctx, "No workers available")
-				continue
-			}
-
-			hasWork := false
-			totalTasks := int64(0)
-			for _, workerID := range workerIDs {
-				state := p.workers[workerID]
-				if state == nil {
-					continue
-				}
-
-				state.mu.Lock()
-				if state.paused.Load() || state.removed.Load() {
-					state.mu.Unlock()
-					continue
-				}
-				state.mu.Unlock()
-
-				// Check if there are tasks available
-				if q, ok := p.taskQueues.get(workerID); ok {
-					qLen := q.Length()
-					totalTasks += int64(qLen)
-					if qLen > 0 {
-						hasWork = true
-					}
-				}
-			}
-
-			if !hasWork {
-				p.logger.Debug(p.ctx, "No tasks available, waiting")
-				p.cond.Wait()
-				p.mu.Unlock()
-				continue
-			}
-
-			p.mu.Unlock()
-
-			if !hasWork {
-				continue
-			}
-
-			// Process one task per worker
-			for _, workerID := range workerIDs {
-				state := p.workers[workerID]
-				if state == nil {
-					continue
-				}
-
-				state.mu.Lock()
-				if state.paused.Load() || state.removed.Load() {
-					state.mu.Unlock()
-					continue
-				}
-				state.mu.Unlock()
-
-				task, ok := p.getTaskForWorker(state.id)
-				if !ok {
-					continue
-				}
-
-				state.mu.Lock()
-				state.currentTask = task
-				state.mu.Unlock()
-
-				p.processTask(state, task)
-
-				state.mu.Lock()
-				state.currentTask = nil
-				state.mu.Unlock()
-			}
-		}
-	}
-}
-
-// getTaskForWorker gets the next task for the worker
-func (p *Pool[T]) getTaskForWorker(workerID int) (*Task[T], bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.logger.Debug(p.ctx, "Getting task for worker", "worker_id", workerID, "total_queue_size", p.QueueSize())
-
-	q, ok := p.taskQueues.get(workerID)
-	if !ok {
-		return nil, false
-	}
-
-	qLen := q.Length()
-	p.logger.Debug(p.ctx, "Found queue", "worker_id", workerID, "queue_length", qLen)
-
-	if qLen == 0 {
-		return nil, false
-	}
-
-	task, ok := q.Dequeue()
-	if ok {
-		p.UpdateWorkerQueueSize(workerID, -1)
-		p.logger.Debug(p.ctx, "Got task for worker", "worker_id", workerID, "task_data", task.data, "remaining_queue", q.Length())
-	}
-
-	return task, ok
-}
-
-// processTask processes a task with proper state management
-func (p *Pool[T]) processTask(state *workerState[T], task *Task[T]) {
-	p.logger.Debug(p.ctx, "Starting task processing", "worker_id", state.id, "task_data", task.data, "task_retries", task.retries, "immediate_retry", task.immediateRetry)
-
-	// Update task state with proper locking
-	task.mu.Lock()
-	task.lastWorkerID = state.id
-	if task.bounceRetry {
-		task.attemptedWorkers[state.id] = struct{}{}
-	}
-	task.attemptStartTime = time.Now()
-	task.processedAt = append(task.processedAt, time.Now())
-	task.mu.Unlock()
-
-	// Update metrics atomically
-	p.metrics.TasksProcessed.Add(1)
-	p.totalProcessing.Add(1)
-	defer p.totalProcessing.Add(-1)
-
-	p.logger.Debug(p.ctx, "Processing task", "worker_id", state.id, "task_data", task.data)
-
-	if p.config.onTaskAttempt != nil {
-		p.config.onTaskAttempt(task, state.id)
-	}
-
-	// Create a context for this task attempt, considering both per-attempt and total task timeouts.
-	// If the total task timeout has already been exceeded, createTaskContext returns nil,
-	// and we handle the task failure without starting a new attempt.
-	ctx, cancel := p.createTaskContext(state.ctx, task)
-	if ctx == nil {
-		// Total task timeout has been exceeded before starting this attempt.
-		// Handle task failure without starting a new attempt.
-		p.handleTaskFailure(task, context.DeadlineExceeded)
-		return
-	}
-	defer cancel()
-
-	// Before processing the task
-	if err := p.TransitionTaskState(task, TaskStateRunning, "Task processing started"); err != nil {
-		p.logger.Warn(p.ctx, "Failed to transition task state", "error", err, "worker_id", state.id, "task_data", task.data)
-		p.handleTaskFailure(task, err)
-		return
-	}
-
-	// Execute task with proper error handling
-	err := p.executeTask(ctx, state, task)
-
-	p.logger.Debug(p.ctx, "Task execution completed", "worker_id", state.id, "task_data", task.data, "error", err, "task_retries", task.retries)
-
-	// Handle task completion
-	p.handleTaskCompletion(state, task, err)
-}
-
-// createTaskContext creates a new context for a task attempt, ensuring that both per-attempt and total task timeouts are enforced.
-// It calculates the appropriate timeout for the current attempt based on the per-attempt timeout and the remaining total task timeout.
-// - If the total task timeout has been exceeded, it returns nil, indicating that no further attempts should be made.
-// - If only the per-attempt timeout is set, it uses that for the context.
-// - If both timeouts are set, it uses the smaller of the per-attempt timeout and the remaining total task timeout.
-func (p *Pool[T]) createTaskContext(parentCtx context.Context, task *Task[T]) (context.Context, context.CancelFunc) {
-	task.mu.Lock()
-	totalTimeout := task.totalTimeout
-	attemptTimeout := task.attemptTimeout
-	totalDuration := task.totalDuration
-	task.mu.Unlock()
-
-	if totalTimeout > 0 {
-		// Calculate the remaining total task timeout.
-		remainingTotalTimeout := totalTimeout - totalDuration
-		if remainingTotalTimeout <= 0 {
-			// Total task timeout has been exceeded; no further attempts should be made.
-			return nil, nil
-		}
-
-		// Determine the timeout for this attempt.
-		// Use the smaller of the per-attempt timeout and the remaining total task timeout.
-		var timeout time.Duration
-		if attemptTimeout > 0 && attemptTimeout < remainingTotalTimeout {
-			timeout = attemptTimeout
-		} else {
-			timeout = remainingTotalTimeout
-		}
-
-		// Create a context with the calculated timeout.
-		ctx, cancel := context.WithTimeout(parentCtx, timeout)
-		return ctx, cancel
-	} else if attemptTimeout > 0 {
-		// Only per-attempt timeout is set; use it for the context.
-		ctx, cancel := context.WithTimeout(parentCtx, attemptTimeout)
-		return ctx, cancel
-	}
-
-	// No timeouts are set; create a cancellable context without a deadline.
-	return context.WithCancel(parentCtx)
-}
-
-// executeTask executes the task with proper panic recovery
-func (p *Pool[T]) executeTask(ctx context.Context, state *workerState[T], task *Task[T]) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = p.handlePanic(state, r)
-			p.logger.Error(p.ctx, "Recovered from panic in worker", "worker_id", state.id, "error", err)
-		}
-	}()
-
-	p.logger.Debug(p.ctx, "Executing task", "worker_id", state.id, "task_data", task.data)
-
-	if task.runningCb != nil {
-		task.runningCb()
-	}
-
-	return state.worker.Run(ctx, task.data)
-}
-
-// handlePanic processes panic recovery
-func (p *Pool[T]) handlePanic(state *workerState[T], r interface{}) error {
-	const stackSize = 1 << 16
-	buf := make([]byte, stackSize)
-	n := runtime.Stack(buf, false)
-	stackTrace := string(buf[:n])
-
-	err := fmt.Errorf("panic in worker %d: %v\n%s", state.id, r, stackTrace)
-
-	if p.config.onWorkerPanic != nil {
-		p.config.onWorkerPanic(state.id, r, stackTrace)
-	}
-
-	p.logger.Error(p.ctx, "Panic in worker during task execution", "worker_id", state.id, "error", r, "stack_trace", stackTrace)
-
-	return err
-}
-
-// handleTaskCompletion processes task completion or failure
-func (p *Pool[T]) handleTaskCompletion(state *workerState[T], task *Task[T], err error) {
-	taskDuration := time.Since(task.attemptStartTime)
-
-	task.mu.Lock()
-	task.totalDuration += taskDuration
-	task.durations = append(task.durations, taskDuration)
-
-	if err != nil {
-		task.errors = append(task.errors, err)
-		task.retries++
-		task.mu.Unlock()
-
-		p.logger.Warn(p.ctx, "Task failed", "worker_id", state.id, "task_data", task.data, "error", err)
-
-		if err := p.TransitionTaskState(task, TaskStateFailed, "Task failed"); err != nil {
-			p.logger.Error(p.ctx, "Failed to transition task state", "error", err)
-		}
-
-		p.handleTaskFailure(task, err)
-		return
-	}
-
-	task.mu.Unlock()
-
-	p.metrics.TasksSucceeded.Add(1)
-	p.UpdateTotalQueueSize(-1)
-
-	p.logger.Debug(p.ctx, "Task succeeded", "worker_id", state.id, "task_data", task.data)
-
-	if err := p.TransitionTaskState(task, TaskStateCompleted, "Task succeeded"); err != nil {
-		p.logger.Error(p.ctx, "Failed to transition task state", "error", err)
-	}
-
-	p.logger.Debug(p.ctx, "Checking task success callback", "has_callback", p.config.onTaskSuccess != nil)
-
-	if p.config.onTaskSuccess != nil {
-		p.config.onTaskSuccess(task.data)
-	}
-
-	if task.notifiedProcessed != nil {
-		task.notifiedProcessed.Notify()
-	}
-	if task.processedCb != nil {
-		task.processedCb()
-	}
-	p.taskPool.Put(task)
-}
-
-// handleTaskFailure handles a task failure
-func (p *Pool[T]) handleTaskFailure(task *Task[T], err error) {
-	// p.metrics.TasksFailed.Add(1)
-	p.metrics.TasksFailed.Add(1)
-
-	task.mu.Lock()
-	totalTimeout := task.totalTimeout
-	totalDuration := task.totalDuration
-	task.mu.Unlock()
-
-	// Check if total task timeout has been exceeded
-	if totalTimeout > 0 && totalDuration >= totalTimeout {
-		p.UpdateTotalQueueSize(-1)
-		task.deadReason = "failed; total task time limit exceeded"
-		p.addDeadTask(task)
-		return
-	}
-
-	action := TaskActionRetry
-	if p.config.onTaskFailure != nil {
-		action = p.config.onTaskFailure(task.data, err)
-	}
-
-	p.logger.Debug(p.ctx, "Handling task failure", "task_data", task.data, "action", action, "bounce_retry", task.bounceRetry)
-
-	switch action {
-	case TaskActionRetry:
-		if p.config.attempts > 0 && task.retries >= p.config.attempts {
-			p.UpdateTotalQueueSize(-1)
-			task.deadReason = "failed; max retries exceeded"
-			p.addDeadTask(task)
-			return
-		}
-		if p.config.retryIf != nil && !p.config.retryIf(err) {
-			p.UpdateTotalQueueSize(-1)
-			task.deadReason = "failed; retryIf condition failed"
-			p.addDeadTask(task)
-			return
-		}
-
-		// Handle bounce retry worker tracking
-		if task.bounceRetry {
-			if len(task.attemptedWorkers) >= len(p.workers) {
-				// Reset if we've tried all workers
-				task.attemptedWorkers = make(map[int]struct{})
-			}
-		}
-
-		// Handle immediate retry
-		if task.immediateRetry {
-			p.submitTask(task)
-			return
-		}
-
-		// Calculate retry delay
-		delay := p.config.delay
-		if p.config.delayFunc != nil {
-			delay = p.config.delayFunc(task.retries, err, &p.config)
-		} else if p.config.retryPolicy != nil {
-			delay = p.config.retryPolicy.ComputeDelay(task.retries, err, &p.config)
-		}
-
-		// Simple blocking delay - this will still respect context cancellation
-		select {
-		case <-p.ctx.Done():
-			p.UpdateTotalQueueSize(-1)
-			task.deadReason = "failed; context cancelled during retry delay"
-			p.addDeadTask(task)
-			return
-		case <-time.After(delay):
-			if err := p.submitTask(task); err != nil {
-				p.UpdateTotalQueueSize(-1)
-				task.deadReason = "failed; retry submission failed"
-				p.addDeadTask(task)
-			}
-		}
-
-	case TaskActionForceRetry:
-		if task.bounceRetry {
-			if len(task.attemptedWorkers) >= len(p.workers) {
-				task.attemptedWorkers = make(map[int]struct{})
-			}
-		}
-		task.deadReason = "failed; force retry"
-		p.submitTask(task)
-
-	case TaskActionAddToDeadTasks:
-		p.UpdateTotalQueueSize(-1)
-		task.deadReason = "failed; add to dead tasks"
-		p.addDeadTask(task)
-
-	case TaskActionRemove:
-		p.UpdateTotalQueueSize(-1)
-		p.taskPool.Put(task)
-	}
-}
-
-// addDeadTask adds a task to dead tasks
-func (p *Pool[T]) addDeadTask(task *Task[T]) {
-
-	// First transition to dead state
-	if err := p.TransitionTaskState(task, TaskStateDead, "Task added to dead tasks"); err != nil {
-		p.logger.Error(p.ctx, "Failed to transition task state", "error", err)
-	}
-
-	// THEN copy it
-	p.deadMu.Lock()
-
-	deadTaskIndex := len(p.deadTasks)
-	if p.config.deadTasksLimit > 0 && deadTaskIndex >= p.config.deadTasksLimit {
-		p.deadTasks = p.deadTasks[1:]
-		deadTaskIndex--
-	}
-
-	deadTask := &DeadTask[T]{
-		Data:          task.data,
-		Retries:       task.retries,
-		TotalDuration: task.totalDuration,
-		Errors:        task.errors,
-		Reason:        task.deadReason,
-		StateHistory:  task.stateHistory,
-	}
-
-	p.deadTasks = append(p.deadTasks, deadTask)
-	p.metrics.DeadTasks.Add(1)
-
-	p.deadMu.Unlock()
-
-	// Send notification after releasing the lock
-	if p.config.onDeadTask != nil {
-		select {
-		case p.deadTaskNotifications <- deadTaskIndex:
-		default:
-			p.logger.Warn(p.ctx, "Dead task notification channel full, notification dropped", "dead_task_index", deadTaskIndex)
-		}
-	}
-
-	p.taskPool.Put(task)
-}
-
-// WaitWithCallback waits for the pool to complete while calling a callback function
-func (p *Pool[T]) WaitWithCallback(ctx context.Context, callback func(queueSize, processingCount, deadTaskCount int) bool, interval time.Duration) error {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			p.logger.Warn(p.ctx, "WaitWithCallback context done", "error", ctx.Err())
-			return ctx.Err()
-		case <-ticker.C:
-			queueSize := int(p.QueueSize())
-			processingCount := int(p.totalProcessing.Load())
-			deadTaskCount := int(p.metrics.DeadTasks.Load())
-			p.logger.Debug(p.ctx, "WaitWithCallback tick", "queue_size", queueSize, "processing_count", processingCount, "dead_task_count", deadTaskCount)
-			if !callback(queueSize, processingCount, deadTaskCount) {
-				p.logger.Info(p.ctx, "WaitWithCallback stopping as callback returned false")
-				return nil
-			}
-		}
-	}
-}
-
-// Close gracefully shuts down the pool
-func (p *Pool[T]) Close() error {
-	p.mu.Lock()
-	p.stopped = true
-	p.mu.Unlock()
-
-	p.logger.Info(p.ctx, "Closing pool")
-
-	p.cond.Broadcast()
-
-	p.mu.Lock()
-	for _, state := range p.workers {
-		state.mu.Lock()
-		if !state.removed.Load() {
-			state.removed.Store(true)
-			state.paused.Store(true)
-			state.cancel()
-			state.mu.Unlock()
-			state.callMethod("OnStop", state.ctx)
-			state.callMethod("OnRemove", state.ctx)
-			p.logger.Info(p.ctx, "Worker closed", "worker_id", state.id)
-		} else {
-			state.mu.Unlock()
-		}
-	}
-	p.mu.Unlock()
-
-	p.cancel()
-	return nil
-}
-
-// QueueSize returns the total number of tasks in the queue
-func (p *Pool[T]) QueueSize() int64 {
-	total := p.totalQueueSize.Load()
-	p.logger.Debug(p.ctx, "Fetching total queue size", "queue_size", total)
-	return total
-}
-
-// ProcessingCount returns the number of tasks currently being processed
-func (p *Pool[T]) ProcessingCount() int64 {
-	processingCount := p.totalProcessing.Load()
-	p.logger.Debug(p.ctx, "Fetching processing count", "processing_count", processingCount)
-	return processingCount
-}
-
-// DeadTaskCount returns the number of dead tasks
-func (p *Pool[T]) DeadTaskCount() int64 {
-	deadTaskCount := p.metrics.DeadTasks.Load()
-	p.logger.Debug(p.ctx, "Fetching dead task count", "dead_task_count", deadTaskCount)
-	return deadTaskCount
-}
-
-// RangeDeadTasks iterates over all dead tasks
-func (p *Pool[T]) RangeDeadTasks(fn func(*DeadTask[T]) bool) {
-	p.deadMu.Lock()
-	defer p.deadMu.Unlock()
-	for _, dt := range p.deadTasks {
-		p.logger.Debug(p.ctx, "Iterating dead tasks", "dead_task_data", dt.Data)
-		if !fn(dt) {
-			break
-		}
-	}
-}
-
-// PullDeadTask removes and returns a dead task from the pool
-func (p *Pool[T]) PullDeadTask(idx int) (*DeadTask[T], error) {
-	p.deadMu.Lock()
-	defer p.deadMu.Unlock()
-	if idx < 0 || idx >= len(p.deadTasks) {
-		p.logger.Error(p.ctx, "Invalid index for PullDeadTask", "index", idx)
-		return nil, errors.New("invalid index")
-	}
-	dt := p.deadTasks[idx]
-	p.deadTasks = append(p.deadTasks[:idx], p.deadTasks[idx+1:]...)
-	p.metrics.DeadTasks.Add(-1)
-	p.logger.Debug(p.ctx, "Pulled dead task", "dead_task_data", dt.Data)
-	return dt, nil
-}
-
-// PullRangeDeadTasks removes and returns a range of dead tasks from the pool
-func (p *Pool[T]) PullRangeDeadTasks(from int, to int) ([]*DeadTask[T], error) {
-	p.deadMu.Lock()
-	defer p.deadMu.Unlock()
-	if from < 0 || to > len(p.deadTasks) || from > to {
-		p.logger.Error(p.ctx, "Invalid range for PullRangeDeadTasks", "from", from, "to", to)
-		return nil, errors.New("invalid range")
-	}
-	dts := make([]*DeadTask[T], to-from)
-	copy(dts, p.deadTasks[from:to])
-	p.deadTasks = append(p.deadTasks[:from], p.deadTasks[to:]...)
-	p.metrics.DeadTasks.Add(int64(from - to))
-	p.logger.Debug(p.ctx, "Pulled range of dead tasks", "count", len(dts))
-	return dts, nil
-}
-
-// ProcessedNotification is used to notify when a task is processed
-type ProcessedNotification struct {
-	ch     chan struct{}
-	once   sync.Once
-	closed bool
-}
-
-// NewProcessedNotification creates a new ProcessedNotification
-func NewProcessedNotification() *ProcessedNotification {
-	return &ProcessedNotification{ch: make(chan struct{})}
-}
-
-// Notify notifies that the task has been processed
-func (n *ProcessedNotification) Notify() {
-	n.once.Do(func() {
-		close(n.ch)
-		n.closed = true
-	})
-}
-
-// Wait waits for the notification
-func (n *ProcessedNotification) Wait() {
-	<-n.ch
-}
-
-// Done returns the channel that's closed when the task is processed
-func (n *ProcessedNotification) Done() <-chan struct{} {
-	return n.ch
-}
-
-// QueuedNotification is used to notify when a task is queued
-type QueuedNotification struct {
-	ch     chan struct{}
-	once   sync.Once
-	closed bool
-}
-
-// NewQueuedNotification creates a new QueuedNotification
-func NewQueuedNotification() *QueuedNotification {
-	return &QueuedNotification{ch: make(chan struct{})}
-}
-
-// Notify notifies that the task has been queued
-func (n *QueuedNotification) Notify() {
-	n.once.Do(func() {
-		close(n.ch)
-		n.closed = true
-	})
-}
-
-// Wait waits for the notification
-func (n *QueuedNotification) Wait() {
-	<-n.ch
-}
-
-// Done returns the channel that's closed when the task is queued
-func (n *QueuedNotification) Done() <-chan struct{} {
-	return n.ch
-}
-
-// RequestResponse manages the lifecycle of a task request and its response
-type RequestResponse[T any, R any] struct {
-	Request     T              // The request data
-	done        chan struct{}  // Channel to signal completion
-	response    R              // Stores the successful response
-	err         error          // Stores any error that occurred
-	mu          deadlock.Mutex // Protects response and err
-	isCompleted bool           // Indicates if request is completed
-}
-
-// NewRequestResponse creates a new RequestResponse instance
-func NewRequestResponse[T any, R any](request T) *RequestResponse[T, R] {
-	return &RequestResponse[T, R]{
-		Request: request,
-		done:    make(chan struct{}),
-	}
-}
-
-// Complete safely marks the request as complete with a response
-func (rr *RequestResponse[T, R]) Complete(response R) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-
-	if !rr.isCompleted {
-		rr.response = response
-		rr.isCompleted = true
-		close(rr.done)
-	}
-}
-
-// CompleteWithError safely marks the request as complete with an error
-func (rr *RequestResponse[T, R]) CompleteWithError(err error) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-
-	if !rr.isCompleted {
-		rr.err = err
-		rr.isCompleted = true
-		close(rr.done)
-	}
-}
-
-// Done returns a channel that's closed when the request is complete
-func (rr *RequestResponse[T, R]) Done() <-chan struct{} {
-	return rr.done
-}
-
-// Err returns any error that occurred during the request
-func (rr *RequestResponse[T, R]) Err() error {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	return rr.err
-}
-
-// Wait waits for the request to complete and returns the response and any error
-func (rr *RequestResponse[T, R]) Wait(ctx context.Context) (R, error) {
-	select {
-	case <-rr.done:
-		rr.mu.Lock()
-		defer rr.mu.Unlock()
-		return rr.response, rr.err
-	case <-ctx.Done():
-		rr.mu.Lock()
-		defer rr.mu.Unlock()
-		var zero R
-		if !rr.isCompleted {
-			rr.err = ctx.Err()
-			rr.isCompleted = true
-			close(rr.done)
-			return zero, rr.err
-		} else {
-			return rr.response, rr.err
-		}
-	}
-}
-
-// handleDeadTaskNotifications handles dead task notifications
-func (p *Pool[T]) handleDeadTaskNotifications(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case idx := <-p.deadTaskNotifications:
-			if p.config.onDeadTask != nil {
-				p.config.onDeadTask(idx)
-			}
-		}
-	}
-}
-
-func (ws *workerState[T]) callMethod(methodName string, ctx context.Context) {
-	// ws.logger.Debug(ctx, "Attempting to call method", "method_name", methodName)
-
-	method, exists := ws.methodsCache[methodName]
-	if !exists {
-		// ws.logger.Debug(ctx, "Method not found in cache", "method_name", methodName)
-		return
-	}
-
-	methodType := method.Type()
-	if methodType.NumIn() == 0 {
-		// ws.logger.Debug(ctx, "Calling method without context", "method_name", methodName)
-		method.Call(nil)
-	} else if methodType.NumIn() == 1 && methodType.In(0) == reflect.TypeOf((*context.Context)(nil)).Elem() {
-		// ws.logger.Debug(ctx, "Calling method with context", "method_name", methodName)
-		method.Call([]reflect.Value{reflect.ValueOf(ctx)})
-	}
 }

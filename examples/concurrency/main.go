@@ -71,7 +71,7 @@ func main() {
 	// Close the pool
 	pool.Close()
 
-	metrics := pool.GetMetricsSnapshot()
+	metrics := pool.GetSnapshot()
 	fmt.Println("Metrics:", metrics.TasksSucceeded, metrics.TasksProcessed, metrics.TasksFailed, metrics.DeadTasks)
 
 	fmt.Println("All tasks submitted and processed successfully.")

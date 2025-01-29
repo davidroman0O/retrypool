@@ -126,10 +126,10 @@ func TestTaskProcessingTimeLimits(t *testing.T) {
 
 			taskOpts := []retrypool.TaskOption[int]{}
 			if tt.taskTimeLimit > 0 {
-				taskOpts = append(taskOpts, retrypool.WithTimeout[int](tt.taskTimeLimit))
+				taskOpts = append(taskOpts, retrypool.WithTaskTimeout[int](tt.taskTimeLimit))
 			}
 			if tt.attemptTimeout > 0 {
-				taskOpts = append(taskOpts, retrypool.WithDuration[int](tt.attemptTimeout))
+				taskOpts = append(taskOpts, retrypool.WithTaskDuration[int](tt.attemptTimeout))
 			}
 
 			err := pool.Submit(1, taskOpts...)

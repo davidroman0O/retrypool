@@ -64,13 +64,21 @@ type Data struct {
 
 func (w *APIWorker) Run(ctx context.Context, rr *retrypool.RequestResponse[Data, error]) error {
 	client := &http.Client{}
-	payload, err := json.Marshal(rr.Request.Payload)
+	var p interface{}
+	var url string
+	rr.ConsultRequest(func(d Data) error {
+		p = d.Payload
+		url = d.URL
+		return nil
+	})
+
+	payload, err := json.Marshal(p)
 	if err != nil {
 		rr.CompleteWithError(fmt.Errorf("error marshaling payload: %w", err))
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", rr.Request.URL, bytes.NewBuffer(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(payload))
 	if err != nil {
 		rr.CompleteWithError(fmt.Errorf("error creating request: %w", err))
 		return err
@@ -123,8 +131,11 @@ func main() {
 		retrypool.WithDelay[*retrypool.RequestResponse[Data, error]](time.Second),
 		retrypool.WithMaxDelay[*retrypool.RequestResponse[Data, error]](5*time.Second),
 		retrypool.WithMaxJitter[*retrypool.RequestResponse[Data, error]](500*time.Millisecond),
-		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[Data, error]](func(data *retrypool.RequestResponse[Data, error], err error) retrypool.TaskAction {
-			log.Printf("Task failed (URL: %s): %v", data.Request.URL, err)
+		retrypool.WithOnTaskFailure[*retrypool.RequestResponse[Data, error]](func(data *retrypool.RequestResponse[Data, error], metadata map[string]any, err error) retrypool.TaskAction {
+			data.ConsultRequest(func(d Data) error {
+				log.Printf("Task failed (URL: %s): %v", d.URL, err)
+				return nil
+			})
 			return retrypool.TaskActionRetry
 		}),
 	)
@@ -135,7 +146,7 @@ func main() {
 			Payload: map[string]interface{}{"key": fmt.Sprintf("value%d", i)},
 		})
 
-		err := pool.Submit(task, retrypool.WithBounceRetry[*retrypool.RequestResponse[Data, error]]())
+		err := pool.Submit(task, retrypool.WithTaskBounceRetry[*retrypool.RequestResponse[Data, error]]())
 		if err != nil {
 			log.Printf("Failed to dispatch task: %v", err)
 			continue
@@ -159,7 +170,7 @@ func main() {
 	})
 
 	// Get metrics snapshot
-	metrics := pool.GetMetricsSnapshot()
+	metrics := pool.GetSnapshot()
 	fmt.Printf("Final metrics - Submitted: %d, Processed: %d, Succeeded: %d, Failed: %d, Dead: %d\n",
 		metrics.TasksSubmitted, metrics.TasksProcessed, metrics.TasksSucceeded,
 		metrics.TasksFailed, metrics.DeadTasks)

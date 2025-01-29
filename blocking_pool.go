@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/k0kubun/pp/v3"
 	"github.com/sasha-s/go-deadlock"
 )
 
@@ -70,7 +71,8 @@ type BlockingConfig[T any] struct {
 	logger        Logger
 	workerFactory WorkerFactory[T]
 	// You always starts with 1 pool but you can define the maximum amount the BP can have at all time
-	maxActivePools int // Maximum number of active pools (one per group)
+	maxConcurrentPools          int // Maximum number of active pools (one per group)
+	maxConcurrentWorkersPerPool int // Maximum number of workers per pool
 	// Task callbacks
 	OnTaskSubmitted func(task T)
 	OnTaskStarted   func(task T)
@@ -86,6 +88,10 @@ type BlockingConfig[T any] struct {
 	OnWorkerAdded    func(groupID any, workerID int)
 	OnWorkerRemoved  func(groupID any, workerID int)
 	OnPoolClosed     func()
+
+	getData func(T) interface{}
+
+	onSnapshot func()
 }
 
 // BlockingPoolOption is a functional option for configuring the blocking pool
@@ -99,6 +105,7 @@ type blockingTaskState[T any, GID comparable, TID comparable] struct {
 	groupID      GID
 	completed    bool
 	completionCh chan struct{}
+	options      []TaskOption[T]
 }
 
 // blockingTaskGroup manages tasks that share the same GroupID
@@ -121,6 +128,12 @@ type BlockingPool[T any, GID comparable, TID comparable] struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	config        BlockingConfig[T]
+	cachedTasks   map[GID][]*blockingTaskState[T, GID, TID] // Store tasks that can't be immediately submitted
+	cacheMu       deadlock.RWMutex
+
+	snapshotMu     deadlock.RWMutex // Protects access to the snapshot
+	snapshotGroups map[GID]MetricsSnapshot[T]
+	snapshot       BlockingMetricsSnapshot[T, GID]
 }
 
 // Configuration options
@@ -135,11 +148,17 @@ func WithBlockingMaxActivePools[T any](max int) BlockingPoolOption[T] {
 		if max < 1 {
 			max = 1
 		}
-		c.maxActivePools = max
+		c.maxConcurrentPools = max
 	}
 }
 
 // All the callback setters
+
+func WithBlockingSnapshotHandler[T any](cb func()) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.onSnapshot = cb
+	}
+}
 
 func WithBlockingLogger[T any](logger Logger) BlockingPoolOption[T] {
 	return func(c *BlockingConfig[T]) {
@@ -225,24 +244,37 @@ func WithBlockingOnPoolClosed[T any](cb func()) BlockingPoolOption[T] {
 	}
 }
 
+func WithBlockingMaxWorkersPerPool[T any](max int) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.maxConcurrentWorkersPerPool = max
+	}
+}
+
+func WithBlockingGetData[T any](cb func(T) interface{}) BlockingPoolOption[T] {
+	return func(c *BlockingConfig[T]) {
+		c.getData = cb
+	}
+}
+
 // NewBlockingPool constructs a BlockingPool with the given options.
 func NewBlockingPool[T any, GID comparable, TID comparable](
 	ctx context.Context,
 	opt ...BlockingPoolOption[T],
 ) (*BlockingPool[T, GID, TID], error) {
 	cfg := BlockingConfig[T]{
-		logger:         NewLogger(slog.LevelDebug),
-		maxActivePools: 1, // Default to one active pool
+		logger:                      NewLogger(slog.LevelDebug),
+		maxConcurrentPools:          1,  // Default to one active pool
+		maxConcurrentWorkersPerPool: -1, // unlimited workers per pool
 	}
 
-	cfg.logger.Disable()
+	// cfg.logger.Disable()
 
 	for _, o := range opt {
 		o(&cfg)
 	}
 
 	cfg.logger.Info(ctx, "Creating new BlockingPool",
-		"max_active_pools", cfg.maxActivePools,
+		"max_active_pools", cfg.maxConcurrentPools,
 		"has_worker_factory", cfg.workerFactory != nil)
 
 	if cfg.workerFactory == nil {
@@ -252,28 +284,166 @@ func NewBlockingPool[T any, GID comparable, TID comparable](
 
 	ctx, cancel := context.WithCancel(ctx)
 	pool := &BlockingPool[T, GID, TID]{
-		pools:         make(map[GID]Pooler[T]),
-		workerFactory: cfg.workerFactory,
-		groups:        make(map[GID]*blockingTaskGroup[T, GID, TID]),
-		activeGroups:  make(map[GID]struct{}),
-		pendingGroups: make([]GID, 0),
-		config:        cfg,
-		ctx:           ctx,
-		cancel:        cancel,
+		pools:          make(map[GID]Pooler[T]),
+		workerFactory:  cfg.workerFactory,
+		groups:         make(map[GID]*blockingTaskGroup[T, GID, TID]),
+		activeGroups:   make(map[GID]struct{}),
+		pendingGroups:  make([]GID, 0),
+		config:         cfg,
+		ctx:            ctx,
+		cancel:         cancel,
+		cachedTasks:    make(map[GID][]*blockingTaskState[T, GID, TID]),
+		snapshotGroups: make(map[GID]MetricsSnapshot[T]),
 	}
 
 	cfg.logger.Info(ctx, "BlockingPool created successfully")
 	return pool, nil
 }
 
+func (p *BlockingPool[T, GID, TID]) cacheTaskState(groupID GID, state *blockingTaskState[T, GID, TID]) {
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+
+	p.config.logger.Debug(p.ctx, "Caching task state for later submission",
+		"group_id", groupID,
+		"task_id", state.taskID)
+
+	if p.cachedTasks == nil {
+		p.cachedTasks = make(map[GID][]*blockingTaskState[T, GID, TID])
+	}
+	p.cachedTasks[groupID] = append(p.cachedTasks[groupID], state)
+}
+
+// Try to submit cached task states
+func (p *BlockingPool[T, GID, TID]) trySubmitCachedStates(groupID GID) {
+	p.cacheMu.Lock()
+	cached, exists := p.cachedTasks[groupID]
+	if !exists || len(cached) == 0 {
+		p.cacheMu.Unlock()
+		return
+	}
+
+	p.config.logger.Debug(p.ctx, "Attempting to submit cached tasks",
+		"group_id", groupID,
+		"cached_count", len(cached))
+
+	pool := p.pools[groupID]
+	if pool == nil {
+		p.cacheMu.Unlock()
+		return
+	}
+
+	var remainingStates []*blockingTaskState[T, GID, TID]
+	currentStates := cached
+	p.cachedTasks[groupID] = nil // Clear before unlocking
+	p.cacheMu.Unlock()
+
+	// Try to submit cached states
+	for _, state := range currentStates {
+		// completion check
+		state.mu.Lock()
+		if state.completed {
+			state.mu.Unlock()
+			continue // Skip already completed tasks
+		}
+		state.mu.Unlock()
+
+		pp.Println("Submitting cached task", "groupID", state.groupID, "taskID", state.taskID)
+
+		err := pool.SubmitToFreeWorker(state.task, state.options...)
+		if err != nil {
+			remainingStates = append(remainingStates, state)
+		}
+	}
+
+	// Cache any states that couldn't be submitted
+	if len(remainingStates) > 0 {
+		p.cacheMu.Lock()
+		p.cachedTasks[groupID] = append(p.cachedTasks[groupID], remainingStates...)
+		p.cacheMu.Unlock()
+	}
+}
+
 // Scale the amount of parallel pools that can be active at the same time
-func (p *BlockingPool[T, GID, TID]) SetActivePools(max int) {
+func (p *BlockingPool[T, GID, TID]) SetConcurrentPools(max int) {
 	if max < 1 {
 		max = 1
 	}
 	p.mu.Lock()
-	p.config.maxActivePools = max
+	p.config.maxConcurrentPools = max
 	p.mu.Unlock()
+}
+
+// Scale the amount of workers that can be active at the same time on each pool
+func (p *BlockingPool[T, GID, TID]) SetConcurrentWorkers(max int) {
+	if max == 0 {
+		max = -1
+	} else if max < 0 {
+		max = -1
+	}
+	p.mu.Lock()
+	p.config.maxConcurrentWorkersPerPool = max
+	p.mu.Unlock()
+}
+
+type GroupBlockingMetricSnapshot[T any, GID comparable] struct {
+	GroupID GID
+	MetricsSnapshot[T]
+}
+
+type BlockingMetricsSnapshot[T any, GID comparable] struct {
+	TotalTasksSubmitted int64
+	TotalTasksProcessed int64
+	TotalTasksSucceeded int64
+	TotalTasksFailed    int64
+	TotalDeadTasks      int64
+	Metrics             []GroupBlockingMetricSnapshot[T, GID]
+}
+
+func (p *BlockingPool[T, GID, TID]) GetSnapshot() BlockingMetricsSnapshot[T, GID] {
+	p.snapshotMu.RLock()
+	defer p.snapshotMu.RUnlock()
+	return p.snapshot
+}
+
+func (p *BlockingPool[T, GID, TID]) RangeWorkerQueues(f func(workerID int, queueSize int64) bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, pool := range p.pools {
+		pool.RangeWorkerQueues(f)
+	}
+}
+
+func (p *BlockingPool[T, GID, TID]) RangeWorkers(f func(workerID int, state WorkerSnapshot[T]) bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, pool := range p.pools {
+		pool.RangeWorkers(f)
+	}
+}
+
+func (p *BlockingPool[T, GID, TID]) RangeTaskQueues(f func(workerID int, queue TaskQueue[T]) bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, pool := range p.pools {
+		pool.RangeTaskQueues(f)
+	}
+}
+
+func (p *BlockingPool[T, GID, TID]) calculateMetricsSnapshot() {
+	snapshot := BlockingMetricsSnapshot[T, GID]{}
+	for id, metric := range p.snapshotGroups {
+		snapshot.TotalTasksSubmitted += metric.TasksSubmitted
+		snapshot.TotalTasksProcessed += metric.TasksProcessed
+		snapshot.TotalTasksSucceeded += metric.TasksSucceeded
+		snapshot.TotalTasksFailed += metric.TasksFailed
+		snapshot.TotalDeadTasks += metric.DeadTasks
+		snapshot.Metrics = append(snapshot.Metrics, GroupBlockingMetricSnapshot[T, GID]{
+			GroupID:         id,
+			MetricsSnapshot: metric,
+		})
+	}
+	p.snapshot = snapshot
 }
 
 // createPoolForGroup creates a new worker pool for a group
@@ -283,20 +453,45 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 	worker := p.workerFactory()
 	p.config.logger.Debug(p.ctx, "Created initial worker for group", "group_id", groupID)
 
-	// Create pool with synchronous mode and single retry
-	pool := New[T](p.ctx, []Worker[T]{worker},
+	options := []Option[T]{
 		WithAttempts[T](1),
-		WithLogger[T](p.config.logger))
+		WithLogger[T](p.config.logger),
+	}
+
+	// if p.config.getData != nil {
+	// 	options = append(options, WithGetData[T](p.config.getData))
+	// }
+
+	options = append(
+		options,
+		WithSnapshotInterval[T](time.Second),
+		WithSnapshots[T](),
+		WithSnapshotCallback[T](func(ms MetricsSnapshot[T]) {
+			p.snapshotMu.Lock()
+			p.snapshotGroups[groupID] = ms
+			p.calculateMetricsSnapshot()
+			p.snapshotMu.Unlock()
+			if p.config.onSnapshot != nil {
+				p.config.onSnapshot()
+			}
+		}))
+
+	// Create pool with synchronous mode and single retry
+	pool := New[T](
+		p.ctx,
+		[]Worker[T]{worker},
+		options...,
+	)
 
 	// Set completion handler
-	pool.SetOnTaskSuccess(func(data T) {
+	pool.SetOnTaskSuccess(func(data T, metadata map[string]any) {
 		p.config.logger.Debug(p.ctx, "Task completed successfully in group",
 			"group_id", groupID)
 		p.handleTaskCompletion(groupID, data)
 	})
 
 	// Add failure handler to trigger group cleanup
-	pool.SetOnTaskFailure(func(data T, err error) TaskAction {
+	pool.SetOnTaskFailure(func(data T, metadata map[string]any, err error) TaskAction {
 		p.config.logger.Error(p.ctx, "Task failed in group",
 			"group_id", groupID,
 			"error", err)
@@ -307,19 +502,16 @@ func (p *BlockingPool[T, GID, TID]) createPoolForGroup(groupID GID) (Pooler[T], 
 
 		// Get group's tasks without holding the pool lock
 		var tasks []T
-		p.mu.Lock()
+
 		group := p.groups[groupID]
 		if group != nil {
-			group.mu.Lock()
 			for _, taskState := range group.tasks {
 				tasks = append(tasks, taskState.task)
 			}
-			group.mu.Unlock()
 			p.config.logger.Debug(p.ctx, "Collected tasks for failed group",
 				"group_id", groupID,
 				"task_count", len(tasks))
 		}
-		p.mu.Unlock()
 
 		// Call callbacks before acquiring any locks
 		if p.config.OnGroupFailed != nil {
@@ -350,9 +542,6 @@ func (p *BlockingPool[T, GID, TID]) cleanupGroup(groupID GID, tasks []T) {
 	p.config.logger.Debug(p.ctx, "Starting group cleanup",
 		"group_id", groupID,
 		"task_count", len(tasks))
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	// First check if the group still exists
 	if _, exists := p.groups[groupID]; !exists {
@@ -397,11 +586,11 @@ func (p *BlockingPool[T, GID, TID]) assignPoolToGroup(groupID GID) error {
 	}
 
 	// Create new pool if under limit
-	if len(p.activeGroups) < p.config.maxActivePools {
+	if len(p.activeGroups) < p.config.maxConcurrentPools {
 		p.config.logger.Debug(p.ctx, "Creating new pool for group",
 			"group_id", groupID,
 			"active_pools", len(p.activeGroups),
-			"max_pools", p.config.maxActivePools)
+			"max_pools", p.config.maxConcurrentPools)
 
 		pool, err := p.createPoolForGroup(groupID)
 		if err != nil {
@@ -471,19 +660,26 @@ func (p *BlockingPool[T, GID, TID]) releaseGroupPool(groupID GID) error {
 
 				// Get tasks that need to be submitted
 				nextGroup.mu.Lock()
-				pendingTasks := make([]T, 0, len(nextGroup.tasks))
+				pendingTasks := []*blockingTaskState[T, GID, TID]{}
 				for _, taskState := range nextGroup.tasks {
-					pendingTasks = append(pendingTasks, taskState.task)
+					pendingTasks = append(pendingTasks, taskState)
 				}
 				nextGroup.mu.Unlock()
 
 				// Submit all pending tasks
 				for _, task := range pendingTasks {
-					if err := newPool.SubmitToFreeWorker(task, WithBounceRetry[T]()); err != nil {
+					task.mu.Lock()
+					if task.completed {
+						task.mu.Unlock()
+						continue
+					}
+					pp.Println("Submitting pending task", "groupID", task.groupID, "taskID", task.taskID)
+					if err := newPool.SubmitToFreeWorker(task.task, task.options...); err != nil {
 						p.config.logger.Error(p.ctx, "Failed to submit pending task",
 							"group_id", nextGroupID,
 							"error", err)
 					}
+					task.mu.Unlock()
 				}
 			} else {
 				p.config.logger.Error(p.ctx, "Failed to create pool for next group, returning to pending queue",
@@ -524,13 +720,32 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 		desired++
 	}
 
+	// Apply maxWorkersPerPool limit if set
+	if p.config.maxConcurrentWorkersPerPool > 0 && desired > p.config.maxConcurrentWorkersPerPool {
+		desired = p.config.maxConcurrentWorkersPerPool
+		p.config.logger.Debug(p.ctx, "Desired workers capped by maxWorkersPerPool",
+			"group_id", groupID,
+			"max_workers", p.config.maxConcurrentWorkersPerPool,
+			"desired_workers", desired)
+	}
+
 	p.config.logger.Debug(p.ctx, "Worker scaling metrics",
 		"group_id", groupID,
 		"queued_tasks", queued,
 		"processing_tasks", processing,
-		"desired_workers", desired)
+		"desired_workers", desired,
+		"max_workers_per_pool", p.config.maxConcurrentWorkersPerPool)
 
-	currentWorkers := len(pool.GetFreeWorkers())
+	workers, err := pool.Workers()
+	if err != nil {
+		p.config.logger.Error(p.ctx, "Failed to get workers from pool",
+			"group_id", groupID,
+			"error", err)
+		return err
+	}
+	currentWorkers := len(workers)
+
+	// currentWorkers := len(pool.GetFreeWorkers())
 	if currentWorkers < desired {
 		toAdd := desired - currentWorkers
 		p.config.logger.Info(p.ctx, "Scaling up workers",
@@ -555,11 +770,39 @@ func (p *BlockingPool[T, GID, TID]) scaleWorkersIfNeeded(groupID GID) error {
 		}
 	}
 
+	// pp.Println(pool.GetMetricsSnapshot())
+
 	return nil
 }
 
+type submitConfig struct {
+	queueNotification     *QueuedNotification
+	processedNotification *ProcessedNotification
+	metadata              map[string]any
+}
+
+type SubmitOption[T any] func(*submitConfig)
+
+func WithBlockingQueueNotification[T any](notification *QueuedNotification) SubmitOption[T] {
+	return func(c *submitConfig) {
+		c.queueNotification = notification
+	}
+}
+
+func WithBlockingProcessedNotification[T any](notification *ProcessedNotification) SubmitOption[T] {
+	return func(c *submitConfig) {
+		c.processedNotification = notification
+	}
+}
+
+func WithBlockingMetadata[T any](metadata map[string]any) SubmitOption[T] {
+	return func(c *submitConfig) {
+		c.metadata = metadata
+	}
+}
+
 // Submit handles task submission, managing group pools as needed
-func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
+func (p *BlockingPool[T, GID, TID]) Submit(data T, opt ...SubmitOption[T]) error {
 	p.config.logger.Debug(p.ctx, "Processing task submission")
 
 	if p.config.OnTaskSubmitted != nil {
@@ -568,21 +811,42 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 
 	dtask, ok := any(data).(BlockingDependentTask[GID, TID])
 	if !ok {
-		p.config.logger.Error(p.ctx, "Task does not implement DependentTask interface")
 		return fmt.Errorf("task does not implement DependentTask interface")
 	}
 
 	groupID := dtask.GetGroupID()
 	taskID := dtask.GetTaskID()
 
-	p.config.logger.Debug(p.ctx, "Task details",
-		"group_id", groupID,
-		"task_id", taskID)
+	// Create task state with all metadata
+	state := &blockingTaskState[T, GID, TID]{
+		task:         data,
+		taskID:       taskID,
+		groupID:      groupID,
+		completionCh: make(chan struct{}),
+		options:      []TaskOption[T]{WithTaskBounceRetry[T]()},
+	}
+
+	// Add any additional options
+	cfg := submitConfig{}
+	for _, o := range opt {
+		o(&cfg)
+	}
+
+	if cfg.queueNotification != nil {
+		state.options = append(state.options, WithTaskQueuedNotification[T](cfg.queueNotification))
+	}
+	if cfg.processedNotification != nil {
+		state.options = append(state.options, WithTaskProcessedNotification[T](cfg.processedNotification))
+	}
+	if cfg.metadata != nil {
+		m := NewMetadata()
+		m.store = cfg.metadata
+		state.options = append(state.options, WithTaskMetadata[T](m))
+	}
 
 	p.mu.Lock()
 	group, exists := p.groups[groupID]
 	if !exists {
-		p.config.logger.Debug(p.ctx, "Creating new group", "group_id", groupID)
 		group = &blockingTaskGroup[T, GID, TID]{
 			id:        groupID,
 			tasks:     make(map[TID]*blockingTaskState[T, GID, TID]),
@@ -595,57 +859,62 @@ func (p *BlockingPool[T, GID, TID]) Submit(data T) error {
 			p.config.OnGroupCreated(groupID)
 		}
 
-		// Try to assign a pool if not at limit
+		// If group needs a pool, add to pending
+		isPending := false
+		for _, pendingID := range p.pendingGroups {
+			if pendingID == groupID {
+				isPending = true
+				break
+			}
+		}
+
+		if !isPending {
+			p.config.logger.Debug(p.ctx, "Adding group to pending queue",
+				"group_id", groupID)
+			p.pendingGroups = append(p.pendingGroups, groupID)
+		}
+
+		// Try to assign a pool if possible
 		if err := p.assignPoolToGroup(groupID); err != nil {
-			// Group will remain in pending state
+			// Cache the task state and return
+			p.cacheTaskState(groupID, state)
 			p.mu.Unlock()
-			p.config.logger.Error(p.ctx, "Failed to assign pool to group",
-				"group_id", groupID,
-				"error", err)
-			return fmt.Errorf("failed to assign pool: %w", err)
+			return nil
 		}
 	}
 
-	// Create task state
-	task := &blockingTaskState[T, GID, TID]{
-		task:         data,
-		taskID:       taskID,
-		groupID:      groupID,
-		completionCh: make(chan struct{}),
-	}
-
+	// Store task state in group
 	group.mu.Lock()
-	group.tasks[taskID] = task
+	group.tasks[taskID] = state
 	group.mu.Unlock()
 
-	// If group has no pool yet, just store the task
+	// If group has no pool, cache the task state
 	if !group.hasPool {
-		p.config.logger.Debug(p.ctx, "Group has no pool, task queued for later processing",
-			"group_id", groupID,
-			"task_id", taskID)
+		p.cacheTaskState(groupID, state)
 		p.mu.Unlock()
 		return nil
 	}
 
 	pool := p.pools[groupID]
-	// Need to scale workers?
 	if err := p.scaleWorkersIfNeeded(groupID); err != nil {
 		p.mu.Unlock()
-		p.config.logger.Error(p.ctx, "Failed to scale workers",
-			"group_id", groupID,
-			"error", err)
 		return fmt.Errorf("failed to scale workers: %w", err)
 	}
-	p.mu.Unlock()
 
 	if p.config.OnTaskStarted != nil {
 		p.config.OnTaskStarted(data)
 	}
 
-	p.config.logger.Debug(p.ctx, "Submitting task to pool",
-		"group_id", groupID,
-		"task_id", taskID)
-	return pool.SubmitToFreeWorker(task.task, WithBounceRetry[T]())
+	// Try to submit with complete state and options
+	err := pool.SubmitToFreeWorker(state.task, state.options...)
+	if err == ErrNoWorkersAvailable {
+		p.cacheTaskState(groupID, state)
+		p.mu.Unlock()
+		return nil
+	}
+
+	p.mu.Unlock()
+	return err
 }
 
 // handleTaskCompletion processes task completion
@@ -655,6 +924,27 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 	if p.config.OnTaskCompleted != nil {
 		p.config.OnTaskCompleted(data)
 	}
+
+	// Check pending groups first
+	p.mu.Lock()
+	if len(p.activeGroups) < p.config.maxConcurrentPools && len(p.pendingGroups) > 0 {
+		nextGroupID := p.pendingGroups[0]
+		p.pendingGroups = p.pendingGroups[1:]
+
+		if nextGroup := p.groups[nextGroupID]; nextGroup != nil {
+			if err := p.assignPoolToGroup(nextGroupID); err == nil {
+				// Pool assigned successfully, try to submit its cached states
+				p.trySubmitCachedStates(nextGroupID)
+			} else {
+				// If pool assignment failed, put group back in pending queue
+				p.pendingGroups = append(p.pendingGroups, nextGroupID)
+			}
+		}
+	}
+	p.mu.Unlock()
+
+	// Try to submit cached states for the completing group
+	p.trySubmitCachedStates(groupID)
 
 	dtask := any(data).(BlockingDependentTask[GID, TID])
 	taskID := dtask.GetTaskID()
@@ -680,8 +970,10 @@ func (p *BlockingPool[T, GID, TID]) handleTaskCompletion(groupID GID, data T) {
 		return
 	}
 
+	task.mu.Lock()
 	task.completed = true
 	close(task.completionCh)
+	task.mu.Unlock()
 	group.completed[taskID] = true
 
 	p.config.logger.Debug(p.ctx, "Task marked as completed",
@@ -792,17 +1084,10 @@ func (p *BlockingPool[T, GID, TID]) WaitWithCallback(
 			return ctx.Err()
 		case <-ticker.C:
 			p.mu.RLock()
-			queued := 0
-			processing := 0
-			deadTasks := 0
+			queued := int(p.snapshot.TotalTasksSubmitted - p.snapshot.TotalTasksProcessed)
+			processing := int(p.snapshot.TotalTasksProcessed - p.snapshot.TotalTasksSucceeded - p.snapshot.TotalTasksFailed)
+			deadTasks := int(p.snapshot.TotalDeadTasks)
 
-			// Sum metrics across all active pools
-			for _, pool := range p.pools {
-				metrics := pool.GetMetricsSnapshot()
-				queued += int(metrics.TasksSubmitted - metrics.TasksProcessed)
-				processing += int(pool.ProcessingCount())
-				deadTasks += int(metrics.DeadTasks)
-			}
 			p.mu.RUnlock()
 
 			p.config.logger.Debug(p.ctx, "Pool metrics",
@@ -852,20 +1137,20 @@ func (p *BlockingPool[T, GID, TID]) Close() error {
 
 // BlockingRequestResponse manages the lifecycle of a task request and its response
 type BlockingRequestResponse[T any, R any, GID comparable, TID comparable] struct {
-	groupID     GID            // The group ID
-	taskID      TID            // The task ID
-	Request     T              // The request data
-	done        chan struct{}  // Channel to signal completion
-	response    R              // Stores the successful response
-	err         error          // Stores any error that occurred
-	mu          deadlock.Mutex // Protects response and err
-	isCompleted bool           // Indicates if request is completed
+	groupID     GID              // The group ID
+	taskID      TID              // The task ID
+	request     T                // The request data
+	done        chan struct{}    // Channel to signal completion
+	response    R                // Stores the successful response
+	err         error            // Stores any error that occurred
+	mu          deadlock.RWMutex // Protects response and err
+	isCompleted bool             // Indicates if request is completed
 }
 
 // NewBlockingRequestResponse creates a new BlockingRequestResponse instance
 func NewBlockingRequestResponse[T any, R any, GID comparable, TID comparable](request T, gid GID, tid TID) *BlockingRequestResponse[T, R, GID, TID] {
 	return &BlockingRequestResponse[T, R, GID, TID]{
-		Request: request,
+		request: request,
 		done:    make(chan struct{}),
 		groupID: gid,
 		taskID:  tid,
@@ -880,60 +1165,94 @@ func (rr BlockingRequestResponse[T, R, GID, TID]) GetTaskID() TID {
 	return rr.taskID
 }
 
+// Safely consults the request data
+func (rr *BlockingRequestResponse[T, R, GID, TID]) ConsultRequest(fn func(T) error) error {
+	rr.mu.Lock()
+	err := fn(rr.request)
+	rr.mu.Unlock()
+	return err
+}
+
 // Complete safely marks the request as complete with a response
 func (rr *BlockingRequestResponse[T, R, GID, TID]) Complete(response R) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
+	var completed bool
+	rr.mu.RLock()
+	completed = rr.isCompleted
+	rr.mu.RUnlock()
 
-	if !rr.isCompleted {
+	if !completed {
+		rr.mu.Lock()
 		rr.response = response
 		rr.isCompleted = true
 		close(rr.done)
+		rr.mu.Unlock()
 	}
 }
 
 // CompleteWithError safely marks the request as complete with an error
 func (rr *BlockingRequestResponse[T, R, GID, TID]) CompleteWithError(err error) {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
+	var completed bool
+	rr.mu.RLock()
+	completed = rr.isCompleted
+	rr.mu.RUnlock()
 
-	if !rr.isCompleted {
+	if !completed {
+		rr.mu.Lock()
 		rr.err = err
 		rr.isCompleted = true
 		close(rr.done)
+		rr.mu.Unlock()
 	}
 }
 
 // Done returns a channel that's closed when the request is complete
 func (rr *BlockingRequestResponse[T, R, GID, TID]) Done() <-chan struct{} {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
 	return rr.done
 }
 
 // Err returns any error that occurred during the request
 func (rr *BlockingRequestResponse[T, R, GID, TID]) Err() error {
-	rr.mu.Lock()
-	defer rr.mu.Unlock()
-	return rr.err
+	var err error
+	rr.mu.RLock()
+	err = rr.err
+	rr.mu.RUnlock()
+	return err
 }
 
 // Wait waits for the request to complete and returns the response and any error
 func (rr *BlockingRequestResponse[T, R, GID, TID]) Wait(ctx context.Context) (R, error) {
 	select {
 	case <-rr.done:
-		rr.mu.Lock()
-		defer rr.mu.Unlock()
-		return rr.response, rr.err
+		var err error
+		var response R
+		rr.mu.RLock()
+		response = rr.response
+		err = rr.err
+		rr.mu.RUnlock()
+		return response, err
 	case <-ctx.Done():
-		rr.mu.Lock()
-		defer rr.mu.Unlock()
-		var zero R
-		if !rr.isCompleted {
+		var completed bool
+		rr.mu.RLock()
+		completed = rr.isCompleted
+		rr.mu.RUnlock()
+		if !completed {
+			var zero R
+			rr.mu.Lock()
 			rr.err = ctx.Err()
 			rr.isCompleted = true
 			close(rr.done)
-			return zero, rr.err
+			rr.mu.Unlock()
+			return zero, ctx.Err()
 		} else {
-			return rr.response, rr.err
+			var err error
+			var response R
+			rr.mu.RLock()
+			response = rr.response
+			err = rr.err
+			rr.mu.RUnlock()
+			return response, err
 		}
 	}
 }

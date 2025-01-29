@@ -79,7 +79,7 @@ func TestImmediateRetry(t *testing.T) {
 			worker.shouldFail[5] = true
 
 			options := []retrypool.Option[int]{
-				retrypool.WithOnTaskFailure[int](func(data int, err error) retrypool.TaskAction {
+				retrypool.WithOnTaskFailure[int](func(data int, metadata map[string]any, err error) retrypool.TaskAction {
 					return retrypool.TaskActionRetry
 				}),
 			}
@@ -101,7 +101,7 @@ func TestImmediateRetry(t *testing.T) {
 					defer wg.Done()
 					var err error
 					if worker.shouldFail[i] {
-						err = pool.Submit(i, retrypool.WithImmediateRetry[int]())
+						err = pool.Submit(i, retrypool.WithTaskImmediateRetry[int]())
 					} else {
 						err = pool.Submit(i)
 					}

@@ -38,15 +38,17 @@ func main() {
 	pool := retrypool.New[int](ctx, []retrypool.Worker[int]{&MyWorker{}, &MyWorker{}},
 		retrypool.WithAttempts[int](3), // Set max attempts to 3
 		retrypool.WithOnTaskAttempt(func(task *retrypool.Task[int], workerID int) {
-			fmt.Println(workerID, task.GetData(), task.GetAttemptedWorkers()) // Showing how to bounce from worker to worker
+			fmt.Println(workerID, task.GetMetadata(), task.GetAttemptedWorkers()) // Showing how to bounce from worker to worker
 		}),
 	)
 
 	// Submit tasks with immediate retry
 	fmt.Println("Submitting tasks with immediate retry:")
 	for i := 1; i <= 5; i++ {
+		m := retrypool.NewMetadata()
+		m.Set("task", i)
 		// All those tasks will stay fixed on their worker but they will try to retry by taking the first position in the taskqueue of their worker (taskqueue != current task)
-		err := pool.Submit(i, retrypool.WithImmediateRetry[int]())
+		err := pool.Submit(i, retrypool.WithTaskImmediateRetry[int](), retrypool.WithTaskMetadata[int](m))
 		if err != nil {
 			fmt.Println("Error submitting task:", err)
 		}
@@ -56,7 +58,7 @@ func main() {
 	fmt.Println("\nSubmitting tasks with bounce retry:")
 	for i := 6; i <= 10; i++ {
 		// All those tasks will bounce from worker to worker every time they fail, so you will see an array of IDs from the callback up there
-		err := pool.Submit(i, retrypool.WithBounceRetry[int]())
+		err := pool.Submit(i, retrypool.WithTaskBounceRetry[int]())
 		if err != nil {
 			fmt.Println("Error submitting task:", err)
 		}
